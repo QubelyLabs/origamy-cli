@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -13,10 +15,23 @@ import (
 
 const (
 	helmChart   = "oci://ghcr.io/qubelylabs/charts/origamy-data-plane"
-	helmVersion = "0.1.1"
+	helmVersion = "0.1.2"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
+
+type preset struct {
+	name        string
+	label       string
+	description string
+	replicas    string
+}
+
+var presets = []preset{
+	{"starter", "Starter", "dev/test  — 1 replica, ~4 GB RAM", "1"},
+	{"standard", "Standard", "production — 2 replicas, ~8 GB RAM", "2"},
+	{"production", "Production", "high-scale — 3 replicas, ~16 GB RAM", "3"},
+}
 
 var deployCmd = &cobra.Command{
 	Use:   "deploy",
@@ -86,9 +101,33 @@ func deployKubernetes(tok *token.Enrollment) error {
 		)
 	}
 
-	step("Kubernetes cluster detected — installing via Helm")
+	step("Kubernetes cluster detected")
 	fmt.Println()
 
+	// — Deployment tier ——————————————————————————————————————————————————
+	fmt.Println("Deployment size:")
+	for i, p := range presets {
+		fmt.Printf("  %d  %-12s %s\n", i+1, p.label, p.description)
+	}
+	tierIdx := promptChoice("Enter 1-3", 1, len(presets), 1)
+	selected := presets[tierIdx-1]
+	fmt.Println()
+
+	// — ClickHouse ————————————————————————————————————————————————————————
+	fmt.Println("ClickHouse:")
+	fmt.Println("  1  Embedded  — deploy inside the cluster (easiest)")
+	fmt.Println("  2  External  — connect to your own ClickHouse instance")
+	chMode := promptChoice("Enter 1-2", 1, 2, 1)
+	fmt.Println()
+
+	var chHost, chPassword string
+	if chMode == 2 {
+		chHost = promptString("ClickHouse host (e.g. clickhouse.mycompany.com)")
+		chPassword = promptString("ClickHouse password")
+		fmt.Println()
+	}
+
+	// — Provision ——————————————————————————————————————————————————————————
 	step("Creating namespace %s...", namespace)
 	_ = runPiped(
 		[]string{"kubectl", "create", "namespace", namespace, "--dry-run=client", "-o", "yaml"},
@@ -106,25 +145,46 @@ func deployKubernetes(tok *token.Enrollment) error {
 		[]string{"kubectl", "apply", "-f", "-"},
 	)
 
-	step("Installing data plane via Helm...")
-	if err := runVisible("helm", "upgrade", "--install", release, helmChart,
+	step("Installing data plane via Helm (%s)...", selected.label)
+	helmArgs := []string{
+		"upgrade", "--install", release, helmChart,
 		"--namespace", namespace,
 		"--version", helmVersion,
-		"--set", "controlPlane.url="+tok.Addr,
-		"--set", "controlPlane.dataPlaneId="+tok.ID,
+		"--set", "controlPlane.url=" + tok.Addr,
+		"--set", "controlPlane.dataPlaneId=" + tok.ID,
 		"--set", "portalAgent.enabled=true",
 		"--set", "portalAgent.existingSecret=origamy-byod-token",
 		"--set", "portalAgent.existingSecretAuthKey=auth-token",
-	); err != nil {
+		"--set", "preset=" + selected.name,
+	}
+
+	if chMode == 1 {
+		helmArgs = append(helmArgs, "--set", "clickhouse.enabled=true")
+	} else {
+		helmArgs = append(helmArgs,
+			"--set", "clickhouse.enabled=false",
+			"--set", "clickhouse.host="+chHost,
+			"--set", "clickhouse.password="+chPassword,
+		)
+	}
+
+	if err := runVisible("helm", helmArgs...); err != nil {
 		return fmt.Errorf("helm upgrade failed: %w", err)
 	}
 
 	fmt.Println()
-	step("Waiting for pods...")
-	_ = runVisible("kubectl", "rollout", "status", "deployment", "-n", namespace, "--timeout=180s")
+	step("Waiting for pods to be ready (this takes ~2 minutes)...")
+	if err := runVisible("kubectl", "rollout", "status", "deployment", "-n", namespace, "--timeout=300s"); err != nil {
+		fmt.Println()
+		fmt.Println("  Pods are still starting. Check progress with:")
+		fmt.Printf("    kubectl get pods -n %s\n", namespace)
+		fmt.Println()
+		fmt.Println("  Once ready, your dashboard will show the data plane as Connected.")
+		return nil
+	}
 
 	fmt.Println()
-	done("Data plane %s deployed.", tok.ID)
+	done("Data plane %s deployed (%s).", tok.ID, selected.label)
 	done("Your dashboard will show it as Connected shortly.")
 	return nil
 }
@@ -139,7 +199,17 @@ func hasDocker() bool {
 }
 
 func deployDocker(tok *token.Enrollment) error {
-	step("Docker detected — installing via Docker Compose")
+	step("Docker detected")
+	fmt.Println()
+
+	// — Deployment tier ——————————————————————————————————————————————————
+	dockerPresets := presets[:2] // Starter and Standard only for Docker
+	fmt.Println("Deployment size:")
+	for i, p := range dockerPresets {
+		fmt.Printf("  %d  %-12s %s\n", i+1, p.label, p.description)
+	}
+	tierIdx := promptChoice("Enter 1-2", 1, len(dockerPresets), 1)
+	selected := dockerPresets[tierIdx-1]
 	fmt.Println()
 
 	dir := "origamy-dp-" + tok.ID
@@ -161,22 +231,48 @@ func deployDocker(tok *token.Enrollment) error {
 
 	step("Writing .env...")
 	env := fmt.Sprintf(
-		"CONTROL_PLANE_ADDR=%s\nCONFIG_URL=%s\nDATA_PLANE_ID=%s\nAUTH_TOKEN=%s\nTLS_ENABLED=true\nDP_IMAGE_TAG=main\nLOG_LEVEL=info\n",
-		tok.Addr, tok.URL, tok.ID, tok.Tok,
+		"CONTROL_PLANE_ADDR=%s\nCONFIG_URL=%s\nDATA_PLANE_ID=%s\nAUTH_TOKEN=%s\nTLS_ENABLED=true\nDP_IMAGE_TAG=main\nLOG_LEVEL=info\nDEPLOYMENT_PRESET=%s\n",
+		tok.Addr, tok.URL, tok.ID, tok.Tok, selected.name,
 	)
 	if err := os.WriteFile(".env", []byte(env), 0600); err != nil {
 		return fmt.Errorf("failed to write .env: %w", err)
 	}
 
-	step("Starting services...")
+	step("Starting services (%s)...", selected.label)
 	if err := runVisible("docker", "compose", "--env-file", ".env", "up", "-d"); err != nil {
 		return fmt.Errorf("docker compose failed: %w", err)
 	}
 
 	fmt.Println()
-	done("Data plane %s started in ./%s/", tok.ID, dir)
+	done("Data plane %s started in ./%s/ (%s).", tok.ID, dir, selected.label)
 	done("Your dashboard will show it as Connected shortly.")
 	return nil
+}
+
+// ── Prompt helpers ────────────────────────────────────────────────────────────
+
+func promptChoice(label string, min, max, defaultVal int) int {
+	r := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Printf("  %s [default: %d]: ", label, defaultVal)
+		line, _ := r.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return defaultVal
+		}
+		var n int
+		if _, err := fmt.Sscanf(line, "%d", &n); err == nil && n >= min && n <= max {
+			return n
+		}
+		fmt.Printf("  Please enter a number between %d and %d.\n", min, max)
+	}
+}
+
+func promptString(label string) string {
+	r := bufio.NewReader(os.Stdin)
+	fmt.Printf("  %s: ", label)
+	line, _ := r.ReadString('\n')
+	return strings.TrimSpace(line)
 }
 
 // ── Shell helpers ─────────────────────────────────────────────────────────────
