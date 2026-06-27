@@ -10,14 +10,7 @@ import (
 var rootCmd = &cobra.Command{
 	Use:   "origamy",
 	Short: "Origamy CLI — deploy and manage your data plane",
-	Long: `
-   ___  ____  ___ ____  ___  __  ____  _  _
-  / _ \|  _ \|_ _/ ___|/ _ \|  \/  \ \/ /
- | | | | |_) || | |  _| | | | |\/| |\  /
- | |_| |  _ < | | |_| | |_| | |  | |/  \
-  \___/|_| \_\___\____|\___/|_|  |_/_/\_\
-
-  Customer Data Platform — self-hosted data plane`,
+	Long: `Origamy CLI — deploy and manage your self-hosted data plane.`,
 }
 
 func Execute() {
