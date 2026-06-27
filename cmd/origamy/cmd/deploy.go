@@ -15,7 +15,7 @@ import (
 
 const (
 	helmChart   = "oci://ghcr.io/qubelylabs/charts/origamy-data-plane"
-	helmVersion = "0.1.5"
+	helmVersion = "0.1.9"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
@@ -151,6 +151,7 @@ func deployKubernetes(tok *token.Enrollment) error {
 		"--namespace", namespace,
 		"--version", helmVersion,
 		"--set", "controlPlane.url=" + tok.Addr,
+		"--set", "controlPlane.httpUrl=" + tok.URL,
 		"--set", "controlPlane.dataPlaneId=" + tok.ID,
 		"--set", "portalAgent.enabled=true",
 		"--set", "portalAgent.existingSecret=origamy-byod-token",
