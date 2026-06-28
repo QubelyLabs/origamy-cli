@@ -61,9 +61,16 @@ func init() {
 }
 
 func runDeploy(raw string) error {
-	tok, err := token.Decode(raw)
+	// Generate a keypair + CSR locally so enrollment can request an mTLS identity
+	// — the private key never leaves this machine. Enroll falls back to a
+	// bearer-only token if the control plane has no CA configured.
+	keyPEM, csrPEM, err := token.GenerateIdentity()
 	if err != nil {
-		return fail("Invalid enrollment token.",
+		return fail("Could not generate a data-plane keypair.", err.Error())
+	}
+	tok, err := token.Enroll(raw, csrPEM)
+	if err != nil {
+		return fail("Invalid or unusable enrollment token.",
 			"Get a fresh token from the Connections page in your dashboard — tokens expire after 72 hours.")
 	}
 
@@ -75,12 +82,15 @@ func runDeploy(raw string) error {
 	ui.Title("Origamy data plane")
 	ui.KV("Data plane", ui.Bold(tok.ID))
 	ui.KV("Control", tok.Addr)
+	if tok.Cert != "" {
+		ui.KV("Identity", "mTLS certificate issued")
+	}
 
 	switch {
 	case hasKubernetes():
-		return deployKubernetes(tok)
+		return deployKubernetes(tok, keyPEM)
 	case hasDocker():
-		return deployDocker(tok)
+		return deployDocker(tok, keyPEM)
 	default:
 		return fail("No Kubernetes cluster or Docker found on this machine.",
 			"Install Docker (https://docs.docker.com/get-docker/) or point kubectl at a cluster, then retry.")
@@ -96,7 +106,7 @@ func hasKubernetes() bool {
 	return runQuiet("kubectl", "cluster-info") == nil
 }
 
-func deployKubernetes(tok *token.Enrollment) error {
+func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 	if _, err := exec.LookPath("helm"); err != nil {
 		return fail("Helm is required for Kubernetes installs.",
 			"Install it from https://helm.sh/docs/intro/install/ and retry.")
@@ -152,6 +162,29 @@ func deployKubernetes(tok *token.Enrollment) error {
 		return diagnose(out)
 	}
 	sp.Success("Auth token stored securely")
+
+	// mTLS identity: store the issued client cert + private key + CA chain as a
+	// Secret (piped via stdin, so the key never hits shell history). The
+	// portal-agent mounts this for the mTLS tunnel. Only present when the control
+	// plane issued a cert (mTLS configured).
+	if tok.Cert != "" {
+		sp = ui.Start("Storing the mTLS identity as a Kubernetes Secret")
+		if out, err := runPipedCaptured(
+			[]string{
+				"kubectl", "create", "secret", "generic", "origamy-byod-identity",
+				"--namespace", namespace,
+				"--from-literal=tls.crt=" + tok.Cert,
+				"--from-literal=tls.key=" + string(keyPEM),
+				"--from-literal=ca.crt=" + tok.CAChain,
+				"--dry-run=client", "-o", "yaml",
+			},
+			[]string{"kubectl", "apply", "-f", "-"},
+		); err != nil {
+			sp.Fail("Could not store the mTLS identity")
+			return diagnose(out)
+		}
+		sp.Success("mTLS identity stored securely")
+	}
 
 	// External ClickHouse: store the password in a Secret (piped via stdin, so
 	// it never appears in shell history) and reference it from the chart — NOT
@@ -408,7 +441,7 @@ func hasDocker() bool {
 	return runQuiet("docker", "info") == nil
 }
 
-func deployDocker(tok *token.Enrollment) error {
+func deployDocker(tok *token.Enrollment, keyPEM []byte) error {
 	ui.Title("Target")
 	ui.Success("Docker detected")
 
@@ -449,6 +482,17 @@ func deployDocker(tok *token.Enrollment) error {
 		return fail("Could not write .env.", err.Error())
 	}
 	ui.Success("Wrote .env")
+
+	// mTLS identity files for the portal-agent (only when the control plane
+	// issued a cert). The private key stays on disk here, never transmitted.
+	if tok.Cert != "" {
+		for name, content := range map[string]string{"tls.crt": tok.Cert, "tls.key": string(keyPEM), "ca.crt": tok.CAChain} {
+			if err := os.WriteFile(name, []byte(content), 0o600); err != nil {
+				return fail("Could not write "+name+".", err.Error())
+			}
+		}
+		ui.Success("Wrote mTLS identity (tls.crt, tls.key, ca.crt)")
+	}
 
 	ui.Title("Bringing services online")
 	sp = ui.Start("Starting services (%s)", selected.label)
