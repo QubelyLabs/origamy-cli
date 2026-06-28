@@ -22,6 +22,12 @@ type Enrollment struct {
 	// + URL, never the credential. It's redeemed for the real params at
 	// <URL>/v1/byod/enroll/resolve.
 	Handle string `json:"h"`
+
+	// Cert / CAChain are populated when enrollment went through /byod/register
+	// (mTLS): the data plane's signed client cert and the issuing CA chain. Empty
+	// when the control plane has no CA configured (bearer-only fallback).
+	Cert    string `json:"-"`
+	CAChain string `json:"-"`
 }
 
 // Decode parses a dpe_ enrollment token into install parameters.
@@ -32,6 +38,23 @@ type Enrollment struct {
 //   - v1 (legacy): the token embedded the credential directly. Still accepted so
 //     tokens minted just before the upgrade keep working.
 func Decode(raw string) (*Enrollment, error) {
+	tok, err := decodeRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	if tok.Handle != "" {
+		return redeem(tok.URL, tok.Handle)
+	}
+	// Legacy self-contained token.
+	if tok.ID == "" || tok.Tok == "" {
+		return nil, fmt.Errorf("token is missing required fields — generate a new one from your dashboard")
+	}
+	return tok, nil
+}
+
+// decodeRaw base64-decodes a dpe_ token into its raw Enrollment (handle + url for
+// v2, embedded params for v1) without contacting the control plane.
+func decodeRaw(raw string) (*Enrollment, error) {
 	b64 := strings.TrimPrefix(raw, "dpe_")
 	b64 = strings.NewReplacer("-", "+", "_", "/").Replace(b64)
 	switch len(b64) % 4 {
@@ -47,15 +70,6 @@ func Decode(raw string) (*Enrollment, error) {
 	var tok Enrollment
 	if err := json.Unmarshal(data, &tok); err != nil {
 		return nil, fmt.Errorf("could not parse token: %w", err)
-	}
-
-	if tok.Handle != "" {
-		return redeem(tok.URL, tok.Handle)
-	}
-
-	// Legacy self-contained token.
-	if tok.ID == "" || tok.Tok == "" {
-		return nil, fmt.Errorf("token is missing required fields — generate a new one from your dashboard")
 	}
 	return &tok, nil
 }
