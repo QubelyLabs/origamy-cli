@@ -18,7 +18,7 @@ import (
 
 const (
 	helmChart   = "oci://ghcr.io/qubelylabs/charts/origamy-data-plane"
-	helmVersion = "0.1.9"
+	helmVersion = "0.1.10"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
