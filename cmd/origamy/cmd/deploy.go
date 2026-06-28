@@ -153,6 +153,26 @@ func deployKubernetes(tok *token.Enrollment) error {
 	}
 	sp.Success("Auth token stored securely")
 
+	// External ClickHouse: store the password in a Secret (piped via stdin, so
+	// it never appears in shell history) and reference it from the chart — NOT
+	// via --set, which would persist the password in helm release history.
+	if chMode == 2 {
+		sp = ui.Start("Storing ClickHouse password as a Kubernetes Secret")
+		if out, err := runPipedCaptured(
+			[]string{
+				"kubectl", "create", "secret", "generic", "origamy-clickhouse",
+				"--namespace", namespace,
+				"--from-literal=clickhouse-password=" + chPassword,
+				"--dry-run=client", "-o", "yaml",
+			},
+			[]string{"kubectl", "apply", "-f", "-"},
+		); err != nil {
+			sp.Fail("Could not store ClickHouse password")
+			return diagnose(out)
+		}
+		sp.Success("ClickHouse password stored securely")
+	}
+
 	helmArgs := []string{
 		"upgrade", "--install", release, helmChart,
 		"--namespace", namespace,
@@ -171,7 +191,9 @@ func deployKubernetes(tok *token.Enrollment) error {
 		helmArgs = append(helmArgs,
 			"--set", "clickhouse.enabled=false",
 			"--set", "clickhouse.host="+chHost,
-			"--set", "clickhouse.password="+chPassword,
+			// Password sourced from the origamy-clickhouse Secret created above,
+			// never --set (which would leak it into helm release history).
+			"--set", "clickhouse.existingSecret=origamy-clickhouse",
 		)
 	}
 
