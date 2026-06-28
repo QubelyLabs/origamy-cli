@@ -15,6 +15,15 @@ build-all:
 	GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY)_darwin_arm64  ./cmd/origamy
 	# SHA256SUMS lets install.sh verify the downloaded binary's integrity.
 	cd $(BUILD_DIR) && { sha256sum $(BINARY)_* 2>/dev/null || shasum -a 256 $(BINARY)_*; } > SHA256SUMS
+	# Detached Ed25519 signature over SHA256SUMS. The signing key lives OUTSIDE
+	# the release (ORIGAMY_RELEASE_KEY), so a tampered release is detectable, not
+	# just corruption. install.sh verifies it with the embedded public key.
+	@if [ -n "$(ORIGAMY_RELEASE_KEY)" ]; then \
+		openssl pkeyutl -sign -inkey "$(ORIGAMY_RELEASE_KEY)" -rawin -in $(BUILD_DIR)/SHA256SUMS -out $(BUILD_DIR)/SHA256SUMS.sig && \
+		echo "Signed SHA256SUMS -> SHA256SUMS.sig"; \
+	else \
+		echo "WARNING: ORIGAMY_RELEASE_KEY not set — SHA256SUMS will be UNSIGNED. Point it at your Ed25519 release private key to sign."; \
+	fi
 
 release: build-all
 	@echo "Creating GitHub release $(VERSION)..."
@@ -27,6 +36,10 @@ release: build-all
 		$(BUILD_DIR)/$(BINARY)_darwin_amd64 \
 		$(BUILD_DIR)/$(BINARY)_darwin_arm64 \
 		$(BUILD_DIR)/SHA256SUMS
+	@if [ -f $(BUILD_DIR)/SHA256SUMS.sig ]; then \
+		gh release upload $(VERSION) --repo qubelylabs/origamy-cli $(BUILD_DIR)/SHA256SUMS.sig && \
+		echo "Uploaded SHA256SUMS.sig"; \
+	fi
 
 test:
 	go test ./...
