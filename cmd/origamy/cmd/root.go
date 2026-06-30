@@ -26,5 +26,6 @@ func Execute() {
 
 func init() {
 	rootCmd.AddCommand(deployCmd)
+	rootCmd.AddCommand(uninstallCmd)
 	rootCmd.AddCommand(versionCmd)
 }
