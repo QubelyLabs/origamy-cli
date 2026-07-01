@@ -143,9 +143,15 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 	fmt.Printf("  %s  %s  %s\n", ui.Cyan("2"), ui.Bold(fmt.Sprintf("%-12s", "Ingress")), ui.Gray("HTTPS on your own domain (needs an ingress controller)"))
 	fmt.Printf("  %s  %s  %s\n", ui.Cyan("3"), ui.Bold(fmt.Sprintf("%-12s", "Internal")), ui.Gray("ClusterIP only — expose later"))
 	exposeMode := promptChoice("Choose 1-3", 1, 3, 1)
-	var ingressHost string
+	var ingressHost, ingressClass string
 	if exposeMode == 2 {
 		ingressHost = promptString("Event domain (e.g. events.mycompany.com)")
+		// An Ingress with no ingressClassName is claimed by NO controller when the
+		// cluster has no default class — it silently 404s. Default to nginx.
+		ingressClass = promptString("Ingress class (nginx, alb, …) [nginx]")
+		if ingressClass == "" {
+			ingressClass = "nginx"
+		}
 	}
 
 	// — Provision ——————————————————————————————————————————————————————————
@@ -257,6 +263,7 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 		helmArgs = append(helmArgs,
 			"--set", "ingestGateway.ingress.enabled=true",
 			"--set", "ingestGateway.ingress.host="+ingressHost,
+			"--set", "ingestGateway.ingress.className="+ingressClass,
 		)
 	}
 
