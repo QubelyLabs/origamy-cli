@@ -244,7 +244,15 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 	}
 	switch exposeMode {
 	case 1: // LoadBalancer
-		helmArgs = append(helmArgs, "--set", "ingestGateway.service.type=LoadBalancer")
+		helmArgs = append(helmArgs,
+			"--set", "ingestGateway.service.type=LoadBalancer",
+			// Request an INTERNET-FACING LB. The AWS Load Balancer Controller
+			// (common on EKS) defaults NLBs to `internal` scheme — which lands the
+			// gateway on private VPC IPs, unreachable by browser/SDK traffic. This
+			// annotation forces public; the in-tree/GKE/AKS providers (which are
+			// internet-facing by default) ignore it harmlessly.
+			"--set-string", `ingestGateway.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing`,
+		)
 	case 2: // Ingress
 		helmArgs = append(helmArgs,
 			"--set", "ingestGateway.ingress.enabled=true",
