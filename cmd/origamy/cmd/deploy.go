@@ -18,7 +18,7 @@ import (
 
 const (
 	helmChart   = "oci://ghcr.io/qubelylabs/charts/origamy-data-plane"
-	helmVersion = "0.1.10"
+	helmVersion = "0.1.12"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
@@ -135,6 +135,19 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 		chPassword = promptString("ClickHouse password")
 	}
 
+	// — Event endpoint ————————————————————————————————————————————————————
+	// How the gateway is exposed for SDK traffic. ClusterIP (internal) alone
+	// means events can't reach the plane from outside the cluster.
+	ui.Title("Event endpoint")
+	fmt.Printf("  %s  %s  %s\n", ui.Cyan("1"), ui.Bold(fmt.Sprintf("%-12s", "LoadBalancer")), ui.Gray("cloud load balancer on :8081 (EKS/GKE/AKS)"))
+	fmt.Printf("  %s  %s  %s\n", ui.Cyan("2"), ui.Bold(fmt.Sprintf("%-12s", "Ingress")), ui.Gray("HTTPS on your own domain (needs an ingress controller)"))
+	fmt.Printf("  %s  %s  %s\n", ui.Cyan("3"), ui.Bold(fmt.Sprintf("%-12s", "Internal")), ui.Gray("ClusterIP only — expose later"))
+	exposeMode := promptChoice("Choose 1-3", 1, 3, 1)
+	var ingressHost string
+	if exposeMode == 2 {
+		ingressHost = promptString("Event domain (e.g. events.mycompany.com)")
+	}
+
 	// — Provision ——————————————————————————————————————————————————————————
 	ui.Title("Provisioning")
 
@@ -229,6 +242,15 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 			"--set", "clickhouse.existingSecret=origamy-clickhouse",
 		)
 	}
+	switch exposeMode {
+	case 1: // LoadBalancer
+		helmArgs = append(helmArgs, "--set", "ingestGateway.service.type=LoadBalancer")
+	case 2: // Ingress
+		helmArgs = append(helmArgs,
+			"--set", "ingestGateway.ingress.enabled=true",
+			"--set", "ingestGateway.ingress.host="+ingressHost,
+		)
+	}
 
 	sp = ui.Start("Installing data plane (%s) via Helm", selected.label)
 	if out, err := runCaptured("helm", helmArgs...); err != nil {
@@ -252,11 +274,32 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 		}
 	}
 
+	// — Resolve the SDK event endpoint ————————————————————————————————————
+	var eventURL, eventHint string
+	switch exposeMode {
+	case 1: // LoadBalancer — wait for the cloud LB address
+		spURL := ui.Start("Waiting for the load balancer address")
+		if addr := waitForGatewayLB(namespace); addr != "" {
+			eventURL = fmt.Sprintf("http://%s:%d", addr, gatewayAPIPort)
+			spURL.Success("Load balancer ready")
+		} else {
+			spURL.Warn("Load balancer still provisioning")
+			eventHint = "kubectl get svc -n " + namespace + " " + release + "-ingestion-gateway"
+		}
+	case 2: // Ingress
+		eventURL = "https://" + ingressHost
+	default: // Internal
+		eventHint = "kubectl port-forward -n " + namespace + " svc/" + release + "-ingestion-gateway " + fmt.Sprintf("%d:%d", gatewayAPIPort, gatewayAPIPort)
+	}
+
 	// — Summary ———————————————————————————————————————————————————————————
 	lines := []string{
 		ui.Gray("Data plane  ") + ui.Bold(tok.ID),
 		ui.Gray("Size        ") + selected.label,
 		ui.Gray("Namespace   ") + namespace,
+	}
+	if eventURL != "" {
+		lines = append(lines, ui.Gray("Send events ")+ui.Bold(eventURL+"/v1/identify"))
 	}
 	if allReady {
 		lines = append(lines, "", ui.Green("Your dashboard will show it as Connected shortly."))
@@ -267,8 +310,34 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 			"  kubectl get pods -n "+namespace,
 		)
 	}
+	if eventURL != "" {
+		lines = append(lines, "", ui.Gray("Paste the event URL into your source's Setup tab in the dashboard."))
+	} else if eventHint != "" {
+		lines = append(lines, "", ui.Gray("Get your event endpoint:"), "  "+eventHint)
+	}
 	ui.Box("Deployed", lines)
 	return nil
+}
+
+// gatewayAPIPort is the ingestion gateway's HTTP API port (matches the chart's
+// ingestGateway.apiPort). SDK events POST to <endpoint>:<port>/v1/identify etc.
+const gatewayAPIPort = 8081
+
+// waitForGatewayLB polls the ingestion-gateway Service for a cloud
+// load-balancer address (hostname or IP), for up to ~90s. Returns "" if the LB
+// is still provisioning.
+func waitForGatewayLB(ns string) string {
+	svc := release + "-ingestion-gateway"
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := runCaptured("kubectl", "get", "svc", svc, "-n", ns,
+			"-o", "jsonpath={.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}")
+		if addr := strings.TrimSpace(out); err == nil && addr != "" {
+			return addr
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return ""
 }
 
 // watchReadiness polls pod status and drives the spinner with live progress.
