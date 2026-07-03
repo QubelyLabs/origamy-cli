@@ -55,8 +55,13 @@ Get your enrollment token from the Connections page in your Origamy dashboard.`,
 	SilenceErrors: true,
 }
 
+// deployChartVersion optionally overrides the pinned helmVersion for the initial
+// install (bound to --version). Empty means "use the CLI's pinned default".
+var deployChartVersion string
+
 func init() {
 	deployCmd.Flags().StringP("token", "t", "", "Enrollment token from your Origamy dashboard (required)")
+	deployCmd.Flags().StringVar(&deployChartVersion, "version", "", "Chart version to install (default: the CLI's pinned version)")
 	_ = deployCmd.MarkFlagRequired("token")
 }
 
@@ -225,10 +230,14 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 		sp.Success("ClickHouse password stored securely")
 	}
 
+	chartVer := helmVersion
+	if deployChartVersion != "" {
+		chartVer = deployChartVersion
+	}
 	helmArgs := []string{
 		"upgrade", "--install", release, helmChart,
 		"--namespace", namespace,
-		"--version", helmVersion,
+		"--version", chartVer,
 		"--set", "controlPlane.url=" + tok.Addr,
 		"--set", "controlPlane.httpUrl=" + tok.URL,
 		"--set", "controlPlane.dataPlaneId=" + tok.ID,
