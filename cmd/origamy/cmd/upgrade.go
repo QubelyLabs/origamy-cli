@@ -24,7 +24,8 @@ roll. Reuses your existing configuration, so no token is needed.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		version, _ := cmd.Flags().GetString("version")
 		channel, _ := cmd.Flags().GetString("channel")
-		return runUpgrade(version, channel)
+		sets, _ := cmd.Flags().GetStringArray("set")
+		return runUpgrade(version, channel, sets)
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -33,14 +34,19 @@ roll. Reuses your existing configuration, so no token is needed.`,
 func init() {
 	upgradeCmd.Flags().String("version", "", "Target chart version (default: latest published)")
 	upgradeCmd.Flags().String("channel", "stable", "Release channel: stable (pinned) or edge (:main)")
+	upgradeCmd.Flags().StringArray("set", nil, "Set a chart value (key=value, repeatable; Kubernetes only). New values introduced by a chart version don't exist in the release yet, so --reuse-values alone can't set them.")
 }
 
-func runUpgrade(version, channel string) error {
+func runUpgrade(version, channel string, sets []string) error {
 	ui.Title("Origamy data plane — upgrade")
 	switch {
 	case hasKubernetes() && releaseInstalled():
-		return upgradeKubernetes(version, channel)
+		return upgradeKubernetes(version, channel, sets)
 	case hasDocker():
+		if len(sets) > 0 {
+			return fail("--set applies to Kubernetes installs only.",
+				"Docker installs configure via .env; edit it directly and rerun without --set.")
+		}
 		return upgradeDocker(version, channel)
 	default:
 		return fail("No existing Origamy data plane found on this machine.",
@@ -48,7 +54,7 @@ func runUpgrade(version, channel string) error {
 	}
 }
 
-func upgradeKubernetes(version, channel string) error {
+func upgradeKubernetes(version, channel string, sets []string) error {
 	if _, err := exec.LookPath("helm"); err != nil {
 		return fail("Helm is required for Kubernetes upgrades.",
 			"Install it from https://helm.sh/docs/intro/install/ and retry.")
@@ -86,6 +92,11 @@ func upgradeKubernetes(version, channel string) error {
 	if channel == "edge" {
 		// Track the moving :main image tag instead of the pinned appVersion.
 		args = append(args, "--set", "global.imageTag=main")
+	}
+	// Operator-supplied values (e.g. a key a new chart version introduced,
+	// which --reuse-values can't know about). Passed to helm verbatim.
+	for _, s := range sets {
+		args = append(args, "--set", s)
 	}
 
 	sp := ui.Start("Upgrading the chart to %s", target)
