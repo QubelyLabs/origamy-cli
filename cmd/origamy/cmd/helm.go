@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -60,6 +61,49 @@ func latestChartVersion() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("could not read chart version from the registry")
+}
+
+// dataPlaneImageRepo identifies an Origamy data-plane service image (as opposed
+// to a bundled datastore like ClickHouse/Postgres, whose tags are upstream
+// versions and must never be moved to a chart version).
+const dataPlaneImageRepo = "origamy-data-plane/"
+
+// serviceImageKeys returns the top-level value keys whose image is an Origamy
+// data-plane service (bulkerWorker, portalAgent, …) in the current release's
+// coalesced values. Used to re-pin every service on a version bump: helm
+// --reuse-values carries forward each service's frozen image.tag, and the
+// chart's image helper lets a per-service tag SHADOW global.imageTag/appVersion
+// — so without clearing them a pinned upgrade silently keeps the old images
+// (the pre-pinning 0.1.12 chart froze tag: main, stranding upgrades on :main).
+// Best-effort: on any error it returns nil and the caller falls back to
+// global.imageTag alone. Datastore images are excluded by repository prefix.
+func serviceImageKeys() []string {
+	out, err := runCaptured("helm", "get", "values", release, "-n", namespace, "--all", "-o", "json")
+	if err != nil {
+		return nil
+	}
+	var vals map[string]any
+	if err := json.Unmarshal([]byte(out), &vals); err != nil {
+		return nil
+	}
+	var keys []string
+	for k, v := range vals {
+		svc, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		img, ok := svc["image"].(map[string]any)
+		if !ok {
+			continue
+		}
+		repo, _ := img["repository"].(string)
+		if !strings.Contains(repo, dataPlaneImageRepo) {
+			continue // datastore or unrelated image — leave its tag alone
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // chartVersion extracts the version suffix from a Helm chart string
