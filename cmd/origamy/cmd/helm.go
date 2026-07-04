@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,6 +10,24 @@ import (
 	"sort"
 	"strings"
 )
+
+// existingOrRandom returns the value of key from the dotenv at path if it is
+// already set (so a re-deploy keeps a datastore password stable — rotating it
+// would lock out the datastore that holds data), otherwise a fresh 32-byte
+// URL-safe random secret. Generated locally; never transmitted.
+func existingOrRandom(path, key string) string {
+	if v := readEnvVar(path, key); v != "" {
+		return v
+	}
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing is effectively impossible on a real host; if it
+		// ever does, "" leaves that datastore unauthenticated (no auth = the
+		// backward-compatible default), never a weak/predictable password.
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
 
 // ── Helm release introspection ──────────────────────────────────────────────
 // Shared by upgrade/rollback/status. The chart coordinates (helmChart,
