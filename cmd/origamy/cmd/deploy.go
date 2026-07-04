@@ -565,16 +565,31 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte) error {
 		sp.Fail("Download failed")
 		return diagnose(out)
 	}
+	// ClickHouse users.d config that sets the default-user password from the env.
+	if out, err := runCaptured("curl", "-fsSL", tok.URL+"/byod/clickhouse-users.xml", "-o", "clickhouse-users.xml"); err != nil {
+		sp.Fail("Download failed")
+		return diagnose(out)
+	}
 	sp.Success("Compose file and schema downloaded")
 
+	// Datastore passwords are generated HERE, in the customer's environment, and
+	// written to the local .env — they never reach Origamy. Reuse any already in
+	// .env from a prior deploy so a re-deploy doesn't rotate them out from under
+	// the running datastores (which hold data).
+	redisPw := existingOrRandom(".env", "DP_REDIS_PASSWORD")
+	natsPw := existingOrRandom(".env", "NATS_PASSWORD")
+	chPw := existingOrRandom(".env", "CLICKHOUSE_PASSWORD")
+
 	env := fmt.Sprintf(
-		"CONTROL_PLANE_ADDR=%s\nCONFIG_URL=%s\nDATA_PLANE_ID=%s\nAUTH_TOKEN=%s\nTLS_ENABLED=true\nDP_IMAGE_TAG=main\nLOG_LEVEL=info\nDEPLOYMENT_PRESET=%s\n",
+		"CONTROL_PLANE_ADDR=%s\nCONFIG_URL=%s\nDATA_PLANE_ID=%s\nAUTH_TOKEN=%s\nTLS_ENABLED=true\nDP_IMAGE_TAG=main\nLOG_LEVEL=info\nDEPLOYMENT_PRESET=%s\n"+
+			"DP_REDIS_PASSWORD=%s\nNATS_PASSWORD=%s\nCLICKHOUSE_PASSWORD=%s\n",
 		tok.Addr, tok.URL, tok.ID, tok.Tok, selected.name,
+		redisPw, natsPw, chPw,
 	)
 	if err := os.WriteFile(".env", []byte(env), 0o600); err != nil {
 		return fail("Could not write .env.", err.Error())
 	}
-	ui.Success("Wrote .env")
+	ui.Success("Wrote .env (datastore passwords generated locally — never sent to Origamy)")
 
 	// mTLS identity files for the portal-agent (only when the control plane
 	// issued a cert). The private key stays on disk here, never transmitted.
