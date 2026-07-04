@@ -89,12 +89,26 @@ func upgradeKubernetes(version, channel string, sets []string) error {
 		"--version", target,
 		"--reuse-values",
 	}
+
+	// Resolve the image tag every data-plane service should run, then pin it
+	// both globally AND per-service. Per-service is not redundant: --reuse-values
+	// carries each service's frozen image.tag forward, and the chart's image
+	// helper (.image.tag | default .global.imageTag | default .appVersion) lets
+	// a non-empty per-service tag SHADOW global.imageTag — so a release first
+	// installed on the pre-pinning 0.1.12 chart (which froze tag: main) would
+	// otherwise stay on :main no matter the target version.
+	imageTag := target // pinned appVersion of the target chart
 	if channel == "edge" {
-		// Track the moving :main image tag instead of the pinned appVersion.
-		args = append(args, "--set", "global.imageTag=main")
+		imageTag = "main" // track the moving edge tag instead
 	}
-	// Operator-supplied values (e.g. a key a new chart version introduced,
-	// which --reuse-values can't know about). Passed to helm verbatim.
+	args = append(args, "--set", "global.imageTag="+imageTag)
+	for _, svc := range serviceImageKeys() {
+		args = append(args, "--set", svc+".image.tag="+imageTag)
+	}
+
+	// Operator-supplied values LAST so they win over the pins above (e.g. a key
+	// a new chart version introduced, which --reuse-values can't know about, or
+	// a deliberate per-service tag override). Passed to helm verbatim.
 	for _, s := range sets {
 		args = append(args, "--set", s)
 	}
