@@ -18,7 +18,7 @@ import (
 
 const (
 	helmChart   = "oci://ghcr.io/qubelylabs/charts/origamy-data-plane"
-	helmVersion = "0.1.12"
+	helmVersion = "0.1.15" // first chart that wires the portal-agent mTLS client cert (identitySecret)
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
@@ -245,6 +245,13 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 		"--set", "portalAgent.existingSecret=origamy-byod-token",
 		"--set", "portalAgent.existingSecretAuthKey=auth-token",
 		"--set", "preset=" + selected.name,
+	}
+	// mTLS: point the portal-agent at the identity Secret we stored above so it
+	// presents its client cert on the tunnel and auto-rotates it (chart >= 0.1.15).
+	// Required once the control plane enforces client certs (Phase 6); without
+	// it the agent connects bearer-only and is refused at the handshake.
+	if tok.Cert != "" {
+		helmArgs = append(helmArgs, "--set", "portalAgent.tunnelTLS.identitySecret=origamy-byod-identity")
 	}
 	if chMode == 1 {
 		helmArgs = append(helmArgs, "--set", "clickhouse.enabled=true")
@@ -586,20 +593,33 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte) error {
 		tok.Addr, tok.URL, tok.ID, tok.Tok, selected.name,
 		redisPw, natsPw, chPw,
 	)
+	if tok.Cert != "" {
+		// Present the mTLS client cert on the tunnel. The compose bundle mounts
+		// ./certs into the portal-agent at /certs; the renew loop rotates the
+		// cert in place there. Required once the control plane enforces client
+		// certs (Phase 6) — otherwise the agent connects bearer-only and is
+		// refused at the handshake.
+		env += "TUNNEL_TLS_CERT=/certs/tls.crt\nTUNNEL_TLS_KEY=/certs/tls.key\n"
+	}
 	if err := os.WriteFile(".env", []byte(env), 0o600); err != nil {
 		return fail("Could not write .env.", err.Error())
 	}
 	ui.Success("Wrote .env (datastore passwords generated locally — never sent to Origamy)")
 
 	// mTLS identity files for the portal-agent (only when the control plane
-	// issued a cert). The private key stays on disk here, never transmitted.
+	// issued a cert). Written into ./certs — the same dir the compose bundle
+	// bind-mounts read-write, so the renew loop's rotations persist across
+	// restarts. The private key stays on disk here, never transmitted.
 	if tok.Cert != "" {
+		if err := os.MkdirAll("certs", 0o700); err != nil {
+			return fail("Could not create certs directory.", err.Error())
+		}
 		for name, content := range map[string]string{"tls.crt": tok.Cert, "tls.key": string(keyPEM), "ca.crt": tok.CAChain} {
-			if err := os.WriteFile(name, []byte(content), 0o600); err != nil {
-				return fail("Could not write "+name+".", err.Error())
+			if err := os.WriteFile("certs/"+name, []byte(content), 0o600); err != nil {
+				return fail("Could not write certs/"+name+".", err.Error())
 			}
 		}
-		ui.Success("Wrote mTLS identity (tls.crt, tls.key, ca.crt)")
+		ui.Success("Wrote mTLS identity (certs/tls.crt, tls.key, ca.crt)")
 	}
 
 	ui.Title("Bringing services online")
