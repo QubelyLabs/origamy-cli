@@ -38,3 +38,49 @@ func TestExistingOrRandom(t *testing.T) {
 		t.Fatal("expected generated secret for absent key")
 	}
 }
+
+func TestAIToggleArgs(t *testing.T) {
+	// --enable-ai (deploy install and upgrade --enable-ai both feed this) →
+	// the helm arg slice sets orchestratorEngine.enabled=true.
+	got, err := aiToggleArgs(true, false)
+	if err != nil {
+		t.Fatalf("enable: unexpected error: %v", err)
+	}
+	if !containsPair(got, "--set", "orchestratorEngine.enabled=true") {
+		t.Fatalf("enable: expected orchestratorEngine.enabled=true, got %v", got)
+	}
+
+	// --disable-ai → orchestratorEngine.enabled=false.
+	got, err = aiToggleArgs(false, true)
+	if err != nil {
+		t.Fatalf("disable: unexpected error: %v", err)
+	}
+	if !containsPair(got, "--set", "orchestratorEngine.enabled=false") {
+		t.Fatalf("disable: expected orchestratorEngine.enabled=false, got %v", got)
+	}
+
+	// Neither flag → no args, no error (default install leaves AI off).
+	got, err = aiToggleArgs(false, false)
+	if err != nil {
+		t.Fatalf("neither: unexpected error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("neither: expected no args, got %v", got)
+	}
+
+	// --enable-ai + --disable-ai together is a user error.
+	if _, err := aiToggleArgs(true, true); err == nil {
+		t.Fatal("both: expected an error when --enable-ai and --disable-ai are combined")
+	}
+}
+
+// containsPair reports whether args holds k immediately followed by v (a helm
+// "--set", "key=value" pair).
+func containsPair(args []string, k, v string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == k && args[i+1] == v {
+			return true
+		}
+	}
+	return false
+}

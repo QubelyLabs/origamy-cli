@@ -45,11 +45,19 @@ Auto-detects your environment:
   • Kubernetes cluster (kubectl) → Helm install into origamy-dp namespace
   • Docker                       → Docker Compose in ./origamy-dp-<id>/
 
-Get your enrollment token from the Connections page in your Origamy dashboard.`,
-	Example: `  origamy deploy --token dpe_xxx`,
+Get your enrollment token from the Connections page in your Origamy dashboard.
+
+Add --enable-ai (or answer the prompt) to also switch on the agentic AI engine
+during install (Kubernetes only). The engine adds ~1 pod and stays inert until
+you enable AI and add an LLM credential in your dashboard — you can also add it
+later with 'origamy upgrade --enable-ai'.`,
+	Example: `  origamy deploy --token dpe_xxx
+  origamy deploy --token dpe_xxx --enable-ai`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		t, _ := cmd.Flags().GetString("token")
-		return runDeploy(t)
+		enableAI, _ := cmd.Flags().GetBool("enable-ai")
+		aiSet := cmd.Flags().Changed("enable-ai")
+		return runDeploy(t, enableAI, aiSet)
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -62,10 +70,11 @@ var deployChartVersion string
 func init() {
 	deployCmd.Flags().StringP("token", "t", "", "Enrollment token from your Origamy dashboard (required)")
 	deployCmd.Flags().StringVar(&deployChartVersion, "version", "", "Chart version to install (default: the CLI's pinned version)")
+	deployCmd.Flags().Bool("enable-ai", false, "Enable the Origamy AI (agentic) engine at install (Kubernetes only)")
 	_ = deployCmd.MarkFlagRequired("token")
 }
 
-func runDeploy(raw string) error {
+func runDeploy(raw string, enableAI, aiSet bool) error {
 	// Generate a keypair + CSR locally so enrollment can request an mTLS identity
 	// — the private key never leaves this machine. Enroll falls back to a
 	// bearer-only token if the control plane has no CA configured.
@@ -93,9 +102,9 @@ func runDeploy(raw string) error {
 
 	switch {
 	case hasKubernetes():
-		return deployKubernetes(tok, keyPEM)
+		return deployKubernetes(tok, keyPEM, enableAI, aiSet)
 	case hasDocker():
-		return deployDocker(tok, keyPEM)
+		return deployDocker(tok, keyPEM, enableAI, aiSet)
 	default:
 		return fail("No Kubernetes cluster or Docker found on this machine.",
 			"Install Docker (https://docs.docker.com/get-docker/) or point kubectl at a cluster, then retry.")
@@ -111,7 +120,7 @@ func hasKubernetes() bool {
 	return runQuiet("kubectl", "cluster-info") == nil
 }
 
-func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
+func deployKubernetes(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) error {
 	if _, err := exec.LookPath("helm"); err != nil {
 		return fail("Helm is required for Kubernetes installs.",
 			"Install it from https://helm.sh/docs/intro/install/ and retry.")
@@ -127,6 +136,20 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 	}
 	tierIdx := promptChoice("Choose 1-3", 1, len(presets), 1)
 	selected := presets[tierIdx-1]
+
+	// — AI engine ————————————————————————————————————————————————————————
+	// AI is a package customers buy; enabling it here adds ~1 pod. The flag wins
+	// when set on the command line, otherwise we ask. The engine stays inert
+	// until the workspace opts into AI and adds an LLM credential in the
+	// dashboard — CLI controls engine presence, the control plane controls use.
+	aiEnabled := enableAI
+	if !aiSet {
+		ui.Title("AI engine")
+		aiEnabled = promptYesNo("Enable the Origamy AI engine? Adds ~1 pod; requires the AI package in your dashboard.", false)
+	}
+	if aiEnabled && selected.name == "starter" {
+		ui.Warn("The AI engine adds a pod; the Starter tier is sized for dev/test. Consider Standard for production use.")
+	}
 
 	// — ClickHouse ————————————————————————————————————————————————————————
 	ui.Title("ClickHouse")
@@ -253,6 +276,11 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 	if tok.Cert != "" {
 		helmArgs = append(helmArgs, "--set", "portalAgent.tunnelTLS.identitySecret=origamy-byod-identity")
 	}
+	// AI engine: the chart auto-generates the engine's KEK + API token when this
+	// flips true, so we pass only the boolean — never a secret (disable is unused
+	// at install; that path lives in `origamy upgrade`).
+	aiArgs, _ := aiToggleArgs(aiEnabled, false)
+	helmArgs = append(helmArgs, aiArgs...)
 	if chMode == 1 {
 		helmArgs = append(helmArgs, "--set", "clickhouse.enabled=true")
 	} else {
@@ -329,6 +357,9 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 		ui.Gray("Size        ") + selected.label,
 		ui.Gray("Namespace   ") + namespace,
 	}
+	if aiEnabled {
+		lines = append(lines, ui.Gray("AI engine   ")+ui.Green("enabled"))
+	}
 	if eventURL != "" {
 		lines = append(lines, ui.Gray("Send events ")+ui.Bold(eventURL+"/v1/identify"))
 	}
@@ -345,6 +376,9 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte) error {
 		lines = append(lines, "", ui.Gray("Paste the event URL into your source's Setup tab in the dashboard."))
 	} else if eventHint != "" {
 		lines = append(lines, "", ui.Gray("Get your event endpoint:"), "  "+eventHint)
+	}
+	if !aiEnabled {
+		lines = append(lines, "", ui.Gray("Add the AI engine later:"), "  origamy upgrade --enable-ai")
 	}
 	ui.Box("Deployed", lines)
 	return nil
@@ -541,9 +575,15 @@ func hasDocker() bool {
 	return runQuiet("docker", "info") == nil
 }
 
-func deployDocker(tok *token.Enrollment, keyPEM []byte) error {
+func deployDocker(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) error {
 	ui.Title("Target")
 	ui.Success("Docker detected")
+
+	// The agentic engine runs on Kubernetes data planes only; the Docker compose
+	// bundle doesn't include it. Warn (don't block) if it was explicitly asked for.
+	if aiSet && enableAI {
+		ui.Warn("The AI engine is available on Kubernetes installs only; ignoring --enable-ai for this Docker deploy.")
+	}
 
 	dockerPresets := presets[:2] // Starter and Standard only for Docker
 	ui.Title("Deployment size")
@@ -664,6 +704,28 @@ func promptString(label string) string {
 	fmt.Printf("  %s: ", label)
 	line, _ := r.ReadString('\n')
 	return strings.TrimSpace(line)
+}
+
+// promptYesNo asks a yes/no question, returning defaultYes on an empty answer.
+func promptYesNo(label string, defaultYes bool) bool {
+	suffix := "[y/N]"
+	if defaultYes {
+		suffix = "[Y/n]"
+	}
+	r := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Printf("\n  %s %s ", label, ui.Gray(suffix))
+		line, _ := r.ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "":
+			return defaultYes
+		case "y", "yes":
+			return true
+		case "n", "no":
+			return false
+		}
+		ui.Warn("Please answer y or n.")
+	}
 }
 
 // ── error helpers ─────────────────────────────────────────────────────────────
