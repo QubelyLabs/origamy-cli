@@ -29,6 +29,56 @@ func existingOrRandom(path, key string) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
+// ── AI (orchestrator engine) enablement ─────────────────────────────────────
+
+// aiToggleArgs returns the helm --set arguments that switch the agentic
+// orchestrator engine on or off. The chart owns every secret: when
+// orchestratorEngine.enabled flips true it auto-generates the engine's KEK and
+// API token, so the CLI passes ONLY the boolean and never a credential. enable
+// and disable are mutually exclusive; passing both is a user error.
+func aiToggleArgs(enable, disable bool) ([]string, error) {
+	switch {
+	case enable && disable:
+		return nil, fmt.Errorf("--enable-ai and --disable-ai cannot be used together")
+	case enable:
+		return []string{"--set", "orchestratorEngine.enabled=true"}, nil
+	case disable:
+		return []string{"--set", "orchestratorEngine.enabled=false"}, nil
+	default:
+		return nil, nil
+	}
+}
+
+// exportReleaseValues writes the release's user-supplied values to a temp file
+// and returns its path (the caller removes it). Toggling a chart-default value
+// like orchestratorEngine.enabled must NOT go through `helm upgrade
+// --reuse-values`: when the target chart has gained new default structure the
+// old release never set, --reuse-values fails to parse the stale merged values.
+// Re-applying the user's own values from a file instead lets the new chart's
+// defaults fill the gaps cleanly while preserving every value the customer
+// supplied (controlPlane, portalAgent, preset, clickhouse, and the tunnel
+// identity Secret references).
+func exportReleaseValues() (string, error) {
+	out, err := runCaptured("helm", "get", "values", release, "-n", namespace, "-o", "yaml")
+	if err != nil {
+		return "", fmt.Errorf("%s", out)
+	}
+	f, err := os.CreateTemp("", "origamy-values-*.yaml")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(out); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
 // ── Helm release introspection ──────────────────────────────────────────────
 // Shared by upgrade/rollback/status. The chart coordinates (helmChart,
 // namespace, release) live in deploy.go.
