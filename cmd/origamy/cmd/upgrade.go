@@ -25,19 +25,29 @@ Use --enable-ai / --disable-ai (mutually exclusive) to switch the agentic AI
 engine on or off on an already-running data plane — this is how you turn on the
 AI package after you've deployed. The toggle preserves all your existing values
 and never touches your datastores. The engine stays inert until you enable AI
-and add an LLM credential in your dashboard.`,
+and add an LLM credential in your dashboard.
+
+Use --enable-predictor / --disable-predictor the same way for the predictor
+(conversion scoring) service. Like the AI toggle, it re-applies your values
+from a clean export so the chart's own defaults for the new service fill in —
+enabling it by hand with --set alone would hit missing-default errors on
+releases installed before the predictor existed.`,
 	Example: `  origamy upgrade                 # to the latest published version
   origamy upgrade --version 0.1.12
   origamy upgrade --channel edge  # track the bleeding edge (:main)
   origamy upgrade --enable-ai     # switch the AI engine on
-  origamy upgrade --disable-ai    # switch the AI engine off`,
+  origamy upgrade --disable-ai    # switch the AI engine off
+  origamy upgrade --enable-predictor   # switch the predictor (scoring) service on
+  origamy upgrade --disable-predictor  # switch the predictor off`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		version, _ := cmd.Flags().GetString("version")
 		channel, _ := cmd.Flags().GetString("channel")
 		sets, _ := cmd.Flags().GetStringArray("set")
 		enableAI, _ := cmd.Flags().GetBool("enable-ai")
 		disableAI, _ := cmd.Flags().GetBool("disable-ai")
-		return runUpgrade(version, channel, sets, enableAI, disableAI)
+		enablePredictor, _ := cmd.Flags().GetBool("enable-predictor")
+		disablePredictor, _ := cmd.Flags().GetBool("disable-predictor")
+		return runUpgrade(version, channel, sets, enableAI, disableAI, enablePredictor, disablePredictor)
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -49,18 +59,23 @@ func init() {
 	upgradeCmd.Flags().StringArray("set", nil, "Set a chart value (key=value, repeatable; Kubernetes only). New values introduced by a chart version don't exist in the release yet, so --reuse-values alone can't set them.")
 	upgradeCmd.Flags().Bool("enable-ai", false, "Switch the Origamy AI (agentic) engine on for the existing release (Kubernetes only)")
 	upgradeCmd.Flags().Bool("disable-ai", false, "Switch the Origamy AI (agentic) engine off for the existing release (Kubernetes only)")
+	upgradeCmd.Flags().Bool("enable-predictor", false, "Switch the predictor (conversion scoring) service on for the existing release (Kubernetes only)")
+	upgradeCmd.Flags().Bool("disable-predictor", false, "Switch the predictor (conversion scoring) service off for the existing release (Kubernetes only)")
 }
 
-func runUpgrade(version, channel string, sets []string, enableAI, disableAI bool) error {
-	// Validate the AI toggle up front (before any registry/cluster calls) so a
+func runUpgrade(version, channel string, sets []string, enableAI, disableAI, enablePredictor, disablePredictor bool) error {
+	// Validate the toggles up front (before any registry/cluster calls) so a
 	// conflicting request fails fast with a clear message.
 	if _, err := aiToggleArgs(enableAI, disableAI); err != nil {
 		return fail(err.Error(), "Pass one of --enable-ai or --disable-ai, not both.")
 	}
+	if _, err := predictorToggleArgs(enablePredictor, disablePredictor); err != nil {
+		return fail(err.Error(), "Pass one of --enable-predictor or --disable-predictor, not both.")
+	}
 	ui.Title("Origamy data plane — upgrade")
 	switch {
 	case hasKubernetes() && releaseInstalled():
-		return upgradeKubernetes(version, channel, sets, enableAI, disableAI)
+		return upgradeKubernetes(version, channel, sets, enableAI, disableAI, enablePredictor, disablePredictor)
 	case hasDocker():
 		if len(sets) > 0 {
 			return fail("--set applies to Kubernetes installs only.",
@@ -70,6 +85,10 @@ func runUpgrade(version, channel string, sets []string, enableAI, disableAI bool
 			return fail("--enable-ai/--disable-ai apply to Kubernetes installs only.",
 				"The AI engine runs on Kubernetes data planes; the Docker compose bundle doesn't include it.")
 		}
+		if enablePredictor || disablePredictor {
+			return fail("--enable-predictor/--disable-predictor apply to Kubernetes installs only.",
+				"The predictor runs on Kubernetes data planes; the Docker compose bundle doesn't include it.")
+		}
 		return upgradeDocker(version, channel)
 	default:
 		return fail("No existing Origamy data plane found on this machine.",
@@ -77,16 +96,19 @@ func runUpgrade(version, channel string, sets []string, enableAI, disableAI bool
 	}
 }
 
-func upgradeKubernetes(version, channel string, sets []string, enableAI, disableAI bool) error {
+func upgradeKubernetes(version, channel string, sets []string, enableAI, disableAI, enablePredictor, disablePredictor bool) error {
 	if _, err := exec.LookPath("helm"); err != nil {
 		return fail("Helm is required for Kubernetes upgrades.",
 			"Install it from https://helm.sh/docs/intro/install/ and retry.")
 	}
 
-	// aiToggle means the run's purpose includes flipping orchestratorEngine.enabled,
-	// which changes how we preserve values (see the -f branch below) and forces the
-	// upgrade to proceed even when already on the target version.
+	// A toggle means the run's purpose includes flipping a feature boolean
+	// (orchestratorEngine.enabled / predictor.enabled), which changes how we
+	// preserve values (see the -f branch below) and forces the upgrade to
+	// proceed even when already on the target version.
 	aiToggle := enableAI || disableAI
+	predictorToggle := enablePredictor || disablePredictor
+	toggle := aiToggle || predictorToggle
 
 	if cur, err := installedRelease(); err == nil {
 		ui.KV("Installed", cur.Chart+"  (revision "+cur.Revision+")")
@@ -106,9 +128,10 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	}
 	ui.KV("Target", target)
 
-	// An AI toggle must run even at the same version (that's how "buy AI later"
-	// flips the value on a release already on latest), so skip the no-op shortcut.
-	if !aiToggle {
+	// A feature toggle must run even at the same version (that's how "buy AI
+	// later" flips the value on a release already on latest), so skip the
+	// no-op shortcut.
+	if !toggle {
 		if cur, err := installedRelease(); err == nil && chartVersion(cur.Chart) == target && channel != "edge" {
 			ui.Success("Already on %s — nothing to upgrade.", target)
 			return nil
@@ -121,13 +144,15 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 		"--version", target,
 	}
 	// Value preservation: the normal version bump reuses the release's values in
-	// place. But toggling orchestratorEngine.enabled must NOT use --reuse-values —
-	// when the target chart adds new default structure the old release never set,
-	// --reuse-values fails to parse. For the toggle we export the user's values to
-	// a file and re-apply them, so the new chart's defaults fill the gaps cleanly
-	// while every customer value (controlPlane, portalAgent, preset, clickhouse,
-	// tunnel identity secret) is preserved.
-	if aiToggle {
+	// place. But toggling a feature boolean (orchestratorEngine.enabled /
+	// predictor.enabled) must NOT use --reuse-values — when the target chart has
+	// default structure the old release never set (the predictor block on a
+	// pre-predictor install, say), --reuse-values ignores the new chart's
+	// defaults and the render nil-derefs. For a toggle we export the user's
+	// values to a file and re-apply them, so the new chart's defaults fill the
+	// gaps cleanly while every customer value (controlPlane, portalAgent,
+	// preset, clickhouse, tunnel identity secret) is preserved.
+	if toggle {
 		valsFile, err := exportReleaseValues()
 		if err != nil {
 			return fail("Could not read the current release values.", err.Error())
@@ -154,10 +179,13 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 		args = append(args, "--set", svc+".image.tag="+imageTag)
 	}
 
-	// AI toggle (validated in runUpgrade, so this never errors here). Only the
-	// boolean is set — the chart owns the engine's KEK + API token generation.
+	// Feature toggles (validated in runUpgrade, so these never error here).
+	// Only booleans are set — the chart owns secret generation (AI KEK/token).
 	if aiArgs, _ := aiToggleArgs(enableAI, disableAI); len(aiArgs) > 0 {
 		args = append(args, aiArgs...)
+	}
+	if predArgs, _ := predictorToggleArgs(enablePredictor, disablePredictor); len(predArgs) > 0 {
+		args = append(args, predArgs...)
 	}
 
 	// Operator-supplied values LAST so they win over the pins above (e.g. a key
@@ -168,12 +196,21 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	}
 
 	action := fmt.Sprintf("Upgrading the chart to %s", target)
-	if aiToggle {
+	switch {
+	case aiToggle && predictorToggle:
+		action = fmt.Sprintf("Applying feature toggles (chart %s)", target)
+	case aiToggle:
 		verb := "Enabling"
 		if disableAI {
 			verb = "Disabling"
 		}
 		action = fmt.Sprintf("%s the AI engine (chart %s)", verb, target)
+	case predictorToggle:
+		verb := "Enabling"
+		if disablePredictor {
+			verb = "Disabling"
+		}
+		action = fmt.Sprintf("%s the predictor (chart %s)", verb, target)
 	}
 	sp := ui.Start("%s", action)
 	if out, err := runCaptured("helm", args...); err != nil {
@@ -197,12 +234,18 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 		ui.Gray("Version    ") + ui.Bold(target),
 		ui.Gray("Namespace  ") + namespace,
 	}
+	if enablePredictor {
+		boxLines = append(boxLines, ui.Gray("Predictor  ")+ui.Green("enabled"))
+	} else if disablePredictor {
+		boxLines = append(boxLines, ui.Gray("Predictor  ")+"disabled")
+	}
 	if enableAI {
 		boxLines = append(boxLines, ui.Gray("AI engine  ")+ui.Green("enabled"))
 	} else if disableAI {
 		boxLines = append(boxLines, ui.Gray("AI engine  ")+"disabled")
 	}
-	boxLines = append(boxLines,
+	boxLines = append(
+		boxLines,
 		"",
 		ui.Green("Your data (ClickHouse/Postgres/NATS/Redis) was not touched."),
 		ui.Gray("Roll back with: ")+"origamy rollback",

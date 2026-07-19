@@ -74,6 +74,40 @@ func TestAIToggleArgs(t *testing.T) {
 	}
 }
 
+func TestPredictorToggleArgs(t *testing.T) {
+	// --enable-predictor → predictor.enabled=true.
+	got, err := predictorToggleArgs(true, false)
+	if err != nil {
+		t.Fatalf("enable: unexpected error: %v", err)
+	}
+	if !containsPair(got, "--set", "predictor.enabled=true") {
+		t.Fatalf("enable: expected predictor.enabled=true, got %v", got)
+	}
+
+	// --disable-predictor → predictor.enabled=false.
+	got, err = predictorToggleArgs(false, true)
+	if err != nil {
+		t.Fatalf("disable: unexpected error: %v", err)
+	}
+	if !containsPair(got, "--set", "predictor.enabled=false") {
+		t.Fatalf("disable: expected predictor.enabled=false, got %v", got)
+	}
+
+	// Neither flag → no args, no error (predictor stays as the release has it).
+	got, err = predictorToggleArgs(false, false)
+	if err != nil {
+		t.Fatalf("neither: unexpected error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("neither: expected no args, got %v", got)
+	}
+
+	// Both together is a user error.
+	if _, err := predictorToggleArgs(true, true); err == nil {
+		t.Fatal("both: expected an error when --enable-predictor and --disable-predictor are combined")
+	}
+}
+
 // containsPair reports whether args holds k immediately followed by v (a helm
 // "--set", "key=value" pair).
 func containsPair(args []string, k, v string) bool {
