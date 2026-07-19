@@ -49,6 +49,26 @@ func aiToggleArgs(enable, disable bool) ([]string, error) {
 	}
 }
 
+// ── Predictor (conversion scoring) enablement ────────────────────────────────
+
+// predictorToggleArgs returns the helm --set arguments that switch the
+// predictor service on or off. Same contract as aiToggleArgs: only the
+// boolean is passed; the chart's defaults supply everything else (which is
+// why toggles go through the exported-values path, not --reuse-values —
+// a release installed before the predictor existed has none of its values).
+func predictorToggleArgs(enable, disable bool) ([]string, error) {
+	switch {
+	case enable && disable:
+		return nil, fmt.Errorf("--enable-predictor and --disable-predictor cannot be used together")
+	case enable:
+		return []string{"--set", "predictor.enabled=true"}, nil
+	case disable:
+		return []string{"--set", "predictor.enabled=false"}, nil
+	default:
+		return nil, nil
+	}
+}
+
 // exportReleaseValues writes the release's user-supplied values to a temp file
 // and returns its path (the caller removes it). Toggling a chart-default value
 // like orchestratorEngine.enabled must NOT go through `helm upgrade
