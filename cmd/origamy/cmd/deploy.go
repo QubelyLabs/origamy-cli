@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,8 +18,15 @@ import (
 )
 
 const (
-	helmChart   = "oci://ghcr.io/qubelylabs/charts/origamy-data-plane"
-	helmVersion = "0.1.15" // first chart that wires the portal-agent mTLS client cert (identitySecret)
+	helmChart = "oci://ghcr.io/qubelylabs/charts/origamy-data-plane"
+	// helmVersion is the data-plane release a fresh install gets: the Helm
+	// chart version on Kubernetes AND the image tag (DP_IMAGE_TAG) on Docker —
+	// chart and images share one version per release. 0.1.17 is the first chart
+	// carrying every feature this CLI can toggle (mTLS identity 0.1.15,
+	// orchestrator engine 0.1.16, predictor 0.1.17); older charts silently
+	// ignore those values. `origamy upgrade` resolves the latest published
+	// chart at run time, so this pin only governs a fresh install.
+	helmVersion = "0.1.17"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
@@ -48,16 +56,23 @@ Auto-detects your environment:
 Get your enrollment token from the Connections page in your Origamy dashboard.
 
 Add --enable-ai (or answer the prompt) to also switch on the agentic AI engine
-during install (Kubernetes only). The engine adds ~1 pod and stays inert until
-you enable AI and add an LLM credential in your dashboard — you can also add it
-later with 'origamy upgrade --enable-ai'.`,
+during install. On Kubernetes it adds ~1 pod; on Docker it enables the
+"agentic" compose profile. The engine stays inert until you enable AI and add an
+LLM credential in your dashboard — you can also add it later with
+'origamy upgrade --enable-ai'.
+
+Add --datastore-auth on Kubernetes to password-protect the bundled Redis, NATS
+and ClickHouse (the chart generates the passwords in-cluster). Docker installs
+always get generated datastore passwords.`,
 	Example: `  origamy deploy --token dpe_xxx
-  origamy deploy --token dpe_xxx --enable-ai`,
+  origamy deploy --token dpe_xxx --enable-ai
+  origamy deploy --token dpe_xxx --datastore-auth`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		t, _ := cmd.Flags().GetString("token")
 		enableAI, _ := cmd.Flags().GetBool("enable-ai")
 		aiSet := cmd.Flags().Changed("enable-ai")
-		return runDeploy(t, enableAI, aiSet)
+		datastoreAuth, _ := cmd.Flags().GetBool("datastore-auth")
+		return runDeploy(t, enableAI, aiSet, datastoreAuth)
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -70,11 +85,12 @@ var deployChartVersion string
 func init() {
 	deployCmd.Flags().StringP("token", "t", "", "Enrollment token from your Origamy dashboard (required)")
 	deployCmd.Flags().StringVar(&deployChartVersion, "version", "", "Chart version to install (default: the CLI's pinned version)")
-	deployCmd.Flags().Bool("enable-ai", false, "Enable the Origamy AI (agentic) engine at install (Kubernetes only)")
+	deployCmd.Flags().Bool("enable-ai", false, "Enable the Origamy AI (agentic) engine at install")
+	deployCmd.Flags().Bool("datastore-auth", false, "Password-protect the bundled Redis/NATS/ClickHouse (Kubernetes; passwords generated in-cluster)")
 	_ = deployCmd.MarkFlagRequired("token")
 }
 
-func runDeploy(raw string, enableAI, aiSet bool) error {
+func runDeploy(raw string, enableAI, aiSet, datastoreAuth bool) error {
 	// Generate a keypair + CSR locally so enrollment can request an mTLS identity
 	// — the private key never leaves this machine. Enroll falls back to a
 	// bearer-only token if the control plane has no CA configured.
@@ -102,7 +118,7 @@ func runDeploy(raw string, enableAI, aiSet bool) error {
 
 	switch {
 	case hasKubernetes():
-		return deployKubernetes(tok, keyPEM, enableAI, aiSet)
+		return deployKubernetes(tok, keyPEM, enableAI, aiSet, datastoreAuth)
 	case hasDocker():
 		return deployDocker(tok, keyPEM, enableAI, aiSet)
 	default:
@@ -120,7 +136,7 @@ func hasKubernetes() bool {
 	return runQuiet("kubectl", "cluster-info") == nil
 }
 
-func deployKubernetes(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) error {
+func deployKubernetes(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet, datastoreAuth bool) error {
 	if _, err := exec.LookPath("helm"); err != nil {
 		return fail("Helm is required for Kubernetes installs.",
 			"Install it from https://helm.sh/docs/intro/install/ and retry.")
@@ -149,6 +165,16 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool
 	}
 	if aiEnabled && selected.name == "starter" {
 		ui.Warn("The AI engine adds a pod; the Starter tier is sized for dev/test. Consider Standard for production use.")
+	}
+	// The chart must actually carry the engine's templates — helm silently
+	// ignores values an older chart doesn't know, and we'd report "enabled"
+	// while nothing deployed.
+	chartVer := helmVersion
+	if deployChartVersion != "" {
+		chartVer = deployChartVersion
+	}
+	if err := featureGate(chartVer, aiEnabled, false); err != nil {
+		return fail(err.Error(), "Pass --version "+minChartAI+" or newer, or drop --enable-ai.")
 	}
 
 	// — ClickHouse ————————————————————————————————————————————————————————
@@ -253,10 +279,6 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool
 		sp.Success("ClickHouse password stored securely")
 	}
 
-	chartVer := helmVersion
-	if deployChartVersion != "" {
-		chartVer = deployChartVersion
-	}
 	helmArgs := []string{
 		"upgrade", "--install", release, helmChart,
 		"--namespace", namespace,
@@ -275,6 +297,17 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool
 	// it the agent connects bearer-only and is refused at the handshake.
 	if tok.Cert != "" {
 		helmArgs = append(helmArgs, "--set", "portalAgent.tunnelTLS.identitySecret=origamy-byod-identity")
+	}
+	// Telemetry push (portal-agent → control plane). The agent refuses a
+	// plaintext telemetry URL when the tunnel is TLS, so only wire it for an
+	// https control plane; a local dev plane keeps the tunnel-side path.
+	if strings.HasPrefix(tok.URL, "https://") {
+		helmArgs = append(helmArgs, "--set", "controlPlane.telemetryUrl="+strings.TrimRight(tok.URL, "/")+"/api/v1/telemetry")
+	}
+	// Datastore auth (Redis/NATS/ClickHouse passwords). Opt-in: the chart
+	// generates the passwords in-cluster into Secrets; they never leave it.
+	if datastoreAuth {
+		helmArgs = append(helmArgs, "--set", "datastores.auth.enabled=true")
 	}
 	// AI engine: the chart auto-generates the engine's KEK + API token when this
 	// flips true, so we pass only the boolean — never a secret (disable is unused
@@ -359,6 +392,9 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool
 	}
 	if aiEnabled {
 		lines = append(lines, ui.Gray("AI engine   ")+ui.Green("enabled"))
+	}
+	if datastoreAuth {
+		lines = append(lines, ui.Gray("Datastores  ")+"password-protected")
 	}
 	if eventURL != "" {
 		lines = append(lines, ui.Gray("Send events ")+ui.Bold(eventURL+"/v1/identify"))
@@ -579,12 +615,6 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) er
 	ui.Title("Target")
 	ui.Success("Docker detected")
 
-	// The agentic engine runs on Kubernetes data planes only; the Docker compose
-	// bundle doesn't include it. Warn (don't block) if it was explicitly asked for.
-	if aiSet && enableAI {
-		ui.Warn("The AI engine is available on Kubernetes installs only; ignoring --enable-ai for this Docker deploy.")
-	}
-
 	dockerPresets := presets[:2] // Starter and Standard only for Docker
 	ui.Title("Deployment size")
 	for i, p := range dockerPresets {
@@ -592,6 +622,31 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) er
 	}
 	tierIdx := promptChoice("Choose 1-2", 1, len(dockerPresets), 1)
 	selected := dockerPresets[tierIdx-1]
+
+	// — Engagement services ——————————————————————————————————————————————
+	// Journeys, broadcasts and human tasks run in workflow-engine, which needs
+	// the bundled Postgres (compose profile "full"). Default on, matching the
+	// Kubernetes install where workflowEngine.enabled is true.
+	ui.Title("Engagement services")
+	fullProfile := promptYesNo("Enable journeys, broadcasts and human tasks? Adds Postgres + workflow-engine.", true)
+
+	// — AI engine ————————————————————————————————————————————————————————
+	// Same contract as Kubernetes: the CLI controls engine presence (compose
+	// profile "agentic"), the control plane controls use. The KEK and internal
+	// API token are generated on this host and never leave it.
+	aiEnabled := enableAI
+	if !aiSet {
+		ui.Title("AI engine")
+		aiEnabled = promptYesNo("Enable the Origamy AI engine? Adds the orchestrator engine; requires the AI package in your dashboard.", false)
+	}
+
+	// — Event endpoint ————————————————————————————————————————————————————
+	// The gateway listens on :8081 over plain HTTP. With a domain, the bundled
+	// Caddy (profile "ingress") terminates HTTPS with a Let's Encrypt cert.
+	ui.Title("Event endpoint")
+	ui.Step("Plain HTTP on :8081 by default. Give it a domain to serve HTTPS via the bundled Caddy")
+	ui.Step("(needs ports 80/443 reachable and the domain's DNS A record pointing at this host).")
+	ingestDomain := promptString("Event domain (e.g. events.mycompany.com) [none]")
 
 	ui.Title("Provisioning")
 	dir := "origamy-dp-" + tok.ID
@@ -603,51 +658,72 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) er
 	}
 	ui.Success("Working directory ./%s", dir)
 
-	sp := ui.Start("Downloading compose file and ClickHouse schema")
-	if out, err := runCaptured("curl", "-fsSL", tok.URL+"/byod/docker-compose.yml", "-o", "docker-compose.yml"); err != nil {
-		sp.Fail("Download failed")
-		return diagnose(out)
+	// The bundle (compose + ClickHouse schema/users config, and the Caddyfile
+	// for HTTPS ingress) is served by the control plane at /byod/*.
+	files := []string{"docker-compose.yml", "clickhouse-init.sql", "clickhouse-users.xml"}
+	if ingestDomain != "" {
+		files = append(files, "Caddyfile")
 	}
-	if out, err := runCaptured("curl", "-fsSL", tok.URL+"/byod/clickhouse-init.sql", "-o", "clickhouse-init.sql"); err != nil {
-		sp.Fail("Download failed")
-		return diagnose(out)
+	sp := ui.Start("Downloading the deploy bundle")
+	for _, f := range files {
+		if err := fetchBundleFile(tok.URL, f); err != nil {
+			sp.Fail("Could not download %s", f)
+			if errors.Is(err, errNotServed) {
+				return fail(fmt.Sprintf("Your control plane does not serve %s.", f),
+					"It predates this CLI's deploy bundle — upgrade the control plane, or deploy with an older CLI.")
+			}
+			return diagnose(err.Error())
+		}
 	}
-	// ClickHouse users.d config that sets the default-user password from the env.
-	if out, err := runCaptured("curl", "-fsSL", tok.URL+"/byod/clickhouse-users.xml", "-o", "clickhouse-users.xml"); err != nil {
-		sp.Fail("Download failed")
-		return diagnose(out)
-	}
-	sp.Success("Compose file and schema downloaded")
+	sp.Success("Bundle downloaded (%s)", strings.Join(files, ", "))
 
-	// Datastore passwords are generated HERE, in the customer's environment, and
-	// written to the local .env — they never reach Origamy. Reuse any already in
-	// .env from a prior deploy so a re-deploy doesn't rotate them out from under
-	// the running datastores (which hold data).
-	redisPw := existingOrRandom(".env", "DP_REDIS_PASSWORD")
-	natsPw := existingOrRandom(".env", "NATS_PASSWORD")
-	chPw := existingOrRandom(".env", "CLICKHOUSE_PASSWORD")
-
-	env := fmt.Sprintf(
-		"CONTROL_PLANE_ADDR=%s\nCONFIG_URL=%s\nDATA_PLANE_ID=%s\nAUTH_TOKEN=%s\nTLS_ENABLED=true\nDP_IMAGE_TAG=main\nLOG_LEVEL=info\nDEPLOYMENT_PRESET=%s\n"+
-			"DP_REDIS_PASSWORD=%s\nNATS_PASSWORD=%s\nCLICKHOUSE_PASSWORD=%s\n",
-		tok.Addr, tok.URL, tok.ID, tok.Tok, selected.name,
-		redisPw, natsPw, chPw,
-	)
-	if tok.Cert != "" {
-		// Present the mTLS client cert on the tunnel. The compose bundle mounts
-		// ./certs into the portal-agent at /certs; the renew loop rotates the
-		// cert in place there. Required once the control plane enforces client
-		// certs (Phase 6) — otherwise the agent connects bearer-only and is
-		// refused at the handshake.
-		env += "TUNNEL_TLS_CERT=/certs/tls.crt\nTUNNEL_TLS_KEY=/certs/tls.key\n"
+	// Secrets are generated HERE, in the customer's environment, and written to
+	// the local .env — they never reach Origamy. Reuse any already in .env from
+	// a prior deploy so a re-deploy doesn't rotate them out from under the
+	// running datastores (which hold data). The AI secrets are carried forward
+	// even when AI is off: the KEK must survive a disable/enable cycle or the
+	// per-workspace LLM keys encrypted under it become unreadable.
+	orchKEK := readEnvVar(".env", "ORCH_KEK")
+	orchToken := readEnvVar(".env", "ORCH_ENGINE_API_TOKEN")
+	if aiEnabled {
+		orchKEK = existingOrRandomKEK(".env", "ORCH_KEK")
+		orchToken = existingOrRandom(".env", "ORCH_ENGINE_API_TOKEN")
 	}
+	var profiles []string
+	if fullProfile {
+		profiles = append(profiles, "full")
+	}
+	if aiEnabled {
+		profiles = append(profiles, "agentic")
+	}
+	if ingestDomain != "" {
+		profiles = append(profiles, "ingress")
+	}
+	env := renderDockerEnv(dockerEnvParams{
+		TunnelAddr:   tok.Addr,
+		HTTPURL:      tok.URL,
+		DataPlaneID:  tok.ID,
+		AuthToken:    tok.Tok,
+		ImageTag:     helmVersion,
+		Preset:       selected.name,
+		Profiles:     profiles,
+		IngestDomain: ingestDomain,
+		RedisPw:      existingOrRandom(".env", "DP_REDIS_PASSWORD"),
+		NatsPw:       existingOrRandom(".env", "NATS_PASSWORD"),
+		ClickHousePw: existingOrRandom(".env", "CLICKHOUSE_PASSWORD"),
+		DBPw:         existingOrRandom(".env", "DB_PASSWORD"),
+		OrchKEK:      orchKEK,
+		OrchToken:    orchToken,
+		AIEnabled:    aiEnabled,
+		MTLS:         tok.Cert != "",
+	})
 	if err := os.WriteFile(".env", []byte(env), 0o600); err != nil {
 		return fail("Could not write .env.", err.Error())
 	}
-	ui.Success("Wrote .env (datastore passwords generated locally — never sent to Origamy)")
+	ui.Success("Wrote .env (secrets generated locally — never sent to Origamy)")
 
 	// mTLS identity files for the portal-agent (only when the control plane
-	// issued a cert). Written into ./certs — the same dir the compose bundle
+	// issued a cert). Written into ./certs — the dir the compose bundle
 	// bind-mounts read-write, so the renew loop's rotations persist across
 	// restarts. The private key stays on disk here, never transmitted.
 	if tok.Cert != "" {
@@ -664,19 +740,44 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) er
 
 	ui.Title("Bringing services online")
 	sp = ui.Start("Starting services (%s)", selected.label)
+	// Profiles come from COMPOSE_PROFILES in .env, so every later compose
+	// invocation (upgrade/status) sees the same service set.
 	if out, err := runCaptured("docker", "compose", "--env-file", ".env", "up", "-d"); err != nil {
 		sp.Fail("docker compose failed")
 		return diagnose(out)
 	}
 	sp.Success("Services started")
 
-	ui.Box("Deployed", []string{
+	lines := []string{
 		ui.Gray("Data plane  ") + ui.Bold(tok.ID),
 		ui.Gray("Location    ") + "./" + dir,
+		ui.Gray("Release     ") + helmVersion,
+	}
+	if fullProfile {
+		lines = append(lines, ui.Gray("Engagement  ")+ui.Green("enabled"))
+	}
+	if aiEnabled {
+		lines = append(lines, ui.Gray("AI engine   ")+ui.Green("enabled"))
+	}
+	if ingestDomain != "" {
+		lines = append(lines,
+			ui.Gray("Send events ")+ui.Bold("https://"+ingestDomain+"/v1/identify"),
+			"",
+			ui.Gray("Point "+ingestDomain+"'s DNS A record at this host; Caddy provisions the certificate on first request."))
+	} else {
+		lines = append(lines,
+			ui.Gray("Send events ")+ui.Bold("http://<this host>:"+fmt.Sprintf("%d", gatewayAPIPort)+"/v1/identify"),
+			"",
+			ui.Gray("Plain HTTP — for production SDK traffic set INGEST_DOMAIN in .env and add \"ingress\" to COMPOSE_PROFILES."))
+	}
+	lines = append(lines,
 		"",
 		ui.Green("Your dashboard will show it as Connected shortly."),
-		ui.Gray("Logs: ") + "docker compose -f ./" + dir + "/docker-compose.yml logs -f portal-agent",
-	})
+		ui.Gray("Logs: ")+"docker compose -f ./"+dir+"/docker-compose.yml logs -f portal-agent")
+	if !aiEnabled {
+		lines = append(lines, "", ui.Gray("Add the AI engine later:"), "  origamy upgrade --enable-ai")
+	}
+	ui.Box("Deployed", lines)
 	return nil
 }
 

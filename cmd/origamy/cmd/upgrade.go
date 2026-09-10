@@ -17,23 +17,25 @@ var upgradeCmd = &cobra.Command{
 	Short: "Upgrade the data plane to a newer version",
 	Long: `Upgrade the Origamy data plane in place, preserving all data and config.
 
-With no flags it moves to the latest published version. Your datastores
-(ClickHouse, Postgres, NATS, Redis) are never touched — only the service pods
-roll. Reuses your existing configuration, so no token is needed.
+With no flags a Kubernetes install moves to the latest published chart, and a
+Docker install to the release this CLI was built for (` + helmVersion + `). Your
+datastores (ClickHouse, Postgres, NATS, Redis) are never touched — only the
+service containers roll. Reuses your existing configuration, so no token is
+needed.
 
 Use --enable-ai / --disable-ai (mutually exclusive) to switch the agentic AI
 engine on or off on an already-running data plane — this is how you turn on the
-AI package after you've deployed. The toggle preserves all your existing values
-and never touches your datastores. The engine stays inert until you enable AI
-and add an LLM credential in your dashboard.
+AI package after you've deployed. On Kubernetes the toggle re-applies your
+values from a clean export so the chart's own defaults for the new service fill
+in; on Docker it flips the "agentic" compose profile (generating the engine's
+KEK + API token locally the first time). Either way your datastores are never
+touched, and the engine stays inert until you enable AI and add an LLM
+credential in your dashboard.
 
 Use --enable-predictor / --disable-predictor the same way for the predictor
-(conversion scoring) service. Like the AI toggle, it re-applies your values
-from a clean export so the chart's own defaults for the new service fill in —
-enabling it by hand with --set alone would hit missing-default errors on
-releases installed before the predictor existed.`,
-	Example: `  origamy upgrade                 # to the latest published version
-  origamy upgrade --version 0.1.12
+(conversion scoring) service — Kubernetes only.`,
+	Example: `  origamy upgrade                 # Kubernetes: latest published chart; Docker: this CLI's release
+  origamy upgrade --version 0.1.17
   origamy upgrade --channel edge  # track the bleeding edge (:main)
   origamy upgrade --enable-ai     # switch the AI engine on
   origamy upgrade --disable-ai    # switch the AI engine off
@@ -54,11 +56,11 @@ releases installed before the predictor existed.`,
 }
 
 func init() {
-	upgradeCmd.Flags().String("version", "", "Target chart version (default: latest published)")
+	upgradeCmd.Flags().String("version", "", "Target release (default: latest published chart on Kubernetes, "+helmVersion+" on Docker)")
 	upgradeCmd.Flags().String("channel", "stable", "Release channel: stable (pinned) or edge (:main)")
 	upgradeCmd.Flags().StringArray("set", nil, "Set a chart value (key=value, repeatable; Kubernetes only). New values introduced by a chart version don't exist in the release yet, so --reuse-values alone can't set them.")
-	upgradeCmd.Flags().Bool("enable-ai", false, "Switch the Origamy AI (agentic) engine on for the existing release (Kubernetes only)")
-	upgradeCmd.Flags().Bool("disable-ai", false, "Switch the Origamy AI (agentic) engine off for the existing release (Kubernetes only)")
+	upgradeCmd.Flags().Bool("enable-ai", false, "Switch the Origamy AI (agentic) engine on for the existing install")
+	upgradeCmd.Flags().Bool("disable-ai", false, "Switch the Origamy AI (agentic) engine off for the existing install")
 	upgradeCmd.Flags().Bool("enable-predictor", false, "Switch the predictor (conversion scoring) service on for the existing release (Kubernetes only)")
 	upgradeCmd.Flags().Bool("disable-predictor", false, "Switch the predictor (conversion scoring) service off for the existing release (Kubernetes only)")
 }
@@ -81,15 +83,11 @@ func runUpgrade(version, channel string, sets []string, enableAI, disableAI, ena
 			return fail("--set applies to Kubernetes installs only.",
 				"Docker installs configure via .env; edit it directly and rerun without --set.")
 		}
-		if enableAI || disableAI {
-			return fail("--enable-ai/--disable-ai apply to Kubernetes installs only.",
-				"The AI engine runs on Kubernetes data planes; the Docker compose bundle doesn't include it.")
-		}
 		if enablePredictor || disablePredictor {
 			return fail("--enable-predictor/--disable-predictor apply to Kubernetes installs only.",
 				"The predictor runs on Kubernetes data planes; the Docker compose bundle doesn't include it.")
 		}
-		return upgradeDocker(version, channel)
+		return upgradeDocker(version, channel, enableAI, disableAI)
 	default:
 		return fail("No existing Origamy data plane found on this machine.",
 			"Run `origamy deploy --token …` first, or point kubectl/Docker at the host where it's installed.")
@@ -127,6 +125,12 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 		sp.Success("Latest published version is %s", target)
 	}
 	ui.KV("Target", target)
+
+	// Enabling a feature on a chart that predates it would "succeed" with
+	// nothing deployed (helm ignores unknown values), so refuse up front.
+	if err := featureGate(target, enableAI, enablePredictor); err != nil {
+		return fail(err.Error(), "Upgrade to a newer chart first (`origamy upgrade`), or pass --version.")
+	}
 
 	// A feature toggle must run even at the same version (that's how "buy AI
 	// later" flips the value on a release already on latest), so skip the
@@ -254,7 +258,7 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	return nil
 }
 
-func upgradeDocker(version, channel string) error {
+func upgradeDocker(version, channel string, enableAI, disableAI bool) error {
 	dir, ok := findComposeDir()
 	if !ok {
 		return fail("No Origamy compose project found here.",
@@ -262,17 +266,53 @@ func upgradeDocker(version, channel string) error {
 	}
 	envPath := filepath.Join(dir, ".env")
 
-	// The docker install pins images via DP_IMAGE_TAG. A version pins to that
-	// tag; edge (or no version) tracks :main.
+	// Docker pins images via DP_IMAGE_TAG. An explicit version wins; "edge"
+	// tracks the moving :main tag; otherwise the release this CLI ships with
+	// (images and chart share a version, so this matches the Kubernetes pin).
 	tag := strings.TrimSpace(version)
-	if tag == "" || channel == "edge" {
+	switch {
+	case tag != "":
+	case channel == "edge":
 		tag = "main"
+	default:
+		tag = helmVersion
 	}
 	if err := setEnvVar(envPath, "DP_IMAGE_TAG", tag); err != nil {
 		return fail("Could not update .env.", err.Error())
 	}
+
+	// AI engine = the "agentic" compose profile. Enabling generates the engine's
+	// secrets locally on first use (the KEK is never regenerated afterwards —
+	// per-workspace LLM keys are encrypted under it) and points portal-agent
+	// at the engine; disabling drops the profile and that pointer, keeping the
+	// secrets so a later re-enable finds the same KEK.
+	profiles := composeProfiles(envPath)
+	switch {
+	case enableAI:
+		for k, v := range map[string]string{
+			"ORCH_KEK":                existingOrRandomKEK(envPath, "ORCH_KEK"),
+			"ORCH_ENGINE_API_TOKEN":   existingOrRandom(envPath, "ORCH_ENGINE_API_TOKEN"),
+			"ORCHESTRATOR_ENGINE_URL": orchestratorEngineURL,
+		} {
+			if err := setEnvVar(envPath, k, v); err != nil {
+				return fail("Could not update .env.", err.Error())
+			}
+		}
+		profiles = withProfile(profiles, "agentic", true)
+	case disableAI:
+		if err := setEnvVar(envPath, "ORCHESTRATOR_ENGINE_URL", ""); err != nil {
+			return fail("Could not update .env.", err.Error())
+		}
+		profiles = withProfile(profiles, "agentic", false)
+	}
+	if enableAI || disableAI {
+		if err := setEnvVar(envPath, "COMPOSE_PROFILES", strings.Join(profiles, ",")); err != nil {
+			return fail("Could not update .env.", err.Error())
+		}
+	}
 	ui.KV("Directory", dir)
 	ui.KV("Image tag", tag)
+	ui.KV("Profiles", orDash(strings.Join(profiles, ",")))
 
 	sp := ui.Start("Pulling %s images", tag)
 	if out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "pull"); err != nil {
@@ -281,18 +321,25 @@ func upgradeDocker(version, channel string) error {
 	}
 	sp.Success("Images pulled")
 
+	// --remove-orphans stops containers of profiles that were just turned off
+	// (compose otherwise leaves them running); named volumes are untouched.
 	sp = ui.Start("Restarting services")
-	if out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "up", "-d"); err != nil {
+	if out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "up", "-d", "--remove-orphans"); err != nil {
 		sp.Fail("docker compose up failed")
 		return diagnose(out)
 	}
 	sp.Success("Services restarted")
 
-	ui.Box("Upgraded", []string{
+	boxLines := []string{
 		ui.Gray("Image tag  ") + ui.Bold(tag),
 		ui.Gray("Directory  ") + dir,
-		"",
-		ui.Green("Named volumes (your data) were not touched."),
-	})
+	}
+	if enableAI {
+		boxLines = append(boxLines, ui.Gray("AI engine  ")+ui.Green("enabled"))
+	} else if disableAI {
+		boxLines = append(boxLines, ui.Gray("AI engine  ")+"disabled")
+	}
+	boxLines = append(boxLines, "", ui.Green("Named volumes (your data) were not touched."))
+	ui.Box("Upgraded", boxLines)
 	return nil
 }

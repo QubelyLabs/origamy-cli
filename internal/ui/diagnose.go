@@ -58,7 +58,7 @@ func DiagnoseHelm(output string) Diagnosis {
 	default:
 		return Diagnosis{
 			"The install command failed.",
-			"See the output above. Re-run with the same token to retry.",
+			"See the output above. Fix the cause, then run `origamy deploy` again with a FRESH enrollment token from your dashboard — tokens are single-use.",
 		}
 	}
 }

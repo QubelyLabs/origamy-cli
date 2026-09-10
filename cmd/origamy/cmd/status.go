@@ -72,6 +72,7 @@ func statusDocker() error {
 	ui.KV("Target", "Docker")
 	ui.KV("Directory", dir)
 	ui.KV("Image tag", orDash(readEnvVar(filepath.Join(dir, ".env"), "DP_IMAGE_TAG")))
+	ui.KV("Profiles", orDash(readEnvVar(filepath.Join(dir, ".env"), "COMPOSE_PROFILES")))
 
 	out, err := runCaptured("docker", "compose", "--project-directory", dir,
 		"--env-file", filepath.Join(dir, ".env"), "ps")
