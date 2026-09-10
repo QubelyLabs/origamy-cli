@@ -4,10 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -259,7 +261,13 @@ func setEnvVar(path, key, val string) error {
 		}
 	}
 	if !found {
-		lines = append(lines, key+"="+val)
+		// Insert before the trailing "" that a newline-terminated file splits
+		// into, so the file stays newline-terminated with no blank line.
+		if n := len(lines); n > 0 && lines[n-1] == "" {
+			lines = append(lines[:n-1], key+"="+val, "")
+		} else {
+			lines = append(lines, key+"="+val, "")
+		}
 	}
 	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
 }
@@ -282,4 +290,194 @@ func orDash(s string) string {
 		return "—"
 	}
 	return s
+}
+
+// ── Chart version gating ────────────────────────────────────────────────────
+
+// Minimum chart versions that carry a feature's templates. Helm silently
+// ignores values an older chart doesn't know, so toggling a feature on a chart
+// that predates it would report "enabled" while nothing deployed.
+const (
+	minChartAI        = "0.1.16" // orchestrator-engine templates + secret
+	minChartPredictor = "0.1.17" // predictor templates
+)
+
+// featureGate returns an error when a requested feature toggle targets a chart
+// too old to have it. Non-semver targets ("main", "") are never blocked.
+func featureGate(chartVer string, enableAI, enablePredictor bool) error {
+	if enableAI && versionLess(chartVer, minChartAI) {
+		return fmt.Errorf("the AI engine needs chart %s or newer (targeting %s)", minChartAI, chartVer)
+	}
+	if enablePredictor && versionLess(chartVer, minChartPredictor) {
+		return fmt.Errorf("the predictor needs chart %s or newer (targeting %s)", minChartPredictor, chartVer)
+	}
+	return nil
+}
+
+// versionLess reports whether semver a < b ("0.1.9" < "0.1.10"). Anything that
+// isn't X.Y.Z compares as not-less, so edge/unknown versions pass through.
+func versionLess(a, b string) bool {
+	pa, oka := parseVersion(a)
+	pb, okb := parseVersion(b)
+	if !oka || !okb {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if pa[i] != pb[i] {
+			return pa[i] < pb[i]
+		}
+	}
+	return false
+}
+
+func parseVersion(v string) ([3]int, bool) {
+	var out [3]int
+	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(v), "v"), ".")
+	if len(parts) != 3 {
+		return out, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+// ── Docker (compose) helpers ─────────────────────────────────────────────────
+
+// orchestratorEngineURL is where portal-agent reaches the AI engine inside the
+// compose network when the "agentic" profile is on (matches the bundle's
+// service name + health port).
+const orchestratorEngineURL = "http://orchestrator-engine:18090"
+
+// existingOrRandomKEK is existingOrRandom for the orchestrator KEK, which the
+// engine requires as STANDARD base64 decoding to exactly 32 bytes — not the
+// URL-safe alphabet the datastore passwords use. Never rotated once set:
+// per-workspace LLM keys encrypted under it would become unreadable.
+func existingOrRandomKEK(path, key string) string {
+	if v := readEnvVar(path, key); v != "" {
+		return v
+	}
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// composeProfiles reads COMPOSE_PROFILES from a dotenv file as a list.
+func composeProfiles(envPath string) []string {
+	var out []string
+	for _, p := range strings.Split(readEnvVar(envPath, "COMPOSE_PROFILES"), ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// withProfile adds or removes one compose profile, preserving order and
+// never duplicating.
+func withProfile(profiles []string, name string, on bool) []string {
+	var out []string
+	for _, p := range profiles {
+		if p != name {
+			out = append(out, p)
+		}
+	}
+	if on {
+		out = append(out, name)
+	}
+	return out
+}
+
+// errNotServed means the control plane answered a bundle-file request with its
+// SPA index.html: the file is not part of the bundle that control plane ships.
+var errNotServed = errors.New("not served by the control plane")
+
+// fetchBundleFile downloads one file of the BYOD deploy bundle from the
+// control plane into the current directory. The control plane's SPA handler
+// answers unknown paths with index.html and HTTP 200, so `curl -f` alone can't
+// tell "missing" from "found" — sniff the body and reject HTML.
+func fetchBundleFile(base, name string) error {
+	if out, err := runCaptured("curl", "-fsSL", strings.TrimRight(base, "/")+"/byod/"+name, "-o", name); err != nil {
+		return fmt.Errorf("%s", out)
+	}
+	b, err := os.ReadFile(name)
+	if err != nil {
+		return err
+	}
+	if looksLikeHTML(b) {
+		_ = os.Remove(name)
+		return errNotServed
+	}
+	return nil
+}
+
+func looksLikeHTML(b []byte) bool {
+	head := strings.ToLower(strings.TrimSpace(string(b[:min(len(b), 64)])))
+	return len(b) == 0 || strings.HasPrefix(head, "<!doctype") || strings.HasPrefix(head, "<html")
+}
+
+// dockerEnvParams is everything `origamy deploy` needs to render the compose
+// bundle's .env. Kept as a struct so the rendering is testable.
+type dockerEnvParams struct {
+	TunnelAddr, HTTPURL, DataPlaneID, AuthToken string
+	ImageTag, Preset                            string
+	Profiles                                    []string
+	IngestDomain                                string
+	RedisPw, NatsPw, ClickHousePw, DBPw         string
+	OrchKEK, OrchToken                          string
+	AIEnabled                                   bool
+	MTLS                                        bool
+}
+
+// renderDockerEnv writes the .env the served compose bundle expects. The
+// control plane's own "Docker / bare-metal" handoff emits the same keys, so a
+// CLI install and a hand-pasted install are interchangeable.
+func renderDockerEnv(p dockerEnvParams) string {
+	base := strings.TrimRight(p.HTTPURL, "/")
+	var b strings.Builder
+	w := func(k, v string) { fmt.Fprintf(&b, "%s=%s\n", k, v) }
+	b.WriteString("# Generated by `origamy deploy`. Edit, then: docker compose --env-file .env up -d\n")
+	w("CONTROL_PLANE_ADDR", p.TunnelAddr)
+	w("CONTROL_PLANE_HTTP_URL", base)
+	// config-sync and the telemetry reporter take FULL endpoint URLs (the Helm
+	// chart derives the same two paths from controlPlane.httpUrl).
+	w("CONFIG_URL", base+"/api/v1/config")
+	w("TELEMETRY_URL", base+"/api/v1/telemetry")
+	w("DATA_PLANE_ID", p.DataPlaneID)
+	w("AUTH_TOKEN", p.AuthToken)
+	w("TLS_ENABLED", "true")
+	b.WriteString("# Release to run. Images and the Helm chart share a version; `origamy upgrade` moves it.\n")
+	w("DP_IMAGE_TAG", p.ImageTag)
+	w("LOG_LEVEL", "info")
+	w("DEPLOYMENT_PRESET", p.Preset)
+	b.WriteString("# Write keys sync from the control plane; this static allowlist is only a bootstrap fallback.\n")
+	w("WRITE_KEYS", "")
+	b.WriteString("# Compose profiles: full = journeys/broadcasts/tasks (Postgres + workflow-engine),\n# agentic = AI engine, ingress = HTTPS for SDK traffic via the bundled Caddy.\n")
+	w("COMPOSE_PROFILES", strings.Join(p.Profiles, ","))
+	w("INGEST_DOMAIN", p.IngestDomain)
+	b.WriteString("# Datastore passwords — generated on this host, never sent to Origamy. Don't rotate them\n# casually: the datastores hold your data under these credentials.\n")
+	w("DP_REDIS_PASSWORD", p.RedisPw)
+	w("NATS_PASSWORD", p.NatsPw)
+	w("CLICKHOUSE_PASSWORD", p.ClickHousePw)
+	w("DB_PASSWORD", p.DBPw)
+	if p.OrchKEK != "" || p.OrchToken != "" {
+		b.WriteString("# AI engine secrets (generated here). ORCH_KEK encrypts per-workspace LLM keys at rest — NEVER rotate it.\n")
+		w("ORCH_KEK", p.OrchKEK)
+		w("ORCH_ENGINE_API_TOKEN", p.OrchToken)
+	}
+	if p.AIEnabled {
+		w("ORCHESTRATOR_ENGINE_URL", orchestratorEngineURL)
+	}
+	if p.MTLS {
+		b.WriteString("# mTLS client identity for the tunnel (written to ./certs; the agent renews it in place).\n")
+		w("TUNNEL_TLS_CERT", "/certs/tls.crt")
+		w("TUNNEL_TLS_KEY", "/certs/tls.key")
+	}
+	return b.String()
 }
