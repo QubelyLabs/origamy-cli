@@ -62,6 +62,12 @@ make build-all      # cross-compile + SHA256SUMS (+ SHA256SUMS.sig when ORIGAMY_
 make release        # gh release create from bin/ (tag = git describe)
 ```
 
-`ORIGAMY_RELEASE_KEY` must point at the Ed25519 private key whose public half is
-embedded in the control plane's `install.sh`; releases built without it are
-published unsigned and installers fall back to checksum-only verification.
+`ORIGAMY_RELEASE_KEY` must point at the Ed25519 private key (unencrypted PKCS#8
+PEM) whose public half is embedded in the control plane's `install.sh`; releases
+built without it are published unsigned and installers fall back to
+checksum-only verification. Signing is done by `tools/sign` in pure Go, so a
+release can be cut on macOS (whose system `openssl` is LibreSSL and cannot
+handle Ed25519). Generate a key with
+`go run ./tools/sign -h` for usage, or `openssl genpkey -algorithm ed25519`
+where OpenSSL 3 is available; verify a downloaded release with
+`make verify-release PUB=pub.pem DIR=<dir with SHA256SUMS and .sig>`.
