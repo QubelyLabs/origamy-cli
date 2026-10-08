@@ -97,7 +97,7 @@ func redeem(baseURL, handle string) (*Enrollment, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not reach the control plane to redeem your token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		var e struct {

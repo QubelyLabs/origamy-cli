@@ -18,7 +18,7 @@ func Execute() {
 		// A blank message means the command already printed a styled,
 		// actionable error (see deploy.go's fail/diagnose). Just exit non-zero.
 		if msg := err.Error(); msg != "" {
-			fmt.Fprintln(os.Stderr, msg)
+			_, _ = fmt.Fprintln(os.Stderr, msg)
 		}
 		os.Exit(1)
 	}

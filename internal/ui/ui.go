@@ -48,7 +48,7 @@ func paint(code, s string) string {
 	return code + s + cReset
 }
 
-// Style helpers (safe to use in any output; no-op without color).
+// Bold returns bold-styled text; related helpers are safe in any output and no-op without color.
 func Bold(s string) string   { return paint(cBold, s) }
 func Dim(s string) string    { return paint(cDim, s) }
 func Red(s string) string    { return paint(cRed, s) }
