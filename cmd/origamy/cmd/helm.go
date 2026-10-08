@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // existingOrRandom returns the value of key from the dotenv at path if it is
@@ -225,20 +227,9 @@ func podSummary(ns string) (ready, total int, issues map[string]string) {
 	return ready, total, issues
 }
 
-// ── Docker (compose) install discovery ──────────────────────────────────────
-// deploy.go writes the compose project to ./origamy-dp-<id>/.
-
-func findComposeDir() (string, bool) {
-	if fileExists("docker-compose.yml") {
-		if wd, err := os.Getwd(); err == nil {
-			return wd, true
-		}
-	}
-	if matches, _ := filepath.Glob("origamy-dp-*/docker-compose.yml"); len(matches) > 0 {
-		return filepath.Dir(matches[0]), true
-	}
-	return "", false
-}
+// ── Docker (compose) helpers ─────────────────────────────────────────────────
+// deploy.go writes the compose project to ./origamy-dp-<id>/; discovery lives
+// in compose.go (composeProjectDir).
 
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
@@ -400,21 +391,27 @@ var errNotServed = errors.New("not served by the control plane")
 
 // fetchBundleFile downloads one file of the BYOD deploy bundle from the
 // control plane into the current directory. The control plane's SPA handler
-// answers unknown paths with index.html and HTTP 200, so `curl -f` alone can't
-// tell "missing" from "found" — sniff the body and reject HTML.
+// answers unknown paths with index.html and HTTP 200, so a successful status
+// alone can't tell "missing" from "found" — sniff the body and reject HTML.
+// Plain net/http: the CLI must not depend on a curl being installed.
 func fetchBundleFile(base, name string) error {
-	if out, err := runCaptured("curl", "-fsSL", strings.TrimRight(base, "/")+"/byod/"+name, "-o", name); err != nil {
-		return fmt.Errorf("%s", out)
-	}
-	b, err := os.ReadFile(name)
+	url := strings.TrimRight(base, "/") + "/byod/" + name
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Get(url)
 	if err != nil {
-		return err
+		return fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", url, err)
 	}
 	if looksLikeHTML(b) {
-		_ = os.Remove(name)
 		return errNotServed
 	}
-	return nil
+	return os.WriteFile(name, b, 0o644)
 }
 
 func looksLikeHTML(b []byte) bool {

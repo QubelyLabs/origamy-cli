@@ -64,10 +64,10 @@ func statusKubernetes() error {
 }
 
 func statusDocker() error {
-	dir, ok := findComposeDir()
-	if !ok {
+	dir, err := composeProjectDir()
+	if err != nil {
 		return fail("No Origamy compose project found here.",
-			"cd into your data-plane directory (e.g. ./origamy-dp-<id>) and retry.")
+			err.Error()+"\ncd into your data-plane directory (e.g. ./origamy-dp-<id>) and retry.")
 	}
 	ui.KV("Target", "Docker")
 	ui.KV("Directory", dir)

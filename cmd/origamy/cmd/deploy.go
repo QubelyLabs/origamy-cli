@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -59,6 +60,8 @@ the install prints the kubectl context it is about to use; pass
 --target docker to install with Docker Compose on such a host.
 
 Get your enrollment token from the Connections page in your Origamy dashboard.
+Every question is asked, and every check made, BEFORE the token is redeemed:
+a token is single-use, so nothing is spent until the install can proceed.
 
 The core plane (ingestion, identity, segments, storage) is all a fresh install
 needs. The optional pieces can be added later without touching it:
@@ -72,7 +75,10 @@ needs. The optional pieces can be added later without touching it:
 
 Add --datastore-auth on Kubernetes to password-protect the bundled Redis, NATS
 and ClickHouse (the chart generates the passwords in-cluster). Docker installs
-always get generated datastore passwords.`,
+always get generated datastore passwords.
+
+Re-running deploy inside an existing ./origamy-dp-<id>/ re-deploys that plane
+in place, keeping its generated passwords and data.`,
 	Example: `  origamy deploy --token dpe_xxx
   origamy deploy --token dpe_xxx --enable-ai
   origamy deploy --token dpe_xxx --datastore-auth
@@ -103,9 +109,10 @@ func init() {
 }
 
 func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
-	// Decide where the plane goes BEFORE enrolling: a successful /byod/register
-	// consumes the one-time token, so a target mistake discovered afterwards
-	// costs the customer a fresh token.
+	// A successful /byod/register consumes the one-time token, so everything
+	// that can fail or needs an answer — target, tooling, architecture, the
+	// questions — happens first. Only then is the token redeemed and the
+	// install applied.
 	k8s, docker := hasKubernetes(), hasDocker()
 	where, err := resolveTarget(target, k8s, docker)
 	if err != nil {
@@ -123,6 +130,17 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
 		dpVersion = deployChartVersion
 	}
 
+	var kp *k8sPlan
+	var dp *dockerPlan
+	if where == targetKubernetes {
+		kp, err = planKubernetes(dpVersion, enableAI, aiSet, datastoreAuth, docker)
+	} else {
+		dp, err = planDocker(dpVersion, enableAI, aiSet)
+	}
+	if err != nil {
+		return err
+	}
+
 	// Generate a keypair + CSR locally so enrollment can request an mTLS identity
 	// — the private key never leaves this machine. Enroll falls back to a
 	// bearer-only token if the control plane has no CA configured.
@@ -130,28 +148,42 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
 	if err != nil {
 		return fail("Could not generate a data-plane keypair.", err.Error())
 	}
+	ui.Title("Enrolling")
+	sp := ui.Start("Redeeming the enrollment token")
 	tok, err := token.Enroll(raw, csrPEM)
 	if err != nil {
-		return fail("Invalid or unusable enrollment token.",
-			"Get a fresh token from the Connections page in your dashboard — tokens expire after 72 hours.")
+		sp.Fail("Enrollment failed")
+		return fail("Could not enroll this data plane.", enrollHint(err))
 	}
-
 	if tok.Exp > 0 && time.Now().Unix() > tok.Exp {
+		sp.Fail("Enrollment token expired")
 		return fail("Your enrollment token has expired.",
 			"Generate a new one from the Connections page in your dashboard.")
 	}
-
-	ui.Title("Origamy data plane")
-	ui.KV("Data plane", ui.Bold(tok.ID))
+	sp.Success("Enrolled data plane %s", ui.Bold(tok.ID))
 	ui.KV("Control", tok.Addr)
 	if tok.Cert != "" {
 		ui.KV("Identity", "mTLS certificate issued")
 	}
 
-	if where == targetKubernetes {
-		return deployKubernetes(tok, keyPEM, dpVersion, enableAI, aiSet, datastoreAuth, docker)
+	if kp != nil {
+		return applyKubernetes(tok, keyPEM, kp)
 	}
-	return deployDocker(tok, keyPEM, dpVersion, enableAI, aiSet)
+	return applyDocker(tok, keyPEM, dp)
+}
+
+// enrollHint turns an enrollment error into guidance. The control plane's own
+// words come first (a proxy, a 502 or an "already used" handle are different
+// problems); the "mint a new token" advice is reserved for the cases where a
+// new token is actually the fix.
+func enrollHint(err error) string {
+	msg := err.Error()
+	for _, needle := range []string{"already-used", "expired", "missing required fields", "could not decode", "could not parse"} {
+		if strings.Contains(msg, needle) {
+			return msg + "\nTokens are single-use and expire after 72 hours — generate a new one from the Connections page in your dashboard."
+		}
+	}
+	return msg + "\nCheck that this host can reach your control plane over HTTPS, then retry with the same token."
 }
 
 // ── Kubernetes ────────────────────────────────────────────────────────────────
@@ -163,12 +195,28 @@ func hasKubernetes() bool {
 	return runQuiet("kubectl", "cluster-info") == nil
 }
 
-// deployKubernetes installs chart version chartVer. dockerToo says Docker is
-// also usable on this host, so the summary can point at --target docker.
-func deployKubernetes(tok *token.Enrollment, keyPEM []byte, chartVer string, enableAI, aiSet, datastoreAuth, dockerToo bool) error {
+// k8sPlan is everything a Kubernetes install needs to know before the token
+// is spent: answers to the prompts plus the release to install.
+type k8sPlan struct {
+	chartVer      string
+	preset        preset
+	aiEnabled     bool
+	datastoreAuth bool
+	// exposeMode: 1 LoadBalancer, 2 Ingress, 3 Internal (ClusterIP only).
+	exposeMode                                  int
+	ingressHost, ingressClass, ingressTLSSecret string
+}
+
+// planKubernetes runs the preflight checks and asks every question for a
+// Kubernetes install. dockerToo says Docker is also usable on this host, so
+// the operator can be pointed at --target docker.
+func planKubernetes(chartVer string, enableAI, aiSet, datastoreAuth, dockerToo bool) (*k8sPlan, error) {
 	if _, err := exec.LookPath("helm"); err != nil {
-		return fail("Helm is required for Kubernetes installs.",
-			"Install it from https://helm.sh/docs/intro/install/ and retry.")
+		hint := "Install it from https://helm.sh/docs/intro/install/ and retry."
+		if dockerToo {
+			hint += " Or install with Docker Compose instead: --target docker."
+		}
+		return nil, fail("Helm is required for Kubernetes installs.", hint)
 	}
 
 	ui.Title("Target")
@@ -183,152 +231,120 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, chartVer string, ena
 	// The images only exist for amd64 (see preflight.go): refuse a cluster that
 	// could never schedule them, warn about a mixed one.
 	if block, warn := nodeArchProblem(nodeArchs()); block != "" {
-		return fail(block, "Add amd64 nodes, or deploy on an amd64 Docker host with --target docker.")
+		return nil, fail(block, "Add amd64 nodes, or deploy on an amd64 Docker host with --target docker.")
 	} else if warn != "" {
 		ui.Warn("%s", warn)
 	}
 
+	p := &k8sPlan{chartVer: chartVer, datastoreAuth: datastoreAuth}
+
 	// — Deployment tier ——————————————————————————————————————————————————
 	ui.Title("Deployment size")
-	for i, p := range presets {
-		fmt.Printf("  %s  %s  %s\n", ui.Cyan(fmt.Sprintf("%d", i+1)), ui.Bold(fmt.Sprintf("%-11s", p.label)), ui.Gray(p.description))
+	for i, pr := range presets {
+		fmt.Printf("  %s  %s  %s\n", ui.Cyan(fmt.Sprintf("%d", i+1)), ui.Bold(fmt.Sprintf("%-11s", pr.label)), ui.Gray(pr.description))
 	}
-	tierIdx := promptChoice("Choose 1-3", 1, len(presets), 1)
-	selected := presets[tierIdx-1]
+	p.preset = presets[promptChoice("Choose 1-3", 1, len(presets), 1)-1]
 
 	// — AI engine ————————————————————————————————————————————————————————
 	// AI is a package customers buy; enabling it here adds ~1 pod. The flag wins
 	// when set on the command line, otherwise we ask. The engine stays inert
 	// until the workspace opts into AI and adds an LLM credential in the
 	// dashboard — CLI controls engine presence, the control plane controls use.
-	aiEnabled := enableAI
+	p.aiEnabled = enableAI
 	if !aiSet {
 		ui.Title("AI engine")
-		aiEnabled = promptYesNo("Enable the Origamy AI engine? Adds ~1 pod; requires the AI package in your dashboard.", false)
+		p.aiEnabled = promptYesNo("Enable the Origamy AI engine? Adds ~1 pod; requires the AI package in your dashboard.", false)
 	}
-	if aiEnabled && selected.name == "starter" {
+	if p.aiEnabled && p.preset.name == "starter" {
 		ui.Warn("The AI engine adds a pod; the Starter tier is sized for dev/test. Consider Standard for production use.")
 	}
 	// The chart must actually carry the engine's templates — helm silently
 	// ignores values an older chart doesn't know, and we'd report "enabled"
 	// while nothing deployed.
-	if err := featureGate(chartVer, aiEnabled, false); err != nil {
-		return fail(err.Error(), "Pass --version "+minChartAI+" or newer, or drop --enable-ai.")
+	if err := featureGate(chartVer, p.aiEnabled, false); err != nil {
+		return nil, fail(err.Error(), "Pass --version "+minChartAI+" or newer, or drop --enable-ai.")
 	}
 
 	// — ClickHouse ————————————————————————————————————————————————————————
+	// Always the bundled StatefulSet. The published charts have no working
+	// external-ClickHouse path: they build a password-less DSN, never run the
+	// schema job against a foreign host and block its egress — so offering
+	// "External" here would install a plane that cannot write a single event.
 	ui.Title("ClickHouse")
-	fmt.Printf("  %s  %s  %s\n", ui.Cyan("1"), ui.Bold("Embedded"), ui.Gray("deploy inside the cluster (easiest)"))
-	fmt.Printf("  %s  %s  %s\n", ui.Cyan("2"), ui.Bold("External"), ui.Gray("connect to your own ClickHouse"))
-	chMode := promptChoice("Choose 1-2", 1, 2, 1)
-
-	var chHost, chPassword string
-	if chMode == 2 {
-		chHost = promptString("ClickHouse host (e.g. clickhouse.mycompany.com)")
-		chPassword = promptString("ClickHouse password")
-	}
+	ui.Step("Runs inside the cluster as part of the data plane (connecting your own ClickHouse needs chart support that is not published yet).")
 
 	// — Event endpoint ————————————————————————————————————————————————————
 	// How the gateway is exposed for SDK traffic. ClusterIP (internal) alone
 	// means events can't reach the plane from outside the cluster.
 	ui.Title("Event endpoint")
 	fmt.Printf("  %s  %s  %s\n", ui.Cyan("1"), ui.Bold(fmt.Sprintf("%-12s", "LoadBalancer")), ui.Gray("cloud load balancer on :8081 (EKS/GKE/AKS)"))
-	fmt.Printf("  %s  %s  %s\n", ui.Cyan("2"), ui.Bold(fmt.Sprintf("%-12s", "Ingress")), ui.Gray("HTTPS on your own domain (needs an ingress controller)"))
+	fmt.Printf("  %s  %s  %s\n", ui.Cyan("2"), ui.Bold(fmt.Sprintf("%-12s", "Ingress")), ui.Gray("your own domain through an ingress controller"))
 	fmt.Printf("  %s  %s  %s\n", ui.Cyan("3"), ui.Bold(fmt.Sprintf("%-12s", "Internal")), ui.Gray("ClusterIP only — expose later"))
-	exposeMode := promptChoice("Choose 1-3", 1, 3, 1)
-	var ingressHost, ingressClass string
-	if exposeMode == 2 {
-		ingressHost = promptString("Event domain (e.g. events.mycompany.com)")
+	p.exposeMode = promptChoice("Choose 1-3", 1, 3, 1)
+	if p.exposeMode == 2 {
+		p.ingressHost = promptString("Event domain (e.g. events.mycompany.com)")
 		// An Ingress with no ingressClassName is claimed by NO controller when the
 		// cluster has no default class — it silently 404s. Default to nginx.
-		ingressClass = promptString("Ingress class (nginx, alb, …) [nginx]")
-		if ingressClass == "" {
-			ingressClass = "nginx"
+		p.ingressClass = promptString("Ingress class (nginx, alb, …) [nginx]")
+		if p.ingressClass == "" {
+			p.ingressClass = "nginx"
 		}
+		// Without a TLS section the controller serves its placeholder
+		// certificate and every SDK rejects the handshake — so ask, and only
+		// promise https when it was configured.
+		ui.Step("HTTPS needs a TLS Secret in the %s namespace holding the certificate for %s (e.g. from cert-manager).", namespace, p.ingressHost)
+		p.ingressTLSSecret = promptString("TLS Secret name (leave empty to serve plain HTTP for now)")
 	}
+	return p, nil
+}
 
-	// — Provision ——————————————————————————————————————————————————————————
+// applyKubernetes installs the plane described by p for the enrolled token.
+func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 	ui.Title("Provisioning")
 
 	sp := ui.Start("Creating namespace %s", namespace)
-	if out, err := runPipedCaptured(
-		[]string{"kubectl", "create", "namespace", namespace, "--dry-run=client", "-o", "yaml"},
-		[]string{"kubectl", "apply", "-f", "-"},
-	); err != nil {
+	if out, err := kubectlApply(namespaceManifest(namespace)); err != nil {
 		sp.Fail("Could not create namespace")
 		return diagnose(out)
 	}
 	sp.Success("Namespace %s ready", namespace)
 
+	// Secrets go to kubectl as manifests on stdin — never as --from-literal
+	// arguments, which sit in `ps` and execve audit logs for the duration of
+	// the command.
 	sp = ui.Start("Storing auth token as a Kubernetes Secret")
-	if out, err := runPipedCaptured(
-		[]string{
-			"kubectl", "create", "secret", "generic", "origamy-byod-token",
-			"--namespace", namespace,
-			"--from-literal=auth-token=" + tok.Tok,
-			"--dry-run=client", "-o", "yaml",
-		},
-		[]string{"kubectl", "apply", "-f", "-"},
-	); err != nil {
+	if out, err := kubectlApply(secretManifest(namespace, "origamy-byod-token", map[string]string{"auth-token": tok.Tok})); err != nil {
 		sp.Fail("Could not store auth token")
 		return diagnose(out)
 	}
 	sp.Success("Auth token stored securely")
 
-	// mTLS identity: store the issued client cert + private key + CA chain as a
-	// Secret (piped via stdin, so the key never hits shell history). The
-	// portal-agent mounts this for the mTLS tunnel. Only present when the control
-	// plane issued a cert (mTLS configured).
+	// mTLS identity: the issued client cert + private key + CA chain. The
+	// portal-agent mounts this for the mTLS tunnel. Only present when the
+	// control plane issued a cert (mTLS configured).
 	if tok.Cert != "" {
 		sp = ui.Start("Storing the mTLS identity as a Kubernetes Secret")
-		if out, err := runPipedCaptured(
-			[]string{
-				"kubectl", "create", "secret", "generic", "origamy-byod-identity",
-				"--namespace", namespace,
-				"--from-literal=tls.crt=" + tok.Cert,
-				"--from-literal=tls.key=" + string(keyPEM),
-				"--from-literal=ca.crt=" + tok.CAChain,
-				"--dry-run=client", "-o", "yaml",
-			},
-			[]string{"kubectl", "apply", "-f", "-"},
-		); err != nil {
+		if out, err := kubectlApply(secretManifest(namespace, "origamy-byod-identity", map[string]string{
+			"tls.crt": tok.Cert, "tls.key": string(keyPEM), "ca.crt": tok.CAChain,
+		})); err != nil {
 			sp.Fail("Could not store the mTLS identity")
 			return diagnose(out)
 		}
 		sp.Success("mTLS identity stored securely")
 	}
 
-	// External ClickHouse: store the password in a Secret (piped via stdin, so
-	// it never appears in shell history) and reference it from the chart — NOT
-	// via --set, which would persist the password in helm release history.
-	if chMode == 2 {
-		sp = ui.Start("Storing ClickHouse password as a Kubernetes Secret")
-		if out, err := runPipedCaptured(
-			[]string{
-				"kubectl", "create", "secret", "generic", "origamy-clickhouse",
-				"--namespace", namespace,
-				"--from-literal=clickhouse-password=" + chPassword,
-				"--dry-run=client", "-o", "yaml",
-			},
-			[]string{"kubectl", "apply", "-f", "-"},
-		); err != nil {
-			sp.Fail("Could not store ClickHouse password")
-			return diagnose(out)
-		}
-		sp.Success("ClickHouse password stored securely")
-	}
-
 	helmArgs := []string{
 		"upgrade", "--install", release, helmChart,
 		"--namespace", namespace,
-		"--version", chartVer,
+		"--version", p.chartVer,
 		"--set", "controlPlane.url=" + tok.Addr,
 		"--set", "controlPlane.httpUrl=" + tok.URL,
 		"--set", "controlPlane.dataPlaneId=" + tok.ID,
 		"--set", "portalAgent.enabled=true",
 		"--set", "portalAgent.existingSecret=origamy-byod-token",
 		"--set", "portalAgent.existingSecretAuthKey=auth-token",
-		"--set", "preset=" + selected.name,
+		"--set", "preset=" + p.preset.name,
+		"--set", "clickhouse.enabled=true",
 	}
 	// mTLS: point the portal-agent at the identity Secret we stored above so it
 	// presents its client cert on the tunnel and auto-rotates it (chart >= 0.1.15).
@@ -345,26 +361,15 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, chartVer string, ena
 	}
 	// Datastore auth (Redis/NATS/ClickHouse passwords). Opt-in: the chart
 	// generates the passwords in-cluster into Secrets; they never leave it.
-	if datastoreAuth {
+	if p.datastoreAuth {
 		helmArgs = append(helmArgs, "--set", "datastores.auth.enabled=true")
 	}
 	// AI engine: the chart auto-generates the engine's KEK + API token when this
 	// flips true, so we pass only the boolean — never a secret (disable is unused
 	// at install; that path lives in `origamy upgrade`).
-	aiArgs, _ := aiToggleArgs(aiEnabled, false)
+	aiArgs, _ := aiToggleArgs(p.aiEnabled, false)
 	helmArgs = append(helmArgs, aiArgs...)
-	if chMode == 1 {
-		helmArgs = append(helmArgs, "--set", "clickhouse.enabled=true")
-	} else {
-		helmArgs = append(helmArgs,
-			"--set", "clickhouse.enabled=false",
-			"--set", "clickhouse.host="+chHost,
-			// Password sourced from the origamy-clickhouse Secret created above,
-			// never --set (which would leak it into helm release history).
-			"--set", "clickhouse.existingSecret=origamy-clickhouse",
-		)
-	}
-	switch exposeMode {
+	switch p.exposeMode {
 	case 1: // LoadBalancer
 		helmArgs = append(helmArgs,
 			"--set", "ingestGateway.service.type=LoadBalancer",
@@ -378,17 +383,23 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, chartVer string, ena
 	case 2: // Ingress
 		helmArgs = append(helmArgs,
 			"--set", "ingestGateway.ingress.enabled=true",
-			"--set", "ingestGateway.ingress.host="+ingressHost,
-			"--set", "ingestGateway.ingress.className="+ingressClass,
+			"--set", "ingestGateway.ingress.host="+p.ingressHost,
+			"--set", "ingestGateway.ingress.className="+p.ingressClass,
 		)
+		if p.ingressTLSSecret != "" {
+			helmArgs = append(helmArgs,
+				"--set", "ingestGateway.ingress.tls.enabled=true",
+				"--set", "ingestGateway.ingress.tls.secretName="+p.ingressTLSSecret,
+			)
+		}
 	}
 
-	sp = ui.Start("Installing data plane (%s) via Helm", selected.label)
+	sp = ui.Start("Installing data plane (%s) via Helm", p.preset.label)
 	if out, err := runCaptured("helm", helmArgs...); err != nil {
 		sp.Fail("Helm install failed")
 		return diagnose(out)
 	}
-	sp.Success("Data plane installed (%s)", selected.label)
+	sp.Success("Data plane installed (%s)", p.preset.label)
 
 	// — Wait for readiness (live) ————————————————————————————————————————
 	ui.Title("Bringing services online")
@@ -407,7 +418,7 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, chartVer string, ena
 
 	// — Resolve the SDK event endpoint ————————————————————————————————————
 	var eventURL, eventHint string
-	switch exposeMode {
+	switch p.exposeMode {
 	case 1: // LoadBalancer — wait for the cloud LB address
 		spURL := ui.Start("Waiting for the load balancer address")
 		if addr := waitForGatewayLB(namespace); addr != "" {
@@ -418,7 +429,11 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, chartVer string, ena
 			eventHint = "kubectl get svc -n " + namespace + " " + release + "-ingestion-gateway"
 		}
 	case 2: // Ingress
-		eventURL = "https://" + ingressHost
+		if p.ingressTLSSecret != "" {
+			eventURL = "https://" + p.ingressHost
+		} else {
+			eventURL = "http://" + p.ingressHost
+		}
 	default: // Internal
 		eventHint = "kubectl port-forward -n " + namespace + " svc/" + release + "-ingestion-gateway " + fmt.Sprintf("%d:%d", gatewayAPIPort, gatewayAPIPort)
 	}
@@ -426,13 +441,13 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, chartVer string, ena
 	// — Summary ———————————————————————————————————————————————————————————
 	lines := []string{
 		ui.Gray("Data plane  ") + ui.Bold(tok.ID),
-		ui.Gray("Size        ") + selected.label,
+		ui.Gray("Size        ") + p.preset.label,
 		ui.Gray("Namespace   ") + namespace,
 	}
-	if aiEnabled {
+	if p.aiEnabled {
 		lines = append(lines, ui.Gray("AI engine   ")+ui.Green("enabled"))
 	}
-	if datastoreAuth {
+	if p.datastoreAuth {
 		lines = append(lines, ui.Gray("Datastores  ")+"password-protected")
 	}
 	if eventURL != "" {
@@ -449,10 +464,13 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, chartVer string, ena
 	}
 	if eventURL != "" {
 		lines = append(lines, "", ui.Gray("Paste the event URL into your source's Setup tab in the dashboard."))
+		if p.exposeMode == 2 && p.ingressTLSSecret == "" {
+			lines = append(lines, ui.Gray("Plain HTTP — add a TLS Secret and set ingestGateway.ingress.tls.{enabled,secretName} (origamy upgrade --set …) before sending production traffic."))
+		}
 	} else if eventHint != "" {
 		lines = append(lines, "", ui.Gray("Get your event endpoint:"), "  "+eventHint)
 	}
-	if !aiEnabled {
+	if !p.aiEnabled {
 		lines = append(lines, "", ui.Gray("Add the AI engine later:"), "  origamy upgrade --enable-ai")
 	}
 	ui.Box("Deployed", lines)
@@ -650,9 +668,23 @@ func hasDocker() bool {
 	return runQuiet("docker", "info") == nil
 }
 
-// deployDocker installs the compose bundle with the service images pinned to
-// imageTag (DP_IMAGE_TAG).
-func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableAI, aiSet bool) error {
+// dockerPlan is everything a Docker install needs to know before the token is
+// spent.
+type dockerPlan struct {
+	imageTag     string
+	fullProfile  bool
+	aiEnabled    bool
+	ingestDomain string
+	// existingID is set when the current directory already holds an Origamy
+	// compose project: the deploy then happens in place, keeping its
+	// generated passwords (the datastores hold data under them).
+	existingID string
+}
+
+// planDocker runs the preflight checks and asks every question for a Docker
+// install. Re-running inside an existing project offers its current answers
+// as the defaults.
+func planDocker(imageTag string, enableAI, aiSet bool) (*dockerPlan, error) {
 	ui.Title("Target")
 	ui.Success("Docker detected")
 	// The images only exist for amd64 (see preflight.go). Emulation works on
@@ -661,29 +693,37 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableA
 		ui.Warn("%s", warn)
 	}
 
-	dockerPresets := presets[:2] // Starter and Standard only for Docker
-	ui.Title("Deployment size")
-	for i, p := range dockerPresets {
-		fmt.Printf("  %s  %s  %s\n", ui.Cyan(fmt.Sprintf("%d", i+1)), ui.Bold(fmt.Sprintf("%-11s", p.label)), ui.Gray(p.description))
+	p := &dockerPlan{imageTag: imageTag}
+	fullDefault, ingestDefault := true, ""
+	if id := existingProjectID("."); id != "" {
+		p.existingID = id
+		profiles := composeProfiles(".env")
+		fullDefault = hasProfile(profiles, "full")
+		ingestDefault = readEnvVar(".env", "INGEST_DOMAIN")
+		if !aiSet {
+			enableAI = hasProfile(profiles, "agentic")
+		}
+		ui.Step("This directory already holds data plane %s — it will be re-deployed in place, keeping its passwords and data.", ui.Bold(id))
 	}
-	tierIdx := promptChoice("Choose 1-2", 1, len(dockerPresets), 1)
-	selected := dockerPresets[tierIdx-1]
+
+	// No "deployment size" question here: the compose bundle has a single
+	// replica of everything, so there is nothing a size could change.
 
 	// — Engagement services ——————————————————————————————————————————————
 	// Journeys, broadcasts and human tasks run in workflow-engine, which needs
 	// the bundled Postgres (compose profile "full"). Default on, matching the
 	// Kubernetes install where workflowEngine.enabled is true.
 	ui.Title("Engagement services")
-	fullProfile := promptYesNo("Enable journeys, broadcasts and human tasks? Adds Postgres + workflow-engine.", true)
+	p.fullProfile = promptYesNo("Enable journeys, broadcasts and human tasks? Adds Postgres + workflow-engine.", fullDefault)
 
 	// — AI engine ————————————————————————————————————————————————————————
 	// Same contract as Kubernetes: the CLI controls engine presence (compose
 	// profile "agentic"), the control plane controls use. The KEK and internal
 	// API token are generated on this host and never leave it.
-	aiEnabled := enableAI
+	p.aiEnabled = enableAI
 	if !aiSet {
 		ui.Title("AI engine")
-		aiEnabled = promptYesNo("Enable the Origamy AI engine? Adds the orchestrator engine; requires the AI package in your dashboard.", false)
+		p.aiEnabled = promptYesNo("Enable the Origamy AI engine? Adds the orchestrator engine; requires the AI package in your dashboard.", enableAI)
 	}
 
 	// — Event endpoint ————————————————————————————————————————————————————
@@ -692,24 +732,48 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableA
 	ui.Title("Event endpoint")
 	ui.Step("Plain HTTP on :8081 by default. Give it a domain to serve HTTPS via the bundled Caddy")
 	ui.Step("(needs ports 80/443 reachable and the domain's DNS A record pointing at this host).")
-	ingestDomain := promptString("Event domain (e.g. events.mycompany.com) [none]")
+	label := "Event domain (e.g. events.mycompany.com) [none]"
+	if ingestDefault != "" {
+		label = "Event domain [" + ingestDefault + "]"
+	}
+	p.ingestDomain = promptString(label)
+	if p.ingestDomain == "" {
+		p.ingestDomain = ingestDefault
+	}
+	return p, nil
+}
 
+// applyDocker installs the plane described by p for the enrolled token.
+func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	ui.Title("Provisioning")
 	dir := "origamy-dp-" + tok.ID
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fail("Could not create the working directory.", err.Error())
+	if p.existingID != "" {
+		if p.existingID != tok.ID {
+			return fail(fmt.Sprintf("This directory holds data plane %s, but the token enrolls %s.", p.existingID, tok.ID),
+				"Run deploy from the parent directory to create ./"+dir+"/ for the new plane, or uninstall the old one first.")
+		}
+		wd, err := os.Getwd()
+		if err != nil {
+			return fail("Could not read the working directory.", err.Error())
+		}
+		dir = filepath.Base(wd)
+		ui.Success("Re-deploying in ./%s", dir)
+	} else {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fail("Could not create the working directory.", err.Error())
+		}
+		if err := os.Chdir(dir); err != nil {
+			return fail("Could not enter the working directory.", err.Error())
+		}
+		ui.Success("Working directory ./%s", dir)
 	}
-	if err := os.Chdir(dir); err != nil {
-		return fail("Could not enter the working directory.", err.Error())
-	}
-	ui.Success("Working directory ./%s", dir)
 
-	// The bundle (compose + ClickHouse schema/users config, and the Caddyfile
-	// for HTTPS ingress) is served by the control plane at /byod/*.
-	files := []string{"docker-compose.yml", "clickhouse-init.sql", "clickhouse-users.xml"}
-	if ingestDomain != "" {
-		files = append(files, "Caddyfile")
-	}
+	// The whole bundle (compose + ClickHouse schema/users config + the
+	// Caddyfile) is served by the control plane at /byod/*. The Caddyfile is
+	// fetched even without a domain: it is inert until the "ingress" profile is
+	// on, and a later `up` with the profile added would otherwise turn the
+	// missing bind-mount source into an empty directory and crash Caddy.
+	files := []string{"docker-compose.yml", "clickhouse-init.sql", "clickhouse-users.xml", "Caddyfile"}
 	sp := ui.Start("Downloading the deploy bundle")
 	for _, f := range files {
 		if err := fetchBundleFile(tok.URL, f); err != nil {
@@ -727,7 +791,7 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableA
 	// the images follow imageTag. A mismatch comes up looking healthy and then
 	// drops every event at insert — refuse it here rather than find out later.
 	if initSQL, err := os.ReadFile("clickhouse-init.sql"); err == nil {
-		if why := bundleSchemaMismatch(string(initSQL), imageTag); why != "" {
+		if why := bundleSchemaMismatch(string(initSQL), p.imageTag); why != "" {
 			return fail(why, "Pass --version <release> to install a matching data-plane release, or ask Origamy which release your control plane expects.")
 		}
 	}
@@ -740,18 +804,18 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableA
 	// per-workspace LLM keys encrypted under it become unreadable.
 	orchKEK := readEnvVar(".env", "ORCH_KEK")
 	orchToken := readEnvVar(".env", "ORCH_ENGINE_API_TOKEN")
-	if aiEnabled {
+	if p.aiEnabled {
 		orchKEK = existingOrRandomKEK(".env", "ORCH_KEK")
 		orchToken = existingOrRandom(".env", "ORCH_ENGINE_API_TOKEN")
 	}
 	var profiles []string
-	if fullProfile {
+	if p.fullProfile {
 		profiles = append(profiles, "full")
 	}
-	if aiEnabled {
+	if p.aiEnabled {
 		profiles = append(profiles, "agentic")
 	}
-	if ingestDomain != "" {
+	if p.ingestDomain != "" {
 		profiles = append(profiles, "ingress")
 	}
 	env := renderDockerEnv(dockerEnvParams{
@@ -759,17 +823,17 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableA
 		HTTPURL:      tok.URL,
 		DataPlaneID:  tok.ID,
 		AuthToken:    tok.Tok,
-		ImageTag:     imageTag,
-		Preset:       selected.name,
+		ImageTag:     p.imageTag,
+		Preset:       "starter",
 		Profiles:     profiles,
-		IngestDomain: ingestDomain,
+		IngestDomain: p.ingestDomain,
 		RedisPw:      existingOrRandom(".env", "DP_REDIS_PASSWORD"),
 		NatsPw:       existingOrRandom(".env", "NATS_PASSWORD"),
 		ClickHousePw: existingOrRandom(".env", "CLICKHOUSE_PASSWORD"),
 		DBPw:         existingOrRandom(".env", "DB_PASSWORD"),
 		OrchKEK:      orchKEK,
 		OrchToken:    orchToken,
-		AIEnabled:    aiEnabled,
+		AIEnabled:    p.aiEnabled,
 		MTLS:         tok.Cert != "",
 	})
 	if err := os.WriteFile(".env", []byte(env), 0o600); err != nil {
@@ -794,7 +858,7 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableA
 	}
 
 	ui.Title("Bringing services online")
-	sp = ui.Start("Starting services (%s)", selected.label)
+	sp = ui.Start("Starting services")
 	// Profiles come from COMPOSE_PROFILES in .env, so every later compose
 	// invocation (upgrade/status) sees the same service set.
 	if out, err := runCaptured("docker", "compose", "--env-file", ".env", "up", "-d"); err != nil {
@@ -803,33 +867,60 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableA
 	}
 	sp.Success("Services started")
 
+	// `up -d` returning 0 only means the containers were created. Watch them
+	// come up so a wrong token, a refused mTLS handshake or a crashing service
+	// is reported here, with its logs, instead of as a plane that never shows
+	// up Connected.
+	sp = ui.Start("Waiting for services to become healthy")
+	healthy, failed := waitForCompose(".", ".env", sp)
+	switch {
+	case healthy:
+		sp.Success("All services are healthy")
+	case len(failed) > 0:
+		sp.Fail("Some services exited")
+		for _, svc := range failed {
+			ui.Detail("%s — last log lines:", ui.Bold(svc))
+			for _, l := range strings.Split(composeLogs(".", ".env", svc, 15), "\n") {
+				if l != "" {
+					fmt.Printf("      %s\n", ui.Gray(l))
+				}
+			}
+		}
+		return fail("The data plane did not come up cleanly.",
+			"Fix the cause above, then rerun `docker compose --env-file .env up -d` in ./"+dir+" — or rerun deploy here with a fresh token to re-enroll.")
+	default:
+		sp.Warn("Services are still starting")
+	}
+
 	lines := []string{
 		ui.Gray("Data plane  ") + ui.Bold(tok.ID),
 		ui.Gray("Location    ") + "./" + dir,
-		ui.Gray("Release     ") + imageTag,
+		ui.Gray("Release     ") + p.imageTag,
 	}
-	if fullProfile {
+	if p.fullProfile {
 		lines = append(lines, ui.Gray("Engagement  ")+ui.Green("enabled"))
 	}
-	if aiEnabled {
+	if p.aiEnabled {
 		lines = append(lines, ui.Gray("AI engine   ")+ui.Green("enabled"))
 	}
-	if ingestDomain != "" {
+	if p.ingestDomain != "" {
 		lines = append(lines,
-			ui.Gray("Send events ")+ui.Bold("https://"+ingestDomain+"/v1/identify"),
+			ui.Gray("Send events ")+ui.Bold("https://"+p.ingestDomain+"/v1/identify"),
 			"",
-			ui.Gray("Point "+ingestDomain+"'s DNS A record at this host; Caddy provisions the certificate on first request."))
+			ui.Gray("Point "+p.ingestDomain+"'s DNS A record at this host; Caddy provisions the certificate on first request."))
 	} else {
 		lines = append(lines,
 			ui.Gray("Send events ")+ui.Bold("http://<this host>:"+fmt.Sprintf("%d", gatewayAPIPort)+"/v1/identify"),
 			"",
-			ui.Gray("Plain HTTP — for production SDK traffic set INGEST_DOMAIN in .env and add \"ingress\" to COMPOSE_PROFILES."))
+			ui.Gray("Plain HTTP — for production SDK traffic set INGEST_DOMAIN in .env, add \"ingress\" to COMPOSE_PROFILES and rerun `docker compose --env-file .env up -d`."))
 	}
-	lines = append(lines,
-		"",
-		ui.Green("Your dashboard will show it as Connected shortly."),
-		ui.Gray("Logs: ")+"docker compose -f ./"+dir+"/docker-compose.yml logs -f portal-agent")
-	if !aiEnabled {
+	if healthy {
+		lines = append(lines, "", ui.Green("Your dashboard will show it as Connected shortly."))
+	} else {
+		lines = append(lines, "", ui.Gray("Check progress:"), "  docker compose --env-file .env ps   (in ./"+dir+")")
+	}
+	lines = append(lines, ui.Gray("Logs: ")+"docker compose -f ./"+dir+"/docker-compose.yml logs -f portal-agent")
+	if !p.aiEnabled {
 		lines = append(lines, "", ui.Gray("Add the AI engine later:"), "  origamy upgrade --enable-ai")
 	}
 	ui.Box("Deployed", lines)
@@ -838,11 +929,15 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableA
 
 // ── Prompt helpers ────────────────────────────────────────────────────────────
 
+// stdin is shared by every prompt. A fresh bufio.Reader per question would
+// swallow whatever the first one read ahead — with answers piped in
+// (`printf '1\nn\n' | origamy deploy …`) only the first would be honoured.
+var stdin = bufio.NewReader(os.Stdin)
+
 func promptChoice(label string, min, max, defaultVal int) int {
-	r := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Printf("\n  %s %s ", label, ui.Gray(fmt.Sprintf("[%d]", defaultVal)))
-		line, _ := r.ReadString('\n')
+		line, _ := stdin.ReadString('\n')
 		line = strings.TrimSpace(line)
 		if line == "" {
 			return defaultVal
@@ -856,9 +951,8 @@ func promptChoice(label string, min, max, defaultVal int) int {
 }
 
 func promptString(label string) string {
-	r := bufio.NewReader(os.Stdin)
 	fmt.Printf("  %s: ", label)
-	line, _ := r.ReadString('\n')
+	line, _ := stdin.ReadString('\n')
 	return strings.TrimSpace(line)
 }
 
@@ -868,10 +962,9 @@ func promptYesNo(label string, defaultYes bool) bool {
 	if defaultYes {
 		suffix = "[Y/n]"
 	}
-	r := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Printf("\n  %s %s ", label, ui.Gray(suffix))
-		line, _ := r.ReadString('\n')
+		line, _ := stdin.ReadString('\n')
 		switch strings.ToLower(strings.TrimSpace(line)) {
 		case "":
 			return defaultYes
@@ -886,12 +979,15 @@ func promptYesNo(label string, defaultYes bool) bool {
 
 // ── error helpers ─────────────────────────────────────────────────────────────
 
-// fail builds a styled, actionable error to return from a command.
+// fail builds a styled, actionable error to return from a command. A hint may
+// span several lines.
 func fail(headline, hint string) error {
 	fmt.Println()
 	ui.Fail("%s", headline)
-	if hint != "" {
-		ui.Detail("%s", hint)
+	for _, l := range strings.Split(hint, "\n") {
+		if l != "" {
+			ui.Detail("%s", l)
+		}
 	}
 	fmt.Println()
 	return errSilent
@@ -949,25 +1045,26 @@ func runCaptured(name string, args ...string) (string, error) {
 	return buf.String(), err
 }
 
-// runPipedCaptured pipes cmd1 → cmd2 and returns cmd2's combined output.
-func runPipedCaptured(cmd1, cmd2 []string) (string, error) {
+// runCapturedEnv is runCaptured with extra KEY=value pairs in the command's
+// environment (on top of the CLI's own).
+func runCapturedEnv(extraEnv []string, name string, args ...string) (string, error) {
 	var buf bytes.Buffer
-	c1 := exec.Command(cmd1[0], cmd1[1:]...)
-	c2 := exec.Command(cmd2[0], cmd2[1:]...)
-	c2.Stdout = &buf
-	c2.Stderr = &buf
-	p, err := c1.StdoutPipe()
-	if err != nil {
-		return "", err
-	}
-	c2.Stdin = p
-	if err := c1.Start(); err != nil {
-		return "", err
-	}
-	if err := c2.Start(); err != nil {
-		return "", err
-	}
-	_ = c1.Wait()
-	err = c2.Wait()
+	c := exec.Command(name, args...)
+	c.Env = append(os.Environ(), extraEnv...)
+	c.Stdout = &buf
+	c.Stderr = &buf
+	err := c.Run()
+	return buf.String(), err
+}
+
+// runWithStdin runs a command with the given stdin and returns combined
+// stdout+stderr.
+func runWithStdin(input string, name string, args ...string) (string, error) {
+	var buf bytes.Buffer
+	c := exec.Command(name, args...)
+	c.Stdin = strings.NewReader(input)
+	c.Stdout = &buf
+	c.Stderr = &buf
+	err := c.Run()
 	return buf.String(), err
 }
