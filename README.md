@@ -107,3 +107,36 @@ handle Ed25519). Generate a key with
 `go run ./tools/sign -h` for usage, or `openssl genpkey -algorithm ed25519`
 where OpenSSL 3 is available; verify a downloaded release with
 `make verify-release PUB=pub.pem DIR=<dir with SHA256SUMS and .sig>`.
+
+## Cutting a release
+
+`install.sh` always installs the **latest GitHub release**, so a release is what
+customers get the moment it is published. The version string comes from
+`git describe`, so cut it from a clean checkout of the tagged commit — a dirty
+tree or an untagged commit would publish `v0.1.19-3-gabc123-dirty` as the
+release name and bake it into `origamy version`, and the installer's
+"already up to date" check compares exactly that string.
+
+```sh
+git switch main && git pull --ff-only          # CI green on this commit
+git tag -a v0.1.19 -m "origamy-cli v0.1.19"
+git push origin v0.1.19
+ORIGAMY_RELEASE_KEY=/path/to/release-key.pem make release   # build-all + sign + gh release create
+```
+
+Then verify what was actually published, with the public key the installer
+trusts (first `RELEASE_PUBKEYS` entry in the control plane's `install.sh`):
+
+```sh
+mkdir -p /tmp/origamy-verify && gh release download v0.1.19 --repo QubelyLabs/origamy-cli --dir /tmp/origamy-verify
+make verify-release PUB=pub.pem DIR=/tmp/origamy-verify
+sh -c "$(curl -fsSL https://v1.origamy.io/install.sh)"      # no token: installs, prints the version, drops into a shell
+```
+
+After the first release signed with a rotated key, remove the retired key from
+`RELEASE_PUBKEYS` in the control plane's `install.sh`.
+
+The data-plane release a fresh install gets (`helmVersion` in
+`cmd/origamy/cmd/deploy.go`) is a separate pin: bump it when the data plane
+publishes a new chart + image set, and cut a CLI release so fresh installs
+pick it up.
