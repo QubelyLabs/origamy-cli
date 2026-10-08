@@ -834,7 +834,7 @@ func promptYesNo(label string, defaultYes bool) bool {
 // fail builds a styled, actionable error to return from a command.
 func fail(headline, hint string) error {
 	fmt.Println()
-	ui.Fail(headline)
+	ui.Fail("%s", headline)
 	if hint != "" {
 		ui.Detail("%s", hint)
 	}
@@ -847,7 +847,7 @@ func fail(headline, hint string) error {
 func diagnose(output string) error {
 	d := ui.DiagnoseHelm(output)
 	fmt.Println()
-	ui.Fail(d.Headline)
+	ui.Fail("%s", d.Headline)
 	if d.Hint != "" {
 		ui.Detail("%s", d.Hint)
 	}
