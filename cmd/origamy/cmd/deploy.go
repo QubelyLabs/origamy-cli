@@ -49,30 +49,41 @@ var deployCmd = &cobra.Command{
 	Short: "Deploy an Origamy data plane to this machine",
 	Long: `Deploy the Origamy data plane using your enrollment token.
 
-Auto-detects your environment:
+Auto-detects your environment (override with --target):
   • Kubernetes cluster (kubectl) → Helm install into origamy-dp namespace
   • Docker                       → Docker Compose in ./origamy-dp-<id>/
 
+Kubernetes wins whenever kubectl reaches a cluster — including Docker Desktop's
+bundled Kubernetes or a kubeconfig that still points at a shared cluster — so
+the install prints the kubectl context it is about to use; pass
+--target docker to install with Docker Compose on such a host.
+
 Get your enrollment token from the Connections page in your Origamy dashboard.
 
-Add --enable-ai (or answer the prompt) to also switch on the agentic AI engine
-during install. On Kubernetes it adds ~1 pod; on Docker it enables the
-"agentic" compose profile. The engine stays inert until you enable AI and add an
-LLM credential in your dashboard — you can also add it later with
-'origamy upgrade --enable-ai'.
+The core plane (ingestion, identity, segments, storage) is all a fresh install
+needs. The optional pieces can be added later without touching it:
+  • AI engine: --enable-ai now, or 'origamy upgrade --enable-ai' later. On
+    Kubernetes it adds ~1 pod; on Docker it enables the "agentic" compose
+    profile. The engine stays inert until you enable AI and add an LLM
+    credential in your dashboard.
+  • Predictor (conversion scoring, Kubernetes): 'origamy upgrade --enable-predictor'.
+  • Journeys, broadcasts and tasks (Docker): the "full" compose profile,
+    offered at install.
 
 Add --datastore-auth on Kubernetes to password-protect the bundled Redis, NATS
 and ClickHouse (the chart generates the passwords in-cluster). Docker installs
 always get generated datastore passwords.`,
 	Example: `  origamy deploy --token dpe_xxx
   origamy deploy --token dpe_xxx --enable-ai
-  origamy deploy --token dpe_xxx --datastore-auth`,
+  origamy deploy --token dpe_xxx --datastore-auth
+  origamy deploy --token dpe_xxx --target docker   # this laptop also has a kubeconfig`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		t, _ := cmd.Flags().GetString("token")
+		target, _ := cmd.Flags().GetString("target")
 		enableAI, _ := cmd.Flags().GetBool("enable-ai")
 		aiSet := cmd.Flags().Changed("enable-ai")
 		datastoreAuth, _ := cmd.Flags().GetBool("datastore-auth")
-		return runDeploy(t, enableAI, aiSet, datastoreAuth)
+		return runDeploy(t, target, enableAI, aiSet, datastoreAuth)
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -84,13 +95,34 @@ var deployChartVersion string
 
 func init() {
 	deployCmd.Flags().StringP("token", "t", "", "Enrollment token from your Origamy dashboard (required)")
-	deployCmd.Flags().StringVar(&deployChartVersion, "version", "", "Chart version to install (default: the CLI's pinned version)")
+	deployCmd.Flags().StringVar(&deployChartVersion, "version", "", "Data-plane release to install: the chart version on Kubernetes, the image tag on Docker (default: the CLI's pinned version)")
+	deployCmd.Flags().String("target", string(targetAuto), "Where to install: auto (Kubernetes if kubectl reaches a cluster, else Docker), kubernetes, or docker")
 	deployCmd.Flags().Bool("enable-ai", false, "Enable the Origamy AI (agentic) engine at install")
 	deployCmd.Flags().Bool("datastore-auth", false, "Password-protect the bundled Redis/NATS/ClickHouse (Kubernetes; passwords generated in-cluster)")
 	_ = deployCmd.MarkFlagRequired("token")
 }
 
-func runDeploy(raw string, enableAI, aiSet, datastoreAuth bool) error {
+func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
+	// Decide where the plane goes BEFORE enrolling: a successful /byod/register
+	// consumes the one-time token, so a target mistake discovered afterwards
+	// costs the customer a fresh token.
+	k8s, docker := hasKubernetes(), hasDocker()
+	where, err := resolveTarget(target, k8s, docker)
+	if err != nil {
+		if errors.Is(err, errNoTarget) {
+			return fail("No Kubernetes cluster or Docker found on this machine.",
+				"Install Docker (https://docs.docker.com/get-docker/) or point kubectl at a cluster, then retry.")
+		}
+		return fail(err.Error(), "Pass --target kubernetes or --target docker to choose explicitly, or omit it to auto-detect.")
+	}
+
+	// The data-plane release a fresh install gets: the chart version on
+	// Kubernetes and the image tag on Docker (they share one version).
+	dpVersion := helmVersion
+	if deployChartVersion != "" {
+		dpVersion = deployChartVersion
+	}
+
 	// Generate a keypair + CSR locally so enrollment can request an mTLS identity
 	// — the private key never leaves this machine. Enroll falls back to a
 	// bearer-only token if the control plane has no CA configured.
@@ -116,15 +148,10 @@ func runDeploy(raw string, enableAI, aiSet, datastoreAuth bool) error {
 		ui.KV("Identity", "mTLS certificate issued")
 	}
 
-	switch {
-	case hasKubernetes():
-		return deployKubernetes(tok, keyPEM, enableAI, aiSet, datastoreAuth)
-	case hasDocker():
-		return deployDocker(tok, keyPEM, enableAI, aiSet)
-	default:
-		return fail("No Kubernetes cluster or Docker found on this machine.",
-			"Install Docker (https://docs.docker.com/get-docker/) or point kubectl at a cluster, then retry.")
+	if where == targetKubernetes {
+		return deployKubernetes(tok, keyPEM, dpVersion, enableAI, aiSet, datastoreAuth, docker)
 	}
+	return deployDocker(tok, keyPEM, dpVersion, enableAI, aiSet)
 }
 
 // ── Kubernetes ────────────────────────────────────────────────────────────────
@@ -136,14 +163,30 @@ func hasKubernetes() bool {
 	return runQuiet("kubectl", "cluster-info") == nil
 }
 
-func deployKubernetes(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet, datastoreAuth bool) error {
+// deployKubernetes installs chart version chartVer. dockerToo says Docker is
+// also usable on this host, so the summary can point at --target docker.
+func deployKubernetes(tok *token.Enrollment, keyPEM []byte, chartVer string, enableAI, aiSet, datastoreAuth, dockerToo bool) error {
 	if _, err := exec.LookPath("helm"); err != nil {
 		return fail("Helm is required for Kubernetes installs.",
 			"Install it from https://helm.sh/docs/intro/install/ and retry.")
 	}
 
 	ui.Title("Target")
-	ui.Success("Kubernetes cluster detected")
+	if ctx := kubeContext(); ctx != "" {
+		ui.Success("Kubernetes cluster detected (kubectl context: %s)", ui.Bold(ctx))
+	} else {
+		ui.Success("Kubernetes cluster detected")
+	}
+	if dockerToo {
+		ui.Step("Docker is also available here — rerun with --target docker to use Docker Compose instead.")
+	}
+	// The images only exist for amd64 (see preflight.go): refuse a cluster that
+	// could never schedule them, warn about a mixed one.
+	if block, warn := nodeArchProblem(nodeArchs()); block != "" {
+		return fail(block, "Add amd64 nodes, or deploy on an amd64 Docker host with --target docker.")
+	} else if warn != "" {
+		ui.Warn("%s", warn)
+	}
 
 	// — Deployment tier ——————————————————————————————————————————————————
 	ui.Title("Deployment size")
@@ -169,10 +212,6 @@ func deployKubernetes(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet, dat
 	// The chart must actually carry the engine's templates — helm silently
 	// ignores values an older chart doesn't know, and we'd report "enabled"
 	// while nothing deployed.
-	chartVer := helmVersion
-	if deployChartVersion != "" {
-		chartVer = deployChartVersion
-	}
 	if err := featureGate(chartVer, aiEnabled, false); err != nil {
 		return fail(err.Error(), "Pass --version "+minChartAI+" or newer, or drop --enable-ai.")
 	}
@@ -611,9 +650,16 @@ func hasDocker() bool {
 	return runQuiet("docker", "info") == nil
 }
 
-func deployDocker(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) error {
+// deployDocker installs the compose bundle with the service images pinned to
+// imageTag (DP_IMAGE_TAG).
+func deployDocker(tok *token.Enrollment, keyPEM []byte, imageTag string, enableAI, aiSet bool) error {
 	ui.Title("Target")
 	ui.Success("Docker detected")
+	// The images only exist for amd64 (see preflight.go). Emulation works on
+	// Docker Desktop, so this is a warning, not a stop.
+	if warn := dockerArchWarning(dockerArch()); warn != "" {
+		ui.Warn("%s", warn)
+	}
 
 	dockerPresets := presets[:2] // Starter and Standard only for Docker
 	ui.Title("Deployment size")
@@ -677,6 +723,15 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) er
 	}
 	sp.Success("Bundle downloaded (%s)", strings.Join(files, ", "))
 
+	// The bundle's ClickHouse schema follows the control plane's current build;
+	// the images follow imageTag. A mismatch comes up looking healthy and then
+	// drops every event at insert — refuse it here rather than find out later.
+	if initSQL, err := os.ReadFile("clickhouse-init.sql"); err == nil {
+		if why := bundleSchemaMismatch(string(initSQL), imageTag); why != "" {
+			return fail(why, "Pass --version <release> to install a matching data-plane release, or ask Origamy which release your control plane expects.")
+		}
+	}
+
 	// Secrets are generated HERE, in the customer's environment, and written to
 	// the local .env — they never reach Origamy. Reuse any already in .env from
 	// a prior deploy so a re-deploy doesn't rotate them out from under the
@@ -704,7 +759,7 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) er
 		HTTPURL:      tok.URL,
 		DataPlaneID:  tok.ID,
 		AuthToken:    tok.Tok,
-		ImageTag:     helmVersion,
+		ImageTag:     imageTag,
 		Preset:       selected.name,
 		Profiles:     profiles,
 		IngestDomain: ingestDomain,
@@ -751,7 +806,7 @@ func deployDocker(tok *token.Enrollment, keyPEM []byte, enableAI, aiSet bool) er
 	lines := []string{
 		ui.Gray("Data plane  ") + ui.Bold(tok.ID),
 		ui.Gray("Location    ") + "./" + dir,
-		ui.Gray("Release     ") + helmVersion,
+		ui.Gray("Release     ") + imageTag,
 	}
 	if fullProfile {
 		lines = append(lines, ui.Gray("Engagement  ")+ui.Green("enabled"))

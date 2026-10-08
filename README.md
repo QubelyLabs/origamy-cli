@@ -27,8 +27,44 @@ script. A signature mismatch aborts the install.
 | `origamy uninstall [id]` | Tears the data plane down (Helm release + namespace, or compose project + volumes). |
 | `origamy version` | Prints the CLI version. |
 
-Flags of note on `deploy`: `--enable-ai`, `--datastore-auth` (Kubernetes: password-protect
-the bundled Redis/NATS/ClickHouse), `--version` (chart version to install instead of the pin).
+Flags of note on `deploy`: `--target auto|kubernetes|docker` (auto prefers
+Kubernetes whenever kubectl reaches a cluster, Docker Desktop's included — the
+install prints the kubectl context it is about to use), `--enable-ai`,
+`--datastore-auth` (Kubernetes: password-protect the bundled
+Redis/NATS/ClickHouse), `--version` (data-plane release to install instead of
+the pin: the chart version on Kubernetes, the image tag on Docker).
+
+## Deploy the core first, add the rest later
+
+A fresh install only needs the core plane (ingestion gateway, transformer,
+identity resolver, segment evaluator, bulker, config-sync, portal-agent and the
+bundled NATS/Redis/ClickHouse). Everything else is optional and can be switched
+on later without touching a running plane:
+
+| Piece | At install | Later |
+|---|---|---|
+| AI engine (orchestrator; needs the AI package + an LLM credential in the dashboard) | `--enable-ai` (default off) | `origamy upgrade --enable-ai` / `--disable-ai` |
+| Predictor (conversion scoring; Kubernetes) | off | `origamy upgrade --enable-predictor` / `--disable-predictor` |
+| Journeys, broadcasts, human tasks (workflow-engine + Postgres) | Kubernetes: on; Docker: the `full` profile, asked at install | Docker: add `full` to `COMPOSE_PROFILES` in `.env` and `docker compose --env-file .env up -d` |
+
+The dependency arrow only points one way (orchestrator → workflow engine, never
+back), the portal-agent only offers AI/proposal queries when
+`ORCHESTRATOR_ENGINE_URL` is set, and the orchestrator's KEK is kept in `.env`
+across a disable/enable cycle, so adding or removing these pieces does not
+disturb the core.
+
+## Preflight checks
+
+- **CPU architecture.** The data-plane images are published for `linux/amd64`
+  only. `deploy` refuses a cluster with no amd64 node, warns about a mixed one,
+  and warns on a non-amd64 Docker host (Docker Desktop runs the images under
+  emulation; a Linux arm64 host needs QEMU binfmt first).
+- **ClickHouse schema (Docker).** The control plane serves one
+  `clickhouse-init.sql` — the schema of its current build — while the install
+  pins the images to a release. The two diverged in the 2026-08 storage reset
+  (payload columns became native JSON): releases up to 0.1.17 cannot write the
+  current schema, so `deploy` refuses that pairing instead of bringing up a
+  plane that looks Connected and drops every event at insert.
 
 ## What a deploy does with secrets
 
