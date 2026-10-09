@@ -77,6 +77,11 @@ Add --datastore-auth on Kubernetes to password-protect the bundled Redis, NATS
 and ClickHouse (the chart generates the passwords in-cluster). Docker installs
 always get generated datastore passwords.
 
+On Kubernetes with release ` + minChartExternalClickHouse + ` or newer, deploy also offers to connect your
+own ClickHouse instead of the bundled one. Its password goes into the
+origamy-clickhouse Secret, and the chart creates the events database and
+tables on that server during install.
+
 Re-running deploy inside an existing ./origamy-dp-<id>/ re-deploys that plane
 in place, keeping its generated passwords and data.`,
 	Example: `  origamy deploy --token dpe_xxx
@@ -226,6 +231,8 @@ type k8sPlan struct {
 	// exposeMode: 1 LoadBalancer, 2 Ingress, 3 Internal (ClusterIP only).
 	exposeMode                                  int
 	ingressHost, ingressClass, ingressTLSSecret string
+	// clickhouse is the operator's own ClickHouse; nil means the bundled one.
+	clickhouse *externalClickHouse
 }
 
 // planKubernetes runs the preflight checks and asks every question for a
@@ -293,12 +300,9 @@ func planKubernetes(chartVer string, enableAI, aiSet, datastoreAuth, dockerToo b
 	}
 
 	// — ClickHouse ————————————————————————————————————————————————————————
-	// Always the bundled StatefulSet. The published charts have no working
-	// external-ClickHouse path: they build a password-less DSN, never run the
-	// schema job against a foreign host and block its egress — so offering
-	// "External" here would install a plane that cannot write a single event.
-	ui.Title("ClickHouse")
-	ui.Step("Runs inside the cluster as part of the data plane (connecting your own ClickHouse needs chart support that is not published yet).")
+	// The bundled StatefulSet, or the operator's own server on a chart that
+	// supports it (see clickhouse.go).
+	p.clickhouse = promptClickHouse(chartVer)
 
 	// — Event endpoint ————————————————————————————————————————————————————
 	// How the gateway is exposed for SDK traffic. ClusterIP (internal) alone
@@ -360,6 +364,17 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 		sp.Success("mTLS identity stored securely")
 	}
 
+	// External ClickHouse: the chart reads the password from this Secret, so
+	// it never travels through helm --set (release history).
+	if p.clickhouse != nil && p.clickhouse.password != "" {
+		sp = ui.Start("Storing the ClickHouse password as a Kubernetes Secret")
+		if out, err := kubectlApply(secretManifest(namespace, clickhouseSecretName, map[string]string{"clickhouse-password": p.clickhouse.password})); err != nil {
+			sp.Fail("Could not store the ClickHouse password")
+			return diagnose(out)
+		}
+		sp.Success("ClickHouse password stored securely")
+	}
+
 	helmArgs := []string{
 		"upgrade", "--install", release, helmChart,
 		"--namespace", namespace,
@@ -371,8 +386,8 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 		"--set", "portalAgent.existingSecret=origamy-byod-token",
 		"--set", "portalAgent.existingSecretAuthKey=auth-token",
 		"--set", "preset=" + p.preset.name,
-		"--set", "clickhouse.enabled=true",
 	}
+	helmArgs = append(helmArgs, clickhouseSetArgs(p.clickhouse)...)
 	// mTLS: point the portal-agent at the identity Secret we stored above so it
 	// presents its client cert on the tunnel and auto-rotates it (chart >= 0.1.15).
 	// Required once the control plane enforces client certs (Phase 6); without
@@ -480,6 +495,9 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 	if p.datastoreAuth {
 		lines = append(lines, ui.Gray("Datastores  ")+"password-protected")
 	}
+	if p.clickhouse != nil {
+		lines = append(lines, ui.Gray("ClickHouse  ")+p.clickhouse.describe())
+	}
 	if eventURL != "" {
 		lines = append(lines, ui.Gray("Send events ")+ui.Bold(eventURL+"/v1/identify"))
 	}
@@ -491,6 +509,11 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 			ui.Gray("Check progress:"),
 			"  kubectl get pods -n "+namespace,
 		)
+		if p.clickhouse != nil {
+			// Services crash-loop until the schema exists on the external
+			// server; the schema Job's log names the connection problem.
+			lines = append(lines, "  kubectl logs -n "+namespace+" -l app.kubernetes.io/component=clickhouse-init --tail=20")
+		}
 	}
 	if eventURL != "" {
 		lines = append(lines, "", ui.Gray("Paste the event URL into your source's Setup tab in the dashboard."))

@@ -143,6 +143,18 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 		return fail(err.Error(), "Upgrade to a newer chart first (`origamy upgrade`), or pass --version.")
 	}
 
+	// A release on an external ClickHouse needs a chart that can still reach
+	// it: an older one renders a password-less DSN, never creates the schema
+	// on that server and blocks egress to it.
+	external := false
+	if vals, err := releaseValues(); err == nil {
+		external = usesExternalClickHouse(vals)
+	}
+	if external && versionLess(target, minChartExternalClickHouse) {
+		return fail(fmt.Sprintf("This data plane uses an external ClickHouse, which needs chart %s or newer (targeting %s).", minChartExternalClickHouse, target),
+			"Pass --version "+minChartExternalClickHouse+" or newer.")
+	}
+
 	// A feature toggle must run even at the same version (that's how "buy AI
 	// later" flips the value on a release already on latest), so skip the
 	// no-op shortcut.
@@ -254,7 +266,12 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	// cannot query it. Once ClickHouse is back on the new image, drop it and
 	// re-apply the chart's schema (from its own ConfigMap) so the table comes
 	// back with the native JSON columns.
-	if reset {
+	// An external ClickHouse has no pod here to run that in; the operator owns
+	// its tables.
+	if reset && external {
+		ui.Warn("External ClickHouse: if %s on your server predates the storage reset, drop it there and apply the chart's schema with your own client:", eventsTable)
+		ui.Detail("kubectl get configmap %s-clickhouse-init -n %s -o jsonpath='{.data.init\\.sql}' | clickhouse-client --host … --port … --user … --password … [--secure] --multiquery", release, namespace)
+	} else if reset {
 		if err := reinitKubernetesClickHouse(); err != nil {
 			return err
 		}
