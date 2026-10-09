@@ -75,12 +75,20 @@ disturb the core.
   credential is redeemed over HTTPS (`/v1/byod/enroll/resolve` or, with a CA,
   `/v1/byod/register` which also signs a locally generated CSR). The private key
   never leaves the host.
-- Kubernetes: the bearer token and mTLS identity go into pre-created Secrets
-  (`origamy-byod-token`, `origamy-byod-identity`), applied as manifests over
+- Kubernetes: the bearer token, mTLS identity and any external ClickHouse
+  password go into pre-created Secrets (`origamy-byod-token`,
+  `origamy-byod-identity`, `origamy-clickhouse`), applied as manifests over
   kubectl's stdin — never through `helm --set` (which would persist them in
   release history) and never as `--from-literal` arguments (which sit in `ps`
-  and audit logs while kubectl runs). ClickHouse is always the bundled one:
-  the published charts have no working external-ClickHouse path yet.
+  and audit logs while kubectl runs). The ClickHouse password is typed with
+  echo off.
+- External ClickHouse (Kubernetes, release 0.1.19 or newer): `deploy` asks
+  for the host, TLS, native port, user and password; older releases only get
+  the bundled ClickHouse, because their charts cannot authenticate to another
+  server or create its schema. The chart embeds the password in the services'
+  connection URL, so it may only contain letters, digits and
+  `` -._~!$&'()*+,;=:@ ``. `upgrade` refuses to move such a plane to a chart
+  older than 0.1.19.
 - Docker: datastore passwords (Redis, NATS, ClickHouse, Postgres) and, with AI
   on, the orchestrator KEK + API token are generated on the host into `.env`
   (mode 0600) and reused on re-deploy. Nothing generated here is sent to Origamy.

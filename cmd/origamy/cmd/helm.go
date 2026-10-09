@@ -86,15 +86,9 @@ func predictorToggleArgs(enable, disable bool) ([]string, error) {
 // overrides a deploy may have written, they are pruned here so the release
 // returns to the chart's defaults.
 func exportReleaseValues(targetVer string) (string, error) {
-	out, err := runCaptured("helm", "get", "values", release, "-n", namespace, "-o", "json")
+	vals, err := releaseValues()
 	if err != nil {
-		return "", fmt.Errorf("%s", out)
-	}
-	vals := map[string]any{}
-	if strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "null" {
-		if err := json.Unmarshal([]byte(out), &vals); err != nil {
-			return "", fmt.Errorf("could not parse the release values: %w", err)
-		}
+		return "", err
 	}
 	if legacyChartSetArgs(targetVer) == nil {
 		pruneLegacyValues(vals)
@@ -117,6 +111,22 @@ func exportReleaseValues(targetVer string) (string, error) {
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+// releaseValues returns the values the operator supplied to the release
+// (helm get values), as a map. An install with none yields an empty map.
+func releaseValues() (map[string]any, error) {
+	out, err := runCaptured("helm", "get", "values", release, "-n", namespace, "-o", "json")
+	if err != nil {
+		return nil, fmt.Errorf("%s", out)
+	}
+	vals := map[string]any{}
+	if strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "null" {
+		if err := json.Unmarshal([]byte(out), &vals); err != nil {
+			return nil, fmt.Errorf("could not parse the release values: %w", err)
+		}
+	}
+	return vals, nil
 }
 
 // ── Helm release introspection ──────────────────────────────────────────────
@@ -312,6 +322,11 @@ func orDash(s string) string {
 const (
 	minChartAI        = "0.1.16" // orchestrator-engine templates + secret
 	minChartPredictor = "0.1.17" // predictor templates
+	// clickhouse.existingSecret/secure/username, the schema Job and egress for
+	// an external host (QubelyLabs/origamy-data-plane#389). 0.1.18 is cut
+	// from staging without it, so the first release that can carry it is
+	// 0.1.19. Lower this only if #389 lands in an earlier release.
+	minChartExternalClickHouse = "0.1.19"
 )
 
 // featureGate returns an error when a requested feature toggle targets a chart
