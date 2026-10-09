@@ -14,10 +14,27 @@ sh -c "$(curl -fsSL https://v1.origamy.io/install.sh)" deploy --token dpe_xxx
 `install.sh` downloads the latest GitHub release for your OS/arch, verifies the
 binary against the release's `SHA256SUMS`, and verifies `SHA256SUMS` against a
 detached Ed25519 signature (`SHA256SUMS.sig`) with the public keys embedded in
-the script. A signature that fails to verify aborts the install. Two caveats
-the installer prints as it goes: on a host whose `openssl` cannot do Ed25519
-(macOS ships LibreSSL) it falls back to checksum-only verification, and a
-release published without a `.sig` is installed on checksum alone.
+the script. It fails closed: a missing `SHA256SUMS` or `SHA256SUMS.sig`, a
+signature that does not verify, or a checksum mismatch aborts the install.
+
+One caveat: on a host whose `openssl` cannot do Ed25519 (macOS ships LibreSSL)
+the signature cannot be checked, so the installer prints a red warning and
+falls back to checksum verification, which catches a corrupt download but not
+a forged release. Install OpenSSL 3 (`brew install openssl@3`, found
+automatically) to get full verification, or set `ORIGAMY_REQUIRE_SIGNATURE=1`
+to refuse instead.
+
+The latest release is resolved from the `github.com/…/releases/latest`
+redirect, not the rate-limited GitHub API. An installed CLI is only replaced by
+a newer release; a newer or locally built one (`origamy dev`) is kept.
+Environment knobs, set before `sh -c`:
+
+| Variable | Effect |
+|---|---|
+| `ORIGAMY_VERSION=v0.1.19` | Install that release instead of the latest, replacing whatever is installed. |
+| `ORIGAMY_FORCE_UPDATE=1` | Replace the installed CLI even when it is newer or not a release build. |
+| `ORIGAMY_REQUIRE_SIGNATURE=1` | Refuse to install when the signature cannot be checked. |
+| `ORIGAMY_OPENSSL=/path/to/openssl` | Use this OpenSSL 3 for the signature check. |
 
 ## Commands
 
@@ -122,9 +139,12 @@ make release        # gh release create from bin/ (tag = git describe)
 ```
 
 `ORIGAMY_RELEASE_KEY` must point at the Ed25519 private key (unencrypted PKCS#8
-PEM) whose public half is embedded in the control plane's `install.sh`; releases
-built without it are published unsigned and installers fall back to
-checksum-only verification. Signing is done by `tools/sign` in pure Go, so a
+PEM) whose public half is embedded in the control plane's `install.sh`.
+`install.sh` refuses a release without `SHA256SUMS.sig`, so `make release`
+refuses to publish without one, and uploads it in the same `gh release create`
+call as the binaries (gh keeps the release a draft until every asset is up, so
+it is never `latest` unsigned). `make build-all` without the key still works
+for local builds. Signing is done by `tools/sign` in pure Go, so a
 release can be cut on macOS (whose system `openssl` is LibreSSL and cannot
 handle Ed25519). Generate a key with
 `go run ./tools/sign -h` for usage, or `openssl genpkey -algorithm ed25519`
@@ -137,8 +157,9 @@ where OpenSSL 3 is available; verify a downloaded release with
 customers get the moment it is published. The version string comes from
 `git describe`, so cut it from a clean checkout of the tagged commit — a dirty
 tree or an untagged commit would publish `v0.1.19-3-gabc123-dirty` as the
-release name and bake it into `origamy version`, and the installer's
-"already up to date" check compares exactly that string.
+release name and bake it into `origamy version`. The installer treats such a
+version as a non-release build: hosts that install it keep it and never
+auto-update past it without `ORIGAMY_FORCE_UPDATE=1`.
 
 ```sh
 git switch main && git pull --ff-only          # CI green on this commit
