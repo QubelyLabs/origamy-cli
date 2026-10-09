@@ -153,3 +153,89 @@ func TestBundleSchemaMismatch(t *testing.T) {
 		t.Fatalf("unknown schema must pass, got %q", why)
 	}
 }
+
+func TestLegacyChartSetArgs(t *testing.T) {
+	// The pinned 0.1.17 chart needs the slow probe; the fixed release and
+	// moving tags do not.
+	if got := legacyChartSetArgs("0.1.17"); len(got) != 4 || got[1] != "healthCheck.livenessProbe.initialDelaySeconds=90" || got[3] != "healthCheck.livenessProbe.failureThreshold=6" {
+		t.Fatalf("0.1.17: got %v", got)
+	}
+	for _, v := range []string{"0.1.18", "0.2.0", "main", ""} {
+		if got := legacyChartSetArgs(v); got != nil {
+			t.Errorf("%q: expected no overrides, got %v", v, got)
+		}
+	}
+}
+
+func TestPruneLegacyValues(t *testing.T) {
+	vals := map[string]any{
+		"controlPlane": map[string]any{"url": "x"},
+		"healthCheck": map[string]any{
+			"livenessProbe": map[string]any{"initialDelaySeconds": 90.0, "failureThreshold": 6.0},
+		},
+	}
+	pruneLegacyValues(vals)
+	if _, ok := vals["healthCheck"]; ok {
+		t.Fatalf("healthCheck should be gone when only the overrides were set: %v", vals)
+	}
+	if vals["controlPlane"].(map[string]any)["url"] != "x" {
+		t.Fatal("unrelated values must survive")
+	}
+	// A customer's own probe tweak next to ours is kept.
+	vals = map[string]any{"healthCheck": map[string]any{"livenessProbe": map[string]any{"initialDelaySeconds": 90.0, "timeoutSeconds": 9.0}}}
+	pruneLegacyValues(vals)
+	lp := vals["healthCheck"].(map[string]any)["livenessProbe"].(map[string]any)
+	if _, ok := lp["initialDelaySeconds"]; ok || lp["timeoutSeconds"] != 9.0 {
+		t.Fatalf("expected only our keys removed, got %v", vals)
+	}
+	pruneLegacyValues(map[string]any{}) // no healthCheck: no panic
+}
+
+func TestCrossesSchemaReset(t *testing.T) {
+	for _, c := range []struct {
+		from, to string
+		want     bool
+	}{
+		{"0.1.17", "0.1.18", true},
+		{"0.1.15", "0.2.0", true},
+		{"0.1.18", "0.1.19", false},
+		{"0.1.16", "0.1.17", false},
+		{"0.1.18", "0.1.17", false}, // downgrade: not this guard's job
+		{"main", "0.1.18", false},
+		{"0.1.17", "staging", false},
+		{"", "0.1.18", false},
+	} {
+		if got := crossesSchemaReset(c.from, c.to); got != c.want {
+			t.Errorf("crossesSchemaReset(%q, %q) = %v, want %v", c.from, c.to, got, c.want)
+		}
+	}
+}
+
+func TestIsDesktopContext(t *testing.T) {
+	for ctx, want := range map[string]bool{
+		"docker-desktop": true, "kind-kind": true, "minikube": true, "orbstack": true,
+		"rancher-desktop": true, "colima": true, "k3d-dev": true,
+		"arn:aws:eks:eu-west-1:123:cluster/prod": false, "gke_proj_europe-west1_prod": false, "": false,
+	} {
+		if got := isDesktopContext(ctx); got != want {
+			t.Errorf("isDesktopContext(%q) = %v, want %v", ctx, got, want)
+		}
+	}
+}
+
+func TestLiveSchemaMismatch(t *testing.T) {
+	if why := liveSchemaMismatch("json", "0.1.17"); why == "" {
+		t.Fatal("0.1.17 against a JSON volume must be refused")
+	}
+	if why := liveSchemaMismatch("string", "0.1.18"); why == "" || !strings.Contains(why, "origamy upgrade") {
+		t.Fatalf("0.1.18 against a String volume must point at upgrade, got %q", why)
+	}
+	for gen, tag := range map[string]string{"json": "0.1.18", "string": "0.1.17", "": "0.1.17"} {
+		if why := liveSchemaMismatch(gen, tag); why != "" {
+			t.Errorf("%s/%s must pass, got %q", gen, tag, why)
+		}
+	}
+	if why := liveSchemaMismatch("json", "staging"); why != "" {
+		t.Fatalf("moving tags never blocked, got %q", why)
+	}
+}

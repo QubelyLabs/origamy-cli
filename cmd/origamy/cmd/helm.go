@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,24 +76,38 @@ func predictorToggleArgs(enable, disable bool) ([]string, error) {
 }
 
 // exportReleaseValues writes the release's user-supplied values to a temp file
-// and returns its path (the caller removes it). Toggling a chart-default value
-// like orchestratorEngine.enabled must NOT go through `helm upgrade
-// --reuse-values`: when the target chart has gained new default structure the
-// old release never set, --reuse-values fails to parse the stale merged values.
-// Re-applying the user's own values from a file instead lets the new chart's
-// defaults fill the gaps cleanly while preserving every value the customer
-// supplied (controlPlane, portalAgent, preset, clickhouse, and the tunnel
-// identity Secret references).
-func exportReleaseValues() (string, error) {
-	out, err := runCaptured("helm", "get", "values", release, "-n", namespace, "-o", "yaml")
+// (JSON, which helm -f accepts) and returns its path; the caller removes it.
+// Every upgrade goes through this rather than `helm upgrade --reuse-values`:
+// --reuse-values hands the new chart the old release's fully coalesced values,
+// so any default block the old chart lacked is missing and the templates
+// nil-deref at render. Re-applying only the customer's own values (controlPlane,
+// portalAgent, preset, the tunnel identity Secret, …) lets the target chart's
+// defaults fill the gaps. When targetVer no longer needs the pre-0.1.18 probe
+// overrides a deploy may have written, they are pruned here so the release
+// returns to the chart's defaults.
+func exportReleaseValues(targetVer string) (string, error) {
+	out, err := runCaptured("helm", "get", "values", release, "-n", namespace, "-o", "json")
 	if err != nil {
 		return "", fmt.Errorf("%s", out)
 	}
-	f, err := os.CreateTemp("", "origamy-values-*.yaml")
+	vals := map[string]any{}
+	if strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "null" {
+		if err := json.Unmarshal([]byte(out), &vals); err != nil {
+			return "", fmt.Errorf("could not parse the release values: %w", err)
+		}
+	}
+	if legacyChartSetArgs(targetVer) == nil {
+		pruneLegacyValues(vals)
+	}
+	data, err := json.Marshal(vals)
 	if err != nil {
 		return "", err
 	}
-	if _, err := f.WriteString(out); err != nil {
+	f, err := os.CreateTemp("", "origamy-values-*.json")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
 		_ = os.Remove(f.Name())
 		return "", err
@@ -260,7 +276,12 @@ func setEnvVar(path, key, val string) error {
 			lines = append(lines, key+"="+val, "")
 		}
 	}
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
+		return err
+	}
+	// WriteFile only applies the mode when it creates the file; an .env an
+	// operator created 0644 must not stay world-readable once it holds secrets.
+	return os.Chmod(path, 0o600)
 }
 
 func readEnvVar(path, key string) string {
@@ -389,29 +410,95 @@ func withProfile(profiles []string, name string, on bool) []string {
 // SPA index.html: the file is not part of the bundle that control plane ships.
 var errNotServed = errors.New("not served by the control plane")
 
+// isLocalBase reports whether a plaintext base URL points at this machine —
+// the only case where fetching over http:// is acceptable (same rule as the
+// enrollment redemption in internal/token).
+func isLocalBase(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
 // fetchBundleFile downloads one file of the BYOD deploy bundle from the
-// control plane into the current directory. The control plane's SPA handler
-// answers unknown paths with index.html and HTTP 200, so a successful status
-// alone can't tell "missing" from "found" — sniff the body and reject HTML.
-// Plain net/http: the CLI must not depend on a curl being installed.
-func fetchBundleFile(base, name string) error {
-	url := strings.TrimRight(base, "/") + "/byod/" + name
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Get(url)
+// control plane into dir. The bundle is executable configuration (compose
+// file, schema), so it only travels over HTTPS (or to a local dev plane) and
+// a redirect to another host or scheme is refused. The control plane's SPA
+// handler answers unknown paths with index.html and HTTP 200, so a successful
+// status alone can't tell "missing" from "found" — sniff the body and reject
+// HTML. Plain net/http: the CLI must not depend on a curl being installed.
+func fetchBundleFile(base, name, dir string) error {
+	base = strings.TrimRight(base, "/")
+	if !strings.HasPrefix(base, "https://") && !isLocalBase(base) {
+		return fmt.Errorf("refusing to fetch the deploy bundle from %s: the control plane URL must be https", base)
+	}
+	target := base + "/byod/" + name
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			if req.URL.Scheme != "https" && !isLocalBase(req.URL.String()) {
+				return fmt.Errorf("refusing a redirect to %s (not https)", req.URL)
+			}
+			if req.URL.Host != via[0].URL.Host {
+				return fmt.Errorf("refusing a redirect to another host (%s)", req.URL.Host)
+			}
+			return nil
+		},
+	}
+	resp, err := client.Get(target)
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", url, err)
+		return fmt.Errorf("GET %s: %w", target, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+		return fmt.Errorf("GET %s: HTTP %d", target, resp.StatusCode)
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", url, err)
+		return fmt.Errorf("GET %s: %w", target, err)
 	}
 	if looksLikeHTML(b) {
 		return errNotServed
 	}
-	return os.WriteFile(name, b, 0o644)
+	return os.WriteFile(filepath.Join(dir, name), b, 0o644)
+}
+
+// mergeEnv returns rendered (the keys the CLI owns, freshly generated) with
+// every other KEY=value line of an existing .env appended, so an operator's
+// own additions (CORS_ALLOWED_ORIGINS, RATE_LIMIT_RPS, LLM_API_KEY, …) survive
+// a re-deploy in place. Comments and blank lines of the old file are dropped;
+// a key the CLI owns is always the freshly rendered one.
+func mergeEnv(existing, rendered string) string {
+	owned := map[string]bool{}
+	for _, l := range strings.Split(rendered, "\n") {
+		if k, _, ok := strings.Cut(l, "="); ok && !strings.HasPrefix(l, "#") {
+			owned[strings.TrimSpace(k)] = true
+		}
+	}
+	var kept []string
+	for _, l := range strings.Split(existing, "\n") {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		k, _, ok := strings.Cut(t, "=")
+		if !ok || owned[strings.TrimSpace(k)] {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if len(kept) == 0 {
+		return rendered
+	}
+	return rendered + "# Kept from your previous .env (not managed by `origamy deploy`).\n" + strings.Join(kept, "\n") + "\n"
 }
 
 func looksLikeHTML(b []byte) bool {

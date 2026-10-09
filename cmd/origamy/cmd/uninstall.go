@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -56,10 +57,16 @@ func runUninstall(id, target string, assumeYes bool) error {
 	// cluster, `origamy uninstall <id>` must tear down ./origamy-dp-<id>, not
 	// delete a namespace elsewhere. Kubernetes is chosen only when that cluster
 	// actually holds the release or the namespace.
-	k8s := hasKubernetes() && (releaseInstalled() || namespaceExists(namespace))
-	docker := hasDocker()
+	reachable := strings.ToLower(strings.TrimSpace(target)) != string(targetDocker) && hasKubernetes()
+	k8s := reachable && (releaseInstalled() || namespaceExists(namespace))
+	docker := strings.ToLower(strings.TrimSpace(target)) != string(targetKubernetes) && hasDocker()
 	where, err := resolveTarget(target, k8s, docker)
 	if err != nil {
+		if reachable && !k8s && (errors.Is(err, errNoTarget) || strings.Contains(err.Error(), "Kubernetes")) {
+			ctx := kubeContext()
+			return fail(fmt.Sprintf("Nothing to uninstall in the cluster kubectl points at (context %s): no '%s' release and no '%s' namespace.", orDash(ctx), release, namespace),
+				"If the data plane runs on Docker here, pass its id: origamy uninstall <data-plane-id>")
+		}
 		if errors.Is(err, errNoTarget) {
 			return fail("No Origamy data plane found on this machine.",
 				"Nothing to uninstall here — run this command where the data plane is deployed.")
