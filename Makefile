@@ -24,10 +24,20 @@ build-all:
 	@if [ -n "$(ORIGAMY_RELEASE_KEY)" ]; then \
 		go run ./tools/sign -key "$(ORIGAMY_RELEASE_KEY)" -in $(BUILD_DIR)/SHA256SUMS -out $(BUILD_DIR)/SHA256SUMS.sig; \
 	else \
-		echo "WARNING: ORIGAMY_RELEASE_KEY not set — SHA256SUMS will be UNSIGNED. Point it at your Ed25519 release private key to sign."; \
+		echo "WARNING: ORIGAMY_RELEASE_KEY not set — SHA256SUMS will be UNSIGNED (fine for local builds; make release refuses it). Point it at your Ed25519 release private key to sign."; \
 	fi
 
+# The control plane's install.sh refuses a release without SHA256SUMS.sig, so
+# an unsigned release would break every install the moment it became latest.
+# The signature is uploaded in the same `gh release create` call as the
+# binaries: gh creates the release as a draft, uploads every asset, then
+# publishes, so the release is never live without its signature. (Uploading
+# it afterwards left a window, and fails outright on an immutable release.)
 release: build-all
+	@if [ ! -s $(BUILD_DIR)/SHA256SUMS.sig ]; then \
+		echo "ERROR: $(BUILD_DIR)/SHA256SUMS.sig is missing. Set ORIGAMY_RELEASE_KEY and re-run: install.sh refuses unsigned releases." >&2; \
+		exit 1; \
+	fi
 	@echo "Creating GitHub release $(VERSION)..."
 	gh release create $(VERSION) \
 		--repo qubelylabs/origamy-cli \
@@ -37,11 +47,8 @@ release: build-all
 		$(BUILD_DIR)/$(BINARY)_linux_arm64 \
 		$(BUILD_DIR)/$(BINARY)_darwin_amd64 \
 		$(BUILD_DIR)/$(BINARY)_darwin_arm64 \
-		$(BUILD_DIR)/SHA256SUMS
-	@if [ -f $(BUILD_DIR)/SHA256SUMS.sig ]; then \
-		gh release upload $(VERSION) --repo qubelylabs/origamy-cli $(BUILD_DIR)/SHA256SUMS.sig && \
-		echo "Uploaded SHA256SUMS.sig"; \
-	fi
+		$(BUILD_DIR)/SHA256SUMS \
+		$(BUILD_DIR)/SHA256SUMS.sig
 
 test:
 	go test ./...
