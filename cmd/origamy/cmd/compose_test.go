@@ -138,3 +138,15 @@ func TestHasProfile(t *testing.T) {
 		t.Fatal("hasProfile wrong")
 	}
 }
+
+func TestClassifyComposeRestarting(t *testing.T) {
+	// A crash-looping container is "running" between restarts; only Status
+	// shows the loop.
+	_, failed := classifyCompose([]composeService{
+		{Service: "portal-agent", State: "running", Status: "Restarting (1) 3 seconds ago"},
+		{Service: "nats", State: "running", Status: "Up 40 seconds (healthy)", Health: "healthy"},
+	})
+	if len(failed) != 1 || failed[0] != "portal-agent" {
+		t.Fatalf("restarting service must be failed, got %v", failed)
+	}
+}

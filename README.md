@@ -98,6 +98,20 @@ release never set). `--channel edge` tracks moving images instead — `:main`
 on Kubernetes, `:staging` on Docker (the only moving tag every service is
 rebuilt under) — and is not for production.
 
+Two release boundaries the CLI knows about:
+
+- **Charts before 0.1.18** ship a config-sync whose health check treats the
+  first telemetry push as liveness, so the chart's default probe kills it
+  before it can report healthy. `deploy` and `upgrade` give those charts a
+  slower liveness probe; the overrides are dropped again on the first
+  upgrade to 0.1.18 or later.
+- **0.1.17 → 0.1.18 (storage reset)**: ClickHouse moves to 25.3 and the
+  events table is recreated with native JSON columns, which discards the
+  event history collected so far (profiles, traits, segments and journeys
+  are kept). `origamy upgrade` explains this, asks for a typed `yes`
+  (`--yes` skips it), then drops and recreates the table itself; on Docker it
+  first re-fetches the current schema from the control plane.
+
 ## Development
 
 ```sh

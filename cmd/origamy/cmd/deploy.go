@@ -111,9 +111,14 @@ func init() {
 func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
 	// A successful /byod/register consumes the one-time token, so everything
 	// that can fail or needs an answer — target, tooling, architecture, the
-	// questions — happens first. Only then is the token redeemed and the
-	// install applied.
-	k8s, docker := hasKubernetes(), hasDocker()
+	// bundle, the questions — happens first. Only then is the token redeemed
+	// and the install applied.
+	want := strings.ToLower(strings.TrimSpace(target))
+	// Probe only what the target needs: a stale kubeconfig can hang
+	// `kubectl cluster-info` for its whole dial timeout, which --target docker
+	// should never have to wait for.
+	k8s := want != string(targetDocker) && hasKubernetes()
+	docker := want != string(targetKubernetes) && hasDocker()
 	where, err := resolveTarget(target, k8s, docker)
 	if err != nil {
 		if errors.Is(err, errNoTarget) {
@@ -130,12 +135,25 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
 		dpVersion = deployChartVersion
 	}
 
+	// Read the token without spending it: a v2 handle is resolved through
+	// /v1/byod/enroll/resolve, which leaves it redeemable, and yields the plane
+	// id and control-plane URL the plan needs (which directory, which bundle).
+	// An invalid or expired token therefore fails here, before any question.
+	peek, err := token.Decode(raw)
+	if err != nil {
+		return fail("Could not read the enrollment token.", enrollHint(err))
+	}
+	if peek.Exp > 0 && time.Now().Unix() > peek.Exp {
+		return fail("Your enrollment token has expired.",
+			"Generate a new one from the Connections page in your dashboard.")
+	}
+
 	var kp *k8sPlan
 	var dp *dockerPlan
 	if where == targetKubernetes {
 		kp, err = planKubernetes(dpVersion, enableAI, aiSet, datastoreAuth, docker)
 	} else {
-		dp, err = planDocker(dpVersion, enableAI, aiSet)
+		dp, err = planDocker(dpVersion, enableAI, aiSet, peek.ID, peek.URL)
 	}
 	if err != nil {
 		return err
@@ -155,10 +173,10 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
 		sp.Fail("Enrollment failed")
 		return fail("Could not enroll this data plane.", enrollHint(err))
 	}
-	if tok.Exp > 0 && time.Now().Unix() > tok.Exp {
-		sp.Fail("Enrollment token expired")
-		return fail("Your enrollment token has expired.",
-			"Generate a new one from the Connections page in your dashboard.")
+	if tok.ID != peek.ID {
+		sp.Fail("Enrollment mismatch")
+		return fail(fmt.Sprintf("The control plane enrolled %s but the token announced %s.", tok.ID, peek.ID),
+			"Generate a fresh token from the Connections page in your dashboard and retry.")
 	}
 	sp.Success("Enrolled data plane %s", ui.Bold(tok.ID))
 	ui.KV("Control", tok.Addr)
@@ -173,12 +191,15 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
 }
 
 // enrollHint turns an enrollment error into guidance. The control plane's own
-// words come first (a proxy, a 502 or an "already used" handle are different
-// problems); the "mint a new token" advice is reserved for the cases where a
-// new token is actually the fix.
+// phrases (and the token decoder's) mark the cases where a new token is the
+// fix; anything else — a proxy, a lapsed TLS certificate on the control
+// plane, a 502 — is a connectivity problem that a new token would not solve.
 func enrollHint(err error) string {
 	msg := err.Error()
-	for _, needle := range []string{"already-used", "expired", "missing required fields", "could not decode", "could not parse"} {
+	for _, needle := range []string{
+		"already-used enrollment token", "enrollment token expired",
+		"missing required fields", "could not decode token", "could not parse token",
+	} {
 		if strings.Contains(msg, needle) {
 			return msg + "\nTokens are single-use and expire after 72 hours — generate a new one from the Connections page in your dashboard."
 		}
@@ -192,7 +213,7 @@ func hasKubernetes() bool {
 	if _, err := exec.LookPath("kubectl"); err != nil {
 		return false
 	}
-	return runQuiet("kubectl", "cluster-info") == nil
+	return runQuiet("kubectl", "cluster-info", "--request-timeout=10s") == nil
 }
 
 // k8sPlan is everything a Kubernetes install needs to know before the token
@@ -220,7 +241,8 @@ func planKubernetes(chartVer string, enableAI, aiSet, datastoreAuth, dockerToo b
 	}
 
 	ui.Title("Target")
-	if ctx := kubeContext(); ctx != "" {
+	ctx := kubeContext()
+	if ctx != "" {
 		ui.Success("Kubernetes cluster detected (kubectl context: %s)", ui.Bold(ctx))
 	} else {
 		ui.Success("Kubernetes cluster detected")
@@ -229,9 +251,14 @@ func planKubernetes(chartVer string, enableAI, aiSet, datastoreAuth, dockerToo b
 		ui.Step("Docker is also available here — rerun with --target docker to use Docker Compose instead.")
 	}
 	// The images only exist for amd64 (see preflight.go): refuse a cluster that
-	// could never schedule them, warn about a mixed one.
+	// could never schedule them, warn about a mixed one. A desktop distribution
+	// (Docker Desktop, kind, OrbStack, …) on Apple Silicon reports arm64 nodes
+	// yet runs amd64 images under emulation, so it only gets the warning.
 	if block, warn := nodeArchProblem(nodeArchs()); block != "" {
-		return nil, fail(block, "Add amd64 nodes, or deploy on an amd64 Docker host with --target docker.")
+		if !isDesktopContext(ctx) {
+			return nil, fail(block, "Add amd64 nodes, or deploy on an amd64 Docker host with --target docker.")
+		}
+		ui.Warn("%s Desktop clusters run them under emulation (slower), so continuing.", block)
 	} else if warn != "" {
 		ui.Warn("%s", warn)
 	}
@@ -369,6 +396,9 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 	// at install; that path lives in `origamy upgrade`).
 	aiArgs, _ := aiToggleArgs(p.aiEnabled, false)
 	helmArgs = append(helmArgs, aiArgs...)
+	// Charts before 0.1.18 kill config-sync under the default liveness probe
+	// before its first telemetry push (see preflight.go); give them time.
+	helmArgs = append(helmArgs, legacyChartSetArgs(p.chartVer)...)
 	switch p.exposeMode {
 	case 1: // LoadBalancer
 		helmArgs = append(helmArgs,
@@ -669,22 +699,26 @@ func hasDocker() bool {
 }
 
 // dockerPlan is everything a Docker install needs to know before the token is
-// spent.
+// spent: the answers, the project directory, and a bundle already downloaded
+// and checked against the release.
 type dockerPlan struct {
-	imageTag     string
+	imageTag string
+	// dir is the project directory (created by the plan). existingID is set
+	// when it already held this plane: the deploy then happens in place,
+	// keeping the generated passwords (the datastores hold data under them)
+	// and the operator's own .env additions.
+	dir          string
+	existingID   string
 	fullProfile  bool
 	aiEnabled    bool
 	ingestDomain string
-	// existingID is set when the current directory already holds an Origamy
-	// compose project: the deploy then happens in place, keeping its
-	// generated passwords (the datastores hold data under them).
-	existingID string
 }
 
-// planDocker runs the preflight checks and asks every question for a Docker
-// install. Re-running inside an existing project offers its current answers
-// as the defaults.
-func planDocker(imageTag string, enableAI, aiSet bool) (*dockerPlan, error) {
+// planDocker runs the preflight checks, downloads the bundle and asks every
+// question for a Docker install of plane id, whose control plane is at base.
+// The current directory is used when it is already this plane's project;
+// otherwise ./origamy-dp-<id>/, reused when it exists from an earlier deploy.
+func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*dockerPlan, error) {
 	ui.Title("Target")
 	ui.Success("Docker detected")
 	// The images only exist for amd64 (see preflight.go). Emulation works on
@@ -694,29 +728,93 @@ func planDocker(imageTag string, enableAI, aiSet bool) (*dockerPlan, error) {
 	}
 
 	p := &dockerPlan{imageTag: imageTag}
+
+	// — Directory ————————————————————————————————————————————————————————
+	switch cwdID := existingProjectID("."); {
+	case cwdID == id:
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, fail("Could not read the working directory.", err.Error())
+		}
+		p.dir, p.existingID = wd, id
+	case cwdID != "":
+		return nil, fail(fmt.Sprintf("This directory holds data plane %s, but the token enrolls %s.", cwdID, id),
+			"Run deploy from the parent directory to create ./origamy-dp-"+id+"/ for the new plane, or uninstall the old one first.")
+	default:
+		p.dir = "origamy-dp-" + id
+		if existingProjectID(p.dir) == id {
+			p.existingID = id
+		}
+	}
+	envPath := filepath.Join(p.dir, ".env")
+	if p.existingID != "" {
+		ui.Step("Data plane %s is already deployed in ./%s — it will be re-deployed in place, keeping its passwords, data and extra .env settings.", ui.Bold(id), filepath.Base(p.dir))
+	}
+
+	// — Bundle ——————————————————————————————————————————————————————————
+	// The whole bundle (compose + ClickHouse schema/users config + the
+	// Caddyfile) is served by the control plane at /byod/*. The Caddyfile is
+	// fetched even without a domain: it is inert until the "ingress" profile
+	// is on, and a later `up` with the profile added would otherwise turn the
+	// missing bind-mount source into an empty directory and crash Caddy.
+	if err := os.MkdirAll(p.dir, 0o755); err != nil {
+		return nil, fail("Could not create the working directory.", err.Error())
+	}
+	files := []string{"docker-compose.yml", "clickhouse-init.sql", "clickhouse-users.xml", "Caddyfile"}
+	sp := ui.Start("Downloading the deploy bundle")
+	for _, f := range files {
+		if err := fetchBundleFile(base, f, p.dir); err != nil {
+			sp.Fail("Could not download %s", f)
+			if errors.Is(err, errNotServed) {
+				return nil, fail(fmt.Sprintf("Your control plane does not serve %s.", f),
+					"It predates this CLI's deploy bundle — upgrade the control plane, or deploy with an older CLI.")
+			}
+			return nil, diagnose(err.Error())
+		}
+	}
+	sp.Success("Bundle downloaded (%s)", strings.Join(files, ", "))
+
+	// — Schema guard ————————————————————————————————————————————————————
+	// The bundle's ClickHouse schema follows the control plane's current build;
+	// the images follow imageTag. A mismatch comes up looking healthy and then
+	// drops every event at insert — refuse it here rather than find out later.
+	// For a plane that already runs, what its volume holds beats what a fresh
+	// volume would get.
+	live := ""
+	if p.existingID != "" {
+		live = liveSchemaGeneration(p.dir, envPath)
+	}
+	if live != "" {
+		if why := liveSchemaMismatch(live, imageTag); why != "" {
+			return nil, fail(why, "")
+		}
+	} else if servedSQL, err := os.ReadFile(filepath.Join(p.dir, "clickhouse-init.sql")); err == nil {
+		if why := bundleSchemaMismatch(string(servedSQL), imageTag); why != "" {
+			return nil, fail(why, "Pass --version <release> to install a matching data-plane release, or ask Origamy which release your control plane expects.")
+		}
+	}
+
+	// — Questions ———————————————————————————————————————————————————————
+	// A re-deploy offers the plane's current answers as the defaults.
 	fullDefault, ingestDefault := true, ""
-	if id := existingProjectID("."); id != "" {
-		p.existingID = id
-		profiles := composeProfiles(".env")
+	if p.existingID != "" {
+		profiles := composeProfiles(envPath)
 		fullDefault = hasProfile(profiles, "full")
-		ingestDefault = readEnvVar(".env", "INGEST_DOMAIN")
+		ingestDefault = readEnvVar(envPath, "INGEST_DOMAIN")
 		if !aiSet {
 			enableAI = hasProfile(profiles, "agentic")
 		}
-		ui.Step("This directory already holds data plane %s — it will be re-deployed in place, keeping its passwords and data.", ui.Bold(id))
 	}
 
 	// No "deployment size" question here: the compose bundle has a single
 	// replica of everything, so there is nothing a size could change.
 
-	// — Engagement services ——————————————————————————————————————————————
 	// Journeys, broadcasts and human tasks run in workflow-engine, which needs
 	// the bundled Postgres (compose profile "full"). Default on, matching the
 	// Kubernetes install where workflowEngine.enabled is true.
 	ui.Title("Engagement services")
 	p.fullProfile = promptYesNo("Enable journeys, broadcasts and human tasks? Adds Postgres + workflow-engine.", fullDefault)
 
-	// — AI engine ————————————————————————————————————————————————————————
 	// Same contract as Kubernetes: the CLI controls engine presence (compose
 	// profile "agentic"), the control plane controls use. The KEK and internal
 	// API token are generated on this host and never leave it.
@@ -726,7 +824,6 @@ func planDocker(imageTag string, enableAI, aiSet bool) (*dockerPlan, error) {
 		p.aiEnabled = promptYesNo("Enable the Origamy AI engine? Adds the orchestrator engine; requires the AI package in your dashboard.", enableAI)
 	}
 
-	// — Event endpoint ————————————————————————————————————————————————————
 	// The gateway listens on :8081 over plain HTTP. With a domain, the bundled
 	// Caddy (profile "ingress") terminates HTTPS with a Let's Encrypt cert.
 	ui.Title("Event endpoint")
@@ -746,54 +843,14 @@ func planDocker(imageTag string, enableAI, aiSet bool) (*dockerPlan, error) {
 // applyDocker installs the plane described by p for the enrolled token.
 func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	ui.Title("Provisioning")
-	dir := "origamy-dp-" + tok.ID
+	if err := os.Chdir(p.dir); err != nil {
+		return fail("Could not enter the working directory.", err.Error())
+	}
+	dir := filepath.Base(p.dir)
 	if p.existingID != "" {
-		if p.existingID != tok.ID {
-			return fail(fmt.Sprintf("This directory holds data plane %s, but the token enrolls %s.", p.existingID, tok.ID),
-				"Run deploy from the parent directory to create ./"+dir+"/ for the new plane, or uninstall the old one first.")
-		}
-		wd, err := os.Getwd()
-		if err != nil {
-			return fail("Could not read the working directory.", err.Error())
-		}
-		dir = filepath.Base(wd)
 		ui.Success("Re-deploying in ./%s", dir)
 	} else {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fail("Could not create the working directory.", err.Error())
-		}
-		if err := os.Chdir(dir); err != nil {
-			return fail("Could not enter the working directory.", err.Error())
-		}
 		ui.Success("Working directory ./%s", dir)
-	}
-
-	// The whole bundle (compose + ClickHouse schema/users config + the
-	// Caddyfile) is served by the control plane at /byod/*. The Caddyfile is
-	// fetched even without a domain: it is inert until the "ingress" profile is
-	// on, and a later `up` with the profile added would otherwise turn the
-	// missing bind-mount source into an empty directory and crash Caddy.
-	files := []string{"docker-compose.yml", "clickhouse-init.sql", "clickhouse-users.xml", "Caddyfile"}
-	sp := ui.Start("Downloading the deploy bundle")
-	for _, f := range files {
-		if err := fetchBundleFile(tok.URL, f); err != nil {
-			sp.Fail("Could not download %s", f)
-			if errors.Is(err, errNotServed) {
-				return fail(fmt.Sprintf("Your control plane does not serve %s.", f),
-					"It predates this CLI's deploy bundle — upgrade the control plane, or deploy with an older CLI.")
-			}
-			return diagnose(err.Error())
-		}
-	}
-	sp.Success("Bundle downloaded (%s)", strings.Join(files, ", "))
-
-	// The bundle's ClickHouse schema follows the control plane's current build;
-	// the images follow imageTag. A mismatch comes up looking healthy and then
-	// drops every event at insert — refuse it here rather than find out later.
-	if initSQL, err := os.ReadFile("clickhouse-init.sql"); err == nil {
-		if why := bundleSchemaMismatch(string(initSQL), p.imageTag); why != "" {
-			return fail(why, "Pass --version <release> to install a matching data-plane release, or ask Origamy which release your control plane expects.")
-		}
 	}
 
 	// Secrets are generated HERE, in the customer's environment, and written to
@@ -802,11 +859,21 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	// running datastores (which hold data). The AI secrets are carried forward
 	// even when AI is off: the KEK must survive a disable/enable cycle or the
 	// per-workspace LLM keys encrypted under it become unreadable.
+	existingEnv, _ := os.ReadFile(".env")
 	orchKEK := readEnvVar(".env", "ORCH_KEK")
 	orchToken := readEnvVar(".env", "ORCH_ENGINE_API_TOKEN")
 	if p.aiEnabled {
 		orchKEK = existingOrRandomKEK(".env", "ORCH_KEK")
 		orchToken = existingOrRandom(".env", "ORCH_ENGINE_API_TOKEN")
+	}
+	// Postgres bakes its password into the volume at first start. A project
+	// whose .env never set DB_PASSWORD (dashboard snippet, older CLI) runs on
+	// the bundle's default, and a freshly generated one would lock
+	// workflow-engine out of its own data.
+	dbPw := existingOrRandom(".env", "DB_PASSWORD")
+	if p.existingID != "" && readEnvVar(".env", "DB_PASSWORD") == "" {
+		dbPw = "origamy"
+		ui.Warn("Keeping the bundled Postgres on its original default password: it was initialised without one and cannot be rotated from here.")
 	}
 	var profiles []string
 	if p.fullProfile {
@@ -830,14 +897,22 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 		RedisPw:      existingOrRandom(".env", "DP_REDIS_PASSWORD"),
 		NatsPw:       existingOrRandom(".env", "NATS_PASSWORD"),
 		ClickHousePw: existingOrRandom(".env", "CLICKHOUSE_PASSWORD"),
-		DBPw:         existingOrRandom(".env", "DB_PASSWORD"),
+		DBPw:         dbPw,
 		OrchKEK:      orchKEK,
 		OrchToken:    orchToken,
 		AIEnabled:    p.aiEnabled,
 		MTLS:         tok.Cert != "",
 	})
+	// Keep whatever else the operator put in the old .env (rate limits, CORS,
+	// an opt-in LLM key): only the keys the CLI owns are rewritten.
+	env = mergeEnv(string(existingEnv), env)
 	if err := os.WriteFile(".env", []byte(env), 0o600); err != nil {
 		return fail("Could not write .env.", err.Error())
+	}
+	// WriteFile keeps the mode of a pre-existing file; an operator-created
+	// 0644 .env must not stay world-readable now that it holds secrets.
+	if err := os.Chmod(".env", 0o600); err != nil {
+		return fail("Could not protect .env.", err.Error())
 	}
 	ui.Success("Wrote .env (secrets generated locally — never sent to Origamy)")
 
@@ -853,31 +928,33 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 			if err := os.WriteFile("certs/"+name, []byte(content), 0o600); err != nil {
 				return fail("Could not write certs/"+name+".", err.Error())
 			}
+			_ = os.Chmod("certs/"+name, 0o600)
 		}
 		ui.Success("Wrote mTLS identity (certs/tls.crt, tls.key, ca.crt)")
 	}
 
 	ui.Title("Bringing services online")
-	sp = ui.Start("Starting services")
+	sp := ui.Start("Starting services")
 	// Profiles come from COMPOSE_PROFILES in .env, so every later compose
-	// invocation (upgrade/status) sees the same service set.
-	if out, err := runCaptured("docker", "compose", "--env-file", ".env", "up", "-d"); err != nil {
+	// invocation (upgrade/status) sees the same service set. --remove-orphans
+	// stops the containers of a profile a re-deploy just turned off.
+	if out, err := runCaptured("docker", "compose", "--env-file", ".env", "up", "-d", "--remove-orphans"); err != nil {
 		sp.Fail("docker compose failed")
 		return diagnose(out)
 	}
 	sp.Success("Services started")
 
 	// `up -d` returning 0 only means the containers were created. Watch them
-	// come up so a wrong token, a refused mTLS handshake or a crashing service
-	// is reported here, with its logs, instead of as a plane that never shows
-	// up Connected.
+	// stay up for a while so a wrong token, a refused mTLS handshake or a
+	// crashing service is reported here, with its logs, instead of as a plane
+	// that never shows up Connected.
 	sp = ui.Start("Waiting for services to become healthy")
 	healthy, failed := waitForCompose(".", ".env", sp)
 	switch {
 	case healthy:
-		sp.Success("All services are healthy")
+		sp.Success("All services are up and stable")
 	case len(failed) > 0:
-		sp.Fail("Some services exited")
+		sp.Fail("Some services exited or keep restarting")
 		for _, svc := range failed {
 			ui.Detail("%s — last log lines:", ui.Bold(svc))
 			for _, l := range strings.Split(composeLogs(".", ".env", svc, 15), "\n") {
@@ -934,6 +1011,27 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 // (`printf '1\nn\n' | origamy deploy …`) only the first would be honoured.
 var stdin = bufio.NewReader(os.Stdin)
 
+// stdinIsTerminal says whether a person is answering. Answers from a pipe or
+// file cannot be corrected interactively, so a rejected one must stop the
+// run — the prompts run before anything is enrolled or installed, so that is
+// always safe — instead of looping on EOF and silently taking defaults.
+var stdinIsTerminal = func() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}()
+
+// rejectAnswer stops a non-interactive run on an unusable answer.
+func rejectAnswer(answer string) {
+	if stdinIsTerminal {
+		return
+	}
+	fmt.Println()
+	ui.Fail("Unexpected answer on a non-interactive stdin: %q", answer)
+	ui.Detail("The prompts changed in this release; check the piped answers. Nothing has been enrolled or installed.")
+	fmt.Println()
+	os.Exit(1)
+}
+
 func promptChoice(label string, min, max, defaultVal int) int {
 	for {
 		fmt.Printf("\n  %s %s ", label, ui.Gray(fmt.Sprintf("[%d]", defaultVal)))
@@ -946,6 +1044,7 @@ func promptChoice(label string, min, max, defaultVal int) int {
 		if _, err := fmt.Sscanf(line, "%d", &n); err == nil && n >= min && n <= max {
 			return n
 		}
+		rejectAnswer(line)
 		ui.Warn("Please enter a number between %d and %d.", min, max)
 	}
 }
@@ -973,6 +1072,7 @@ func promptYesNo(label string, defaultYes bool) bool {
 		case "n", "no":
 			return false
 		}
+		rejectAnswer(strings.TrimSpace(line))
 		ui.Warn("Please answer y or n.")
 	}
 }
