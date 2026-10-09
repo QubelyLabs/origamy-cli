@@ -36,7 +36,7 @@ Use --enable-predictor / --disable-predictor the same way for the predictor
 (conversion scoring) service — Kubernetes only.`,
 	Example: `  origamy upgrade                 # Kubernetes: latest published chart; Docker: this CLI's release
   origamy upgrade --version 0.1.17
-  origamy upgrade --channel edge  # track the bleeding edge (:main)
+  origamy upgrade --channel edge  # track the moving images (Kubernetes :main, Docker :staging); not for production
   origamy upgrade --enable-ai     # switch the AI engine on
   origamy upgrade --disable-ai    # switch the AI engine off
   origamy upgrade --enable-predictor   # switch the predictor (scoring) service on
@@ -57,8 +57,8 @@ Use --enable-predictor / --disable-predictor the same way for the predictor
 
 func init() {
 	upgradeCmd.Flags().String("version", "", "Target release (default: latest published chart on Kubernetes, "+helmVersion+" on Docker)")
-	upgradeCmd.Flags().String("channel", "stable", "Release channel: stable (pinned) or edge (:main)")
-	upgradeCmd.Flags().StringArray("set", nil, "Set a chart value (key=value, repeatable; Kubernetes only). New values introduced by a chart version don't exist in the release yet, so --reuse-values alone can't set them.")
+	upgradeCmd.Flags().String("channel", "stable", "Release channel: stable (pinned) or edge (moving images: :main on Kubernetes, :staging on Docker)")
+	upgradeCmd.Flags().StringArray("set", nil, "Set a chart value (key=value, repeatable; Kubernetes only), e.g. a key a newer chart introduced.")
 	upgradeCmd.Flags().Bool("enable-ai", false, "Switch the Origamy AI (agentic) engine on for the existing install")
 	upgradeCmd.Flags().Bool("disable-ai", false, "Switch the Origamy AI (agentic) engine off for the existing install")
 	upgradeCmd.Flags().Bool("enable-predictor", false, "Switch the predictor (conversion scoring) service on for the existing release (Kubernetes only)")
@@ -147,36 +147,33 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 		"--namespace", namespace,
 		"--version", target,
 	}
-	// Value preservation: the normal version bump reuses the release's values in
-	// place. But toggling a feature boolean (orchestratorEngine.enabled /
-	// predictor.enabled) must NOT use --reuse-values — when the target chart has
-	// default structure the old release never set (the predictor block on a
-	// pre-predictor install, say), --reuse-values ignores the new chart's
-	// defaults and the render nil-derefs. For a toggle we export the user's
-	// values to a file and re-apply them, so the new chart's defaults fill the
-	// gaps cleanly while every customer value (controlPlane, portalAgent,
-	// preset, clickhouse, tunnel identity secret) is preserved.
-	if toggle {
-		valsFile, err := exportReleaseValues()
-		if err != nil {
-			return fail("Could not read the current release values.", err.Error())
-		}
-		defer func() { _ = os.Remove(valsFile) }()
-		args = append(args, "-f", valsFile)
-	} else {
-		args = append(args, "--reuse-values")
+	// Value preservation: the customer's own values are exported and re-applied
+	// from a file — never `--reuse-values`. --reuse-values hands the NEW chart
+	// the OLD release's fully coalesced values, so every default block the old
+	// chart lacked (the predictor on a pre-0.1.17 install, the orchestrator on
+	// a pre-0.1.16 one) is simply missing and the templates nil-deref at
+	// render. Every release the shipped v0.1.18 CLI installed is on chart
+	// 0.1.15 and hit exactly that. Re-applying only what the customer set
+	// (controlPlane, portalAgent, preset, clickhouse, the tunnel identity
+	// Secret) lets the target chart's defaults fill the gaps.
+	valsFile, err := exportReleaseValues()
+	if err != nil {
+		return fail("Could not read the current release values.", err.Error())
 	}
+	defer func() { _ = os.Remove(valsFile) }()
+	args = append(args, "-f", valsFile)
 
 	// Resolve the image tag every data-plane service should run, then pin it
-	// both globally AND per-service. Per-service is not redundant: --reuse-values
-	// carries each service's frozen image.tag forward, and the chart's image
-	// helper (.image.tag | default .global.imageTag | default .appVersion) lets
-	// a non-empty per-service tag SHADOW global.imageTag — so a release first
-	// installed on the pre-pinning 0.1.12 chart (which froze tag: main) would
-	// otherwise stay on :main no matter the target version.
+	// both globally AND per-service. Per-service is not redundant: the exported
+	// values carry each service's frozen image.tag forward, and the chart's
+	// image helper (.image.tag | default .global.imageTag | default .appVersion)
+	// lets a non-empty per-service tag SHADOW global.imageTag — so a release
+	// first installed on the pre-pinning 0.1.12 chart (which froze tag: main)
+	// would otherwise stay on :main no matter the target version.
 	imageTag := target // pinned appVersion of the target chart
 	if channel == "edge" {
 		imageTag = "main" // track the moving edge tag instead
+		ui.Warn("The edge channel runs the moving :main images, which are rebuilt only from the data-plane's main branch; not for production.")
 	}
 	args = append(args, "--set", "global.imageTag="+imageTag)
 	for _, svc := range serviceImageKeys() {
@@ -258,27 +255,34 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	return nil
 }
 
+// dockerEdgeTag is what `--channel edge` runs on Docker. The :staging tag is
+// rebuilt for every service on each staging deploy; :main is not (the
+// data-plane's main branch is development-only), so it lags for months and
+// is missing entirely for the AI engine and predictor images.
+const dockerEdgeTag = "staging"
+
 func upgradeDocker(version, channel string, enableAI, disableAI bool) error {
-	dir, ok := findComposeDir()
-	if !ok {
+	dir, err := composeProjectDir()
+	if err != nil {
 		return fail("No Origamy compose project found here.",
-			"cd into your data-plane directory (e.g. ./origamy-dp-<id>) and retry, or run `origamy deploy` first.")
+			err.Error()+"\ncd into your data-plane directory (e.g. ./origamy-dp-<id>) and retry, or run `origamy deploy` first.")
 	}
 	envPath := filepath.Join(dir, ".env")
 
 	// Docker pins images via DP_IMAGE_TAG. An explicit version wins; "edge"
-	// tracks the moving :main tag; otherwise the release this CLI ships with
+	// tracks the moving :staging tag; otherwise the release this CLI ships with
 	// (images and chart share a version, so this matches the Kubernetes pin).
 	tag := strings.TrimSpace(version)
 	switch {
 	case tag != "":
 	case channel == "edge":
-		tag = "main"
+		tag = dockerEdgeTag
+		ui.Warn("The edge channel runs the moving :%s images; not for production.", tag)
 	default:
 		tag = helmVersion
 	}
-	if err := setEnvVar(envPath, "DP_IMAGE_TAG", tag); err != nil {
-		return fail("Could not update .env.", err.Error())
+	if cur := readEnvVar(envPath, "DP_IMAGE_TAG"); cur != "" && versionLess(tag, cur) {
+		ui.Warn("Moving from %s back to %s — an older release may not understand data written by the newer one.", cur, tag)
 	}
 
 	// AI engine = the "agentic" compose profile. Enabling generates the engine's
@@ -314,12 +318,20 @@ func upgradeDocker(version, channel string, enableAI, disableAI bool) error {
 	ui.KV("Image tag", tag)
 	ui.KV("Profiles", orDash(strings.Join(profiles, ",")))
 
+	// Pull BEFORE recording the tag: a tag that does not exist for one of the
+	// services (or a registry outage) must leave .env — and therefore every
+	// later `docker compose up` — on the release that is actually running.
+	// The process environment wins over the env file in compose
+	// interpolation, so the pull sees the candidate tag without writing it.
 	sp := ui.Start("Pulling %s images", tag)
-	if out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "pull"); err != nil {
+	if out, err := runCapturedEnv([]string{"DP_IMAGE_TAG=" + tag}, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "pull"); err != nil {
 		sp.Fail("docker compose pull failed")
 		return diagnose(out)
 	}
 	sp.Success("Images pulled")
+	if err := setEnvVar(envPath, "DP_IMAGE_TAG", tag); err != nil {
+		return fail("Could not update .env.", err.Error())
+	}
 
 	// --remove-orphans stops containers of profiles that were just turned off
 	// (compose otherwise leaves them running); named volumes are untouched.

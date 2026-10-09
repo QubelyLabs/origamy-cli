@@ -113,6 +113,6 @@ func loadPublic(path string) (ed25519.PublicKey, error) {
 }
 
 func fail(err error) {
-	fmt.Fprintln(os.Stderr, "sign:", err)
+	_, _ = fmt.Fprintln(os.Stderr, "sign:", err)
 	os.Exit(1)
 }

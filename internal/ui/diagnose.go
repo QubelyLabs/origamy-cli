@@ -21,6 +21,16 @@ func DiagnoseHelm(output string) Diagnosis {
 			"A previous install is still in progress or stuck.",
 			"Wait a minute and retry. If it persists: helm uninstall odp -n origamy-dp, then deploy again.",
 		}
+	case contains(o, "conflict. the container name"):
+		return Diagnosis{
+			"Another Origamy data plane is already running on this host.",
+			"The compose bundle uses fixed container names, so one host runs one plane. Re-deploy inside its ./origamy-dp-<id>/ directory, or `origamy uninstall <id>` the old one first.",
+		}
+	case contains(o, "no matching manifest for linux/arm64"), contains(o, "exec format error"):
+		return Diagnosis{
+			"The data-plane images are published for linux/amd64 only.",
+			"Run on an amd64 host, or (Docker Desktop / Linux with QEMU binfmt) let Docker emulate amd64.",
+		}
 	case contains(o, "context deadline exceeded"), contains(o, "timed out waiting"):
 		return Diagnosis{
 			"The install timed out before every pod was ready.",

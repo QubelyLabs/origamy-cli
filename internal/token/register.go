@@ -97,7 +97,7 @@ func register(baseURL, handle string, csrPEM []byte) (*Enrollment, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not reach the control plane to enroll: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		return nil, errMTLSDisabled

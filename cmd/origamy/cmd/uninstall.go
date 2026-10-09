@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,21 +17,24 @@ var uninstallCmd = &cobra.Command{
 	Short: "Tear down an Origamy data plane from this machine",
 	Long: `Remove the Origamy data plane this CLI deployed.
 
-Auto-detects your environment:
-  • Kubernetes → helm uninstall odp + delete the origamy-dp namespace
+Finds the install to remove (override with --target):
+  • Kubernetes → helm uninstall odp + delete the origamy-dp namespace, when the
+                 cluster kubectl points at has the release or the namespace
   • Docker     → docker compose down -v in ./origamy-dp-<id>/
 
 Run this BEFORE deactivating the workspace in your dashboard so the plane
 stops trying to reconnect.`,
-	Example: `  origamy uninstall dp-13-qaglj0ye`,
-	Args:    cobra.MaximumNArgs(1),
+	Example: `  origamy uninstall dp-13-qaglj0ye
+  origamy uninstall --target kubernetes`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		id := ""
 		if len(args) > 0 {
 			id = args[0]
 		}
 		yes, _ := cmd.Flags().GetBool("yes")
-		return runUninstall(id, yes)
+		target, _ := cmd.Flags().GetString("target")
+		return runUninstall(id, target, yes)
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -38,26 +42,38 @@ stops trying to reconnect.`,
 
 func init() {
 	uninstallCmd.Flags().BoolP("yes", "y", false, "Skip the confirmation prompt")
+	uninstallCmd.Flags().String("target", string(targetAuto), "Which install to remove: auto, kubernetes, or docker")
 }
 
-func runUninstall(id string, assumeYes bool) error {
+func runUninstall(id, target string, assumeYes bool) error {
 	ui.Title("Uninstall Origamy data plane")
 	if id != "" {
 		ui.KV("Data plane", ui.Bold(id))
 	}
 
-	switch {
-	case hasKubernetes():
+	// Unlike deploy, a reachable cluster alone is not enough to go the
+	// Kubernetes way: on a Docker host whose kubeconfig still points at some
+	// cluster, `origamy uninstall <id>` must tear down ./origamy-dp-<id>, not
+	// delete a namespace elsewhere. Kubernetes is chosen only when that cluster
+	// actually holds the release or the namespace.
+	k8s := hasKubernetes() && (releaseInstalled() || namespaceExists(namespace))
+	docker := hasDocker()
+	where, err := resolveTarget(target, k8s, docker)
+	if err != nil {
+		if errors.Is(err, errNoTarget) {
+			return fail("No Origamy data plane found on this machine.",
+				"Nothing to uninstall here — run this command where the data plane is deployed.")
+		}
+		return fail(err.Error(), "Pass --target kubernetes or --target docker, or omit it to auto-detect.")
+	}
+	if where == targetKubernetes {
 		return uninstallKubernetes(assumeYes)
-	case hasDocker() && id != "":
-		return uninstallDocker(id, assumeYes)
-	case hasDocker():
+	}
+	if id == "" {
 		return fail("Docker detected, but no data plane id was given.",
 			"Run: origamy uninstall <data-plane-id>  (the id is on your dashboard's Connections page).")
-	default:
-		return fail("No Kubernetes cluster or Docker found on this machine.",
-			"Nothing to uninstall here — run this command where the data plane is deployed.")
 	}
+	return uninstallDocker(id, assumeYes)
 }
 
 // confirmTeardown asks for an explicit "yes" before destroying anything, unless
@@ -79,7 +95,11 @@ func uninstallKubernetes(assumeYes bool) error {
 			"Install it from https://helm.sh/docs/intro/install/ and retry.")
 	}
 	ui.Title("Target")
-	ui.Success("Kubernetes cluster detected")
+	if ctx := kubeContext(); ctx != "" {
+		ui.Success("Kubernetes cluster detected (kubectl context: %s)", ui.Bold(ctx))
+	} else {
+		ui.Success("Kubernetes cluster detected")
+	}
 
 	if !confirmTeardown(fmt.Sprintf("the '%s' release and the '%s' namespace", release, namespace), assumeYes) {
 		return fail("Cancelled.", "")

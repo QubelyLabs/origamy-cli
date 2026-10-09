@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -97,7 +98,7 @@ func redeem(baseURL, handle string) (*Enrollment, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not reach the control plane to redeem your token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		var e struct {
@@ -120,6 +121,19 @@ func redeem(baseURL, handle string) (*Enrollment, error) {
 	return &out, nil
 }
 
-func isLocal(url string) bool {
-	return strings.HasPrefix(url, "http://localhost") || strings.HasPrefix(url, "http://127.0.0.1")
+// isLocal reports whether a plaintext base URL points at this machine — the
+// only case where redeeming a handle over http:// is acceptable. The host is
+// compared exactly (a prefix test would wave through http://localhost.evil.tld
+// and http://127.0.0.1.nip.io, sending the handle and CSR to a foreign host in
+// the clear).
+func isLocal(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
