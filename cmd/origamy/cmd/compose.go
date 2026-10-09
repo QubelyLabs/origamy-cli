@@ -69,9 +69,13 @@ func hasProfile(profiles []string, name string) bool {
 // ── Health after `up -d` ─────────────────────────────────────────────────────
 
 // composeService is the subset of `docker compose ps --format json` we read.
+// Status is the human line ("Up 5 seconds", "Restarting (1) 3 seconds ago");
+// a crash-looping container reports State "running" between restarts, so
+// Status is the only field that exposes the loop.
 type composeService struct {
 	Service  string `json:"Service"`
 	State    string `json:"State"`
+	Status   string `json:"Status"`
 	Health   string `json:"Health"`
 	ExitCode int    `json:"ExitCode"`
 }
@@ -110,6 +114,10 @@ func parseComposePS(out string) ([]composeService, error) {
 // failed; anything created or still passing its healthcheck is pending.
 func classifyCompose(svcs []composeService) (pending, failed []string) {
 	for _, s := range svcs {
+		if strings.HasPrefix(strings.ToLower(s.Status), "restarting") {
+			failed = append(failed, s.Service)
+			continue
+		}
 		switch strings.ToLower(s.State) {
 		case "running":
 			if strings.ToLower(s.Health) == "starting" {
@@ -133,12 +141,20 @@ func classifyCompose(svcs []composeService) (pending, failed []string) {
 	return pending, failed
 }
 
-// waitForCompose polls the project for up to ~2 minutes. It returns healthy
-// when every service is running (and healthy, where it has a check), or the
-// failed services as soon as one gives up — a crashing container restarts
-// forever and would otherwise be reported as "still starting".
+// composeSettle is how long every service must stay up, with no exit or
+// restart, before the stack counts as healthy. A service that cannot reach
+// the control plane (wrong token, refused client cert) starts fine and dies a
+// few seconds later; declaring success on the first all-running snapshot
+// would miss exactly that.
+const composeSettle = 30 * time.Second
+
+// waitForCompose polls the project for up to ~3 minutes. It returns healthy
+// when every service has been running (and healthy, where it has a check)
+// for composeSettle, or the failed services as soon as one exits or starts
+// restarting.
 func waitForCompose(dir, envPath string, sp *ui.Spinner) (healthy bool, failed []string) {
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(3 * time.Minute)
+	var stableSince time.Time
 	for {
 		out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "ps", "-a", "--format", "json")
 		if err == nil {
@@ -148,9 +164,17 @@ func waitForCompose(dir, envPath string, sp *ui.Spinner) (healthy bool, failed [
 					return false, failed
 				}
 				if len(pending) == 0 {
-					return true, nil
+					if stableSince.IsZero() {
+						stableSince = time.Now()
+					}
+					if time.Since(stableSince) >= composeSettle {
+						return true, nil
+					}
+					sp.Suffix("all %d services up — watching for %ds", len(svcs), int((composeSettle-time.Since(stableSince)).Seconds())+1)
+				} else {
+					stableSince = time.Time{}
+					sp.Suffix("%d/%d services ready", len(svcs)-len(pending), len(svcs))
 				}
-				sp.Suffix("%d/%d services ready", len(svcs)-len(pending), len(svcs))
 			}
 		}
 		if time.Now().After(deadline) {
@@ -158,6 +182,25 @@ func waitForCompose(dir, envPath string, sp *ui.Spinner) (healthy bool, failed [
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// liveSchemaGeneration asks the running ClickHouse of a compose project which
+// generation its events table is ("json", "string"), "" when the container is
+// not running or the table does not exist yet. The served init SQL says what
+// the control plane would create; this says what the volume already holds.
+func liveSchemaGeneration(dir, envPath string) string {
+	out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "exec", "-T", "clickhouse", "sh", "-c",
+		`clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT type FROM system.columns WHERE database = 'events' AND table = 'events' AND name = 'properties'"`)
+	if err != nil {
+		return ""
+	}
+	switch t := strings.TrimSpace(out); {
+	case strings.HasPrefix(t, "JSON"):
+		return "json"
+	case strings.HasPrefix(t, "String"):
+		return "string"
+	}
+	return ""
 }
 
 // composeLogs returns the last n log lines of one service.

@@ -205,3 +205,112 @@ func bundleSchemaMismatch(initSQL, imageTag string) string {
 	}
 	return ""
 }
+
+// ── Pre-0.1.18 chart quirks ──────────────────────────────────────────────────
+
+// minChartLivenessFix is the first data-plane release whose config-sync treats
+// the control-plane and telemetry checks as readiness rather than liveness.
+// Before it, /healthz answers 503 until the first telemetry push (30 s after
+// start), while the chart's shared liveness probe (10 s delay, 10 s period,
+// 3 failures) kills the pod at ~40 s: config-sync crash-loops forever and no
+// config ever syncs, although the plane shows Connected.
+const minChartLivenessFix = "0.1.18"
+
+// legacyChartSetArgs returns the extra helm --set flags that keep a
+// pre-0.1.18 chart alive: a liveness probe slow enough to outlast the first
+// telemetry push and a few retries. The other services share the probe
+// values and are unaffected by the extra patience. Empty for charts that
+// carry the fix (and for non-semver targets).
+func legacyChartSetArgs(chartVer string) []string {
+	if !versionLess(chartVer, minChartLivenessFix) {
+		return nil
+	}
+	return []string{
+		"--set", "healthCheck.livenessProbe.initialDelaySeconds=90",
+		"--set", "healthCheck.livenessProbe.failureThreshold=6",
+	}
+}
+
+// pruneLegacyValues removes the probe overrides legacyChartSetArgs wrote into
+// a release's values once the target chart no longer needs them, so an
+// upgrade returns to the chart's own defaults. Empty parents are dropped.
+func pruneLegacyValues(vals map[string]any) {
+	hc, _ := vals["healthCheck"].(map[string]any)
+	if hc == nil {
+		return
+	}
+	if lp, _ := hc["livenessProbe"].(map[string]any); lp != nil {
+		delete(lp, "initialDelaySeconds")
+		delete(lp, "failureThreshold")
+		if len(lp) == 0 {
+			delete(hc, "livenessProbe")
+		}
+	}
+	if len(hc) == 0 {
+		delete(vals, "healthCheck")
+	}
+}
+
+// crossesSchemaReset reports whether moving a data plane from release `from`
+// to release `to` crosses the ClickHouse storage reset: ClickHouse moves to
+// 25.3 and the events table must be recreated with native JSON columns, which
+// discards the event history collected so far (user_traits is altered in
+// place). Non-semver tags never cross.
+func crossesSchemaReset(from, to string) bool {
+	if _, ok := parseVersion(from); !ok {
+		return false
+	}
+	if _, ok := parseVersion(to); !ok {
+		return false
+	}
+	return versionLess(from, minImageForJSONSchema) && !versionLess(to, minImageForJSONSchema)
+}
+
+// eventsTable is the ClickHouse table the storage reset recreates.
+const eventsTable = "events.events"
+
+// clickhouseDropEvents is the shell snippet, run inside the ClickHouse
+// container, that drops the pre-reset events table. CH_DEFAULT_PASSWORD is
+// set on the container by both the chart and the compose bundle (empty when
+// datastore auth is off, which clickhouse-client accepts).
+const clickhouseDropEvents = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "DROP TABLE IF EXISTS ` + eventsTable + `"`
+
+// clickhouseInitStdin applies the schema fed on stdin inside the container.
+const clickhouseInitStdin = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --multiquery`
+
+// isDesktopContext reports whether a kubectl context names a local desktop
+// distribution (Docker Desktop, kind, minikube, OrbStack, Rancher Desktop,
+// Colima, k3d). Their single node is arm64 on Apple Silicon, yet they run
+// amd64 images under emulation, so an arm64-only node list is a warning
+// there rather than a stop.
+func isDesktopContext(ctx string) bool {
+	c := strings.ToLower(strings.TrimSpace(ctx))
+	for _, p := range []string{"docker-desktop", "kind-", "minikube", "orbstack", "rancher-desktop", "colima", "k3d-"} {
+		if strings.HasPrefix(c, p) || c == strings.TrimSuffix(p, "-") {
+			return true
+		}
+	}
+	return false
+}
+
+// liveSchemaMismatch is bundleSchemaMismatch for a schema generation observed
+// in a RUNNING ClickHouse (what the volume already holds) rather than in the
+// served init SQL (what a fresh volume would get).
+func liveSchemaMismatch(gen, imageTag string) string {
+	if _, semver := parseVersion(imageTag); !semver {
+		return ""
+	}
+	switch gen {
+	case "json":
+		if versionLess(imageTag, minImageForJSONSchema) {
+			return fmt.Sprintf("The ClickHouse volume in this directory already holds the current schema (native JSON payload columns), which data-plane release %s cannot write to. Deploy %s or newer here.",
+				imageTag, minImageForJSONSchema)
+		}
+	case "string":
+		if !versionLess(imageTag, minImageForJSONSchema) {
+			return fmt.Sprintf("The ClickHouse volume in this directory holds the pre-%s schema, which release %s no longer writes. Run `origamy upgrade --version %s` here instead: it migrates the volume (event history is discarded).",
+				minImageForJSONSchema, imageTag, imageTag)
+		}
+	}
+	return ""
+}
