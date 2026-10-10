@@ -120,12 +120,16 @@ func register(baseURL, handle string, csrPEM []byte) (*Enrollment, error) {
 		CAChain     string `json:"ca_chain"`
 		TunnelAddr  string `json:"tunnel_addr"`
 		HTTPURL     string `json:"http_url"`
+		SigningKey  string `json:"config_signing_key"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		return nil, fmt.Errorf("could not parse enrollment response: %w", err)
 	}
 	if r.DataPlaneID == "" || r.AuthToken == "" || r.Certificate == "" {
 		return nil, fmt.Errorf("enrollment response is missing required fields")
+	}
+	if err := checkConfigSigningKey(r.SigningKey); err != nil {
+		return nil, err
 	}
 	return &Enrollment{
 		ID:      r.DataPlaneID,
@@ -134,5 +138,6 @@ func register(baseURL, handle string, csrPEM []byte) (*Enrollment, error) {
 		URL:     r.HTTPURL,
 		Cert:    r.Certificate,
 		CAChain: r.CAChain,
+		CSK:     r.SigningKey,
 	}, nil
 }

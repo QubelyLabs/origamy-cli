@@ -76,3 +76,48 @@ func TestDecode_V2_ServerRejectsHandle(t *testing.T) {
 		t.Fatal("expected redemption failure to be surfaced")
 	}
 }
+
+// fakeVerifyKey is an obviously fake config-signing key: base64 of 32 ASCII
+// bytes, the shape of an ed25519 public key.
+var fakeVerifyKey = base64.StdEncoding.EncodeToString([]byte("test-config-verify-key-32-bytes!"))
+
+// The config-signing verify key rides along on /enroll/resolve as "csk" when
+// the control plane signs config; older control planes leave it out.
+func TestDecode_V2_ConfigSigningKey(t *testing.T) {
+	for name, tc := range map[string]struct {
+		csk     any // nil = field absent
+		want    string
+		wantErr bool
+	}{
+		"present":   {csk: fakeVerifyKey, want: fakeVerifyKey},
+		"absent":    {csk: nil, want: ""},
+		"empty":     {csk: "", want: ""},
+		"malformed": {csk: "bm90LTMyLWJ5dGVz", wantErr: true}, // base64 of 12 bytes
+		"not b64":   {csk: "not base64!", wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				resp := map[string]any{"id": "dp-1", "tok": "dpt_secret", "addr": "a:443", "url": "https://x"}
+				if tc.csk != nil {
+					resp["csk"] = tc.csk
+				}
+				_ = json.NewEncoder(w).Encode(resp)
+			}))
+			defer srv.Close()
+
+			got, err := Decode(mkToken(map[string]any{"v": 2, "h": "h", "url": srv.URL}))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an unusable key to be rejected, got %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got.CSK != tc.want {
+				t.Fatalf("CSK = %q, want %q", got.CSK, tc.want)
+			}
+		})
+	}
+}

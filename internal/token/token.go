@@ -2,6 +2,7 @@ package token
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -29,6 +30,12 @@ type Enrollment struct {
 	// when the control plane has no CA configured (bearer-only fallback).
 	Cert    string `json:"-"`
 	CAChain string `json:"-"`
+
+	// CSK is the control plane's config-signing PUBLIC key (standard base64,
+	// 32-byte ed25519): the plane's CONFIG_SIGNING_KEY. "csk" on
+	// /enroll/resolve, config_signing_key on /byod/register. Empty when the
+	// control plane does not sign config or predates handing the key out.
+	CSK string `json:"csk"`
 }
 
 // Decode parses a dpe_ enrollment token into install parameters.
@@ -118,7 +125,23 @@ func redeem(baseURL, handle string) (*Enrollment, error) {
 	if out.ID == "" || out.Tok == "" {
 		return nil, fmt.Errorf("redemption response is missing required fields — generate a new token")
 	}
+	if err := checkConfigSigningKey(out.CSK); err != nil {
+		return nil, err
+	}
 	return &out, nil
+}
+
+// checkConfigSigningKey rejects a config-signing key the data plane could not
+// use: one that is not standard base64 of a 32-byte ed25519 public key would
+// make every config consumer reject all config. "" (no key) is fine.
+func checkConfigSigningKey(k string) error {
+	if k == "" {
+		return nil
+	}
+	if b, err := base64.StdEncoding.DecodeString(k); err != nil || len(b) != ed25519.PublicKeySize {
+		return fmt.Errorf("the control plane sent an unusable config signing key (want standard base64 of %d bytes)", ed25519.PublicKeySize)
+	}
+	return nil
 }
 
 // isLocal reports whether a plaintext base URL points at this machine — the

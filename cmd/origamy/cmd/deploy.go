@@ -82,6 +82,12 @@ own ClickHouse instead of the bundled one. Its password goes into the
 origamy-clickhouse Secret, and the chart creates the events database and
 tables on that server during install.
 
+When the control plane signs config, enrollment hands out its public verify
+key. Release ` + minSigningVersion + ` or newer verifies config with it; on an older release
+the key is only stored, and 'origamy upgrade' applies it once the release can
+verify. --require-signed-config (` + minSigningVersion + `+) makes the services refuse to
+start without the key.
+
 Re-running deploy inside an existing ./origamy-dp-<id>/ re-deploys that plane
 in place, keeping its generated passwords and data.`,
 	Example: `  origamy deploy --token dpe_xxx
@@ -94,7 +100,8 @@ in place, keeping its generated passwords and data.`,
 		enableAI, _ := cmd.Flags().GetBool("enable-ai")
 		aiSet := cmd.Flags().Changed("enable-ai")
 		datastoreAuth, _ := cmd.Flags().GetBool("datastore-auth")
-		return runDeploy(t, target, enableAI, aiSet, datastoreAuth)
+		requireSigned, _ := cmd.Flags().GetBool("require-signed-config")
+		return runDeploy(t, target, enableAI, aiSet, datastoreAuth, requireSigned)
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -110,14 +117,26 @@ func init() {
 	deployCmd.Flags().String("target", string(targetAuto), "Where to install: auto (Kubernetes if kubectl reaches a cluster, else Docker), kubernetes, or docker")
 	deployCmd.Flags().Bool("enable-ai", false, "Enable the Origamy AI (agentic) engine at install")
 	deployCmd.Flags().Bool("datastore-auth", false, "Password-protect the bundled Redis/NATS/ClickHouse (Kubernetes; passwords generated in-cluster)")
+	deployCmd.Flags().Bool("require-signed-config", false, "Make the services refuse to start without the control plane's config signing key (release "+minSigningVersion+"+)")
 	_ = deployCmd.MarkFlagRequired("token")
 }
 
-func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
+func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth, requireSigned bool) error {
 	// A successful /byod/register consumes the one-time token, so everything
 	// that can fail or needs an answer — target, tooling, architecture, the
 	// bundle, the questions — happens first. Only then is the token redeemed
 	// and the install applied.
+	//
+	// The data-plane release a fresh install gets: the chart version on
+	// Kubernetes and the image tag on Docker (they share one version).
+	dpVersion := helmVersion
+	if deployChartVersion != "" {
+		dpVersion = deployChartVersion
+	}
+	if requireSigned && !signingSupported(dpVersion) {
+		return fail(requireSigningProblem(dpVersion, true), "Pass --version "+minSigningVersion+" or newer, or drop --require-signed-config.")
+	}
+
 	want := strings.ToLower(strings.TrimSpace(target))
 	// Probe only what the target needs: a stale kubeconfig can hang
 	// `kubectl cluster-info` for its whole dial timeout, which --target docker
@@ -133,13 +152,6 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
 		return fail(err.Error(), "Pass --target kubernetes or --target docker to choose explicitly, or omit it to auto-detect.")
 	}
 
-	// The data-plane release a fresh install gets: the chart version on
-	// Kubernetes and the image tag on Docker (they share one version).
-	dpVersion := helmVersion
-	if deployChartVersion != "" {
-		dpVersion = deployChartVersion
-	}
-
 	// Read the token without spending it: a v2 handle is resolved through
 	// /v1/byod/enroll/resolve, which leaves it redeemable, and yields the plane
 	// id and control-plane URL the plan needs (which directory, which bundle).
@@ -152,6 +164,10 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
 		return fail("Your enrollment token has expired.",
 			"Generate a new one from the Connections page in your dashboard.")
 	}
+	if requireSigned && peek.CSK == "" {
+		return fail(requireSigningProblem(dpVersion, false),
+			"Your control plane did not hand one out: it does not sign config, or predates handing the key to data planes. Drop --require-signed-config.")
+	}
 
 	var kp *k8sPlan
 	var dp *dockerPlan
@@ -162,6 +178,11 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth bool) error {
 	}
 	if err != nil {
 		return err
+	}
+	if kp != nil {
+		kp.requireSigned = requireSigned
+	} else {
+		dp.requireSigned = requireSigned
 	}
 
 	// Generate a keypair + CSR locally so enrollment can request an mTLS identity
@@ -233,6 +254,8 @@ type k8sPlan struct {
 	ingressHost, ingressClass, ingressTLSSecret string
 	// clickhouse is the operator's own ClickHouse; nil means the bundled one.
 	clickhouse *externalClickHouse
+	// requireSigned turns on config-signing strict mode (already gated).
+	requireSigned bool
 }
 
 // planKubernetes runs the preflight checks and asks every question for a
@@ -375,6 +398,23 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 		sp.Success("ClickHouse password stored securely")
 	}
 
+	// Config signing: the verify key is public, but kept in its own Secret on
+	// every chart so `origamy upgrade` can wire it in once the chart verifies
+	// (older charts never read it). A control plane that hands out no key gets
+	// any earlier copy removed, so a later upgrade cannot apply a key it no
+	// longer signs with.
+	signing := tok.CSK != "" && signingSupported(p.chartVer)
+	if tok.CSK != "" {
+		sp = ui.Start("Storing the config signing key as a Kubernetes Secret")
+		if out, err := kubectlApply(secretManifest(namespace, configSigningSecret, map[string]string{"public-key": tok.CSK})); err != nil {
+			sp.Fail("Could not store the config signing key")
+			return diagnose(out)
+		}
+		sp.Success("Config signing key stored")
+	} else if out, err := runCaptured("kubectl", "delete", "secret", configSigningSecret, "-n", namespace, "--ignore-not-found"); err != nil {
+		return diagnose(out)
+	}
+
 	helmArgs := []string{
 		"upgrade", "--install", release, helmChart,
 		"--namespace", namespace,
@@ -411,6 +451,7 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 	// at install; that path lives in `origamy upgrade`).
 	aiArgs, _ := aiToggleArgs(p.aiEnabled, false)
 	helmArgs = append(helmArgs, aiArgs...)
+	helmArgs = append(helmArgs, signingSetArgs(signing, p.requireSigned)...)
 	// Charts before 0.1.18 kill config-sync under the default liveness probe
 	// before its first telemetry push (see preflight.go); give them time.
 	helmArgs = append(helmArgs, legacyChartSetArgs(p.chartVer)...)
@@ -497,6 +538,9 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 	}
 	if p.clickhouse != nil {
 		lines = append(lines, ui.Gray("ClickHouse  ")+p.clickhouse.describe())
+	}
+	if line := signingSummary(tok.CSK != "", signing, p.requireSigned); line != "" {
+		lines = append(lines, ui.Gray("Config      ")+line)
 	}
 	if eventURL != "" {
 		lines = append(lines, ui.Gray("Send events ")+ui.Bold(eventURL+"/v1/identify"))
@@ -730,11 +774,12 @@ type dockerPlan struct {
 	// when it already held this plane: the deploy then happens in place,
 	// keeping the generated passwords (the datastores hold data under them)
 	// and the operator's own .env additions.
-	dir          string
-	existingID   string
-	fullProfile  bool
-	aiEnabled    bool
-	ingestDomain string
+	dir           string
+	existingID    string
+	fullProfile   bool
+	aiEnabled     bool
+	ingestDomain  string
+	requireSigned bool
 }
 
 // planDocker runs the preflight checks, downloads the bundle and asks every
@@ -909,22 +954,24 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 		profiles = append(profiles, "ingress")
 	}
 	env := renderDockerEnv(dockerEnvParams{
-		TunnelAddr:   tok.Addr,
-		HTTPURL:      tok.URL,
-		DataPlaneID:  tok.ID,
-		AuthToken:    tok.Tok,
-		ImageTag:     p.imageTag,
-		Preset:       "starter",
-		Profiles:     profiles,
-		IngestDomain: p.ingestDomain,
-		RedisPw:      existingOrRandom(".env", "DP_REDIS_PASSWORD"),
-		NatsPw:       existingOrRandom(".env", "NATS_PASSWORD"),
-		ClickHousePw: existingOrRandom(".env", "CLICKHOUSE_PASSWORD"),
-		DBPw:         dbPw,
-		OrchKEK:      orchKEK,
-		OrchToken:    orchToken,
-		AIEnabled:    p.aiEnabled,
-		MTLS:         tok.Cert != "",
+		TunnelAddr:    tok.Addr,
+		HTTPURL:       tok.URL,
+		DataPlaneID:   tok.ID,
+		AuthToken:     tok.Tok,
+		ImageTag:      p.imageTag,
+		Preset:        "starter",
+		Profiles:      profiles,
+		IngestDomain:  p.ingestDomain,
+		RedisPw:       existingOrRandom(".env", "DP_REDIS_PASSWORD"),
+		NatsPw:        existingOrRandom(".env", "NATS_PASSWORD"),
+		ClickHousePw:  existingOrRandom(".env", "CLICKHOUSE_PASSWORD"),
+		DBPw:          dbPw,
+		OrchKEK:       orchKEK,
+		OrchToken:     orchToken,
+		AIEnabled:     p.aiEnabled,
+		MTLS:          tok.Cert != "",
+		SigningKey:    tok.CSK,
+		RequireSigned: p.requireSigned,
 	})
 	// Keep whatever else the operator put in the old .env (rate limits, CORS,
 	// an opt-in LLM key): only the keys the CLI owns are rewritten.
@@ -1002,6 +1049,9 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	}
 	if p.aiEnabled {
 		lines = append(lines, ui.Gray("AI engine   ")+ui.Green("enabled"))
+	}
+	if line := signingSummary(tok.CSK != "", signingSupported(p.imageTag), p.requireSigned); line != "" {
+		lines = append(lines, ui.Gray("Config      ")+line)
 	}
 	if p.ingestDomain != "" {
 		lines = append(lines,
