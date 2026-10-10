@@ -52,7 +52,8 @@ Kubernetes whenever kubectl reaches a cluster, Docker Desktop's included — the
 install prints the kubectl context it is about to use), `--enable-ai`,
 `--datastore-auth` (Kubernetes: password-protect the bundled
 Redis/NATS/ClickHouse), `--version` (data-plane release to install instead of
-the pin: the chart version on Kubernetes, the image tag on Docker).
+the pin: the chart version on Kubernetes, the image tag on Docker),
+`--require-signed-config` (see [Config signing](#config-signing)).
 
 ## Deploy the core first, add the rest later
 
@@ -109,6 +110,44 @@ disturb the core.
 - Docker: datastore passwords (Redis, NATS, ClickHouse, Postgres) and, with AI
   on, the orchestrator KEK + API token are generated on the host into `.env`
   (mode 0600) and reused on re-deploy. Nothing generated here is sent to Origamy.
+
+## Config signing
+
+The control plane signs the config it sends; a data plane holding the
+control plane's ed25519 **public** key rejects config whose signature does not
+verify. Enrollment hands the key out (`csk` from `/v1/byod/enroll/resolve`,
+`config_signing_key` from `/v1/byod/register`); a control plane that does not
+sign, or predates handing the key out, sends none and nothing below applies.
+
+- **Release gate.** Data-plane releases before 0.1.19 (`minSigningVersion` in
+  `cmd/origamy/cmd/signing.go`) check the signature over the wrong field and
+  reject *all* config when given the key. The CLI therefore only hands the key
+  to the services on 0.1.19 or newer (numbered releases only; the edge
+  `:staging` images never get it automatically). On an older release it is
+  only stored: Docker keeps it as `ORIGAMY_CONFIG_SIGNING_KEY` in `.env` with
+  `CONFIG_SIGNING_KEY` blank; Kubernetes keeps it in the
+  `origamy-config-signing` Secret, which older charts never read.
+- **Upgrade.** `origamy upgrade` to 0.1.19 or newer applies the stored key
+  (Docker: `CONFIG_SIGNING_KEY`; Kubernetes:
+  `controlPlane.existingSecret=origamy-config-signing`). On Docker, moving back
+  below 0.1.19 blanks `CONFIG_SIGNING_KEY` again; on Kubernetes, `upgrade`
+  refuses to move a plane that verifies to an older chart (`origamy rollback`
+  restores a whole earlier revision instead).
+- **No stored key.** There is no control-plane endpoint the plane's
+  credentials can fetch the key from, so a plane deployed without one gets it
+  by re-deploying with a fresh token, or by hand with the key from the
+  dashboard's install snippet: `CONFIG_SIGNING_KEY=` in `.env` (Docker), or
+  `origamy upgrade --set controlPlane.publicKey=<key>` (Kubernetes).
+- **Strict mode** (`CONFIG_SIGNING_REQUIRED` / `controlPlane.signingRequired`)
+  makes the services refuse to start without a key instead of running
+  unverified. The CLI never turns it on by itself: pass
+  `--require-signed-config` to `deploy` or `upgrade` once the plane runs
+  cleanly with the key. It is refused below 0.1.19 and when no key is known.
+  Turn it off again by editing `.env` (Docker) or with
+  `origamy upgrade --set controlPlane.signingRequired=false` (Kubernetes).
+
+The key is public (it can check config, never sign it), so it is safe in
+`.env` and in Helm values; only the control plane holds the private half.
 
 ## Versions
 

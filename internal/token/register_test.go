@@ -97,3 +97,38 @@ func TestEnrollLegacyV1(t *testing.T) {
 		t.Fatalf("bad v1 enrollment: %+v", enr)
 	}
 }
+
+// /byod/register hands out the verify key as config_signing_key; an older
+// control plane omits it and enrollment still succeeds without one.
+func TestEnrollRegisterConfigSigningKey(t *testing.T) {
+	for name, key := range map[string]string{"present": fakeVerifyKey, "absent": ""} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				resp := map[string]string{"data_plane_id": "dp-9", "auth_token": "dpt_bearer", "certificate": "CERTPEM"}
+				if key != "" {
+					resp["config_signing_key"] = key
+				}
+				_ = json.NewEncoder(w).Encode(resp)
+			}))
+			defer srv.Close()
+
+			_, csrPEM, _ := GenerateIdentity()
+			enr, err := Enroll(mkToken(map[string]any{"v": 2, "h": "h", "url": srv.URL}), csrPEM)
+			if err != nil {
+				t.Fatalf("enroll: %v", err)
+			}
+			if enr.CSK != key {
+				t.Fatalf("CSK = %q, want %q", enr.CSK, key)
+			}
+		})
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"data_plane_id": "dp-9", "auth_token": "dpt_bearer", "certificate": "CERTPEM", "config_signing_key": "c2hvcnQ="})
+	}))
+	defer srv.Close()
+	_, csrPEM, _ := GenerateIdentity()
+	if _, err := Enroll(mkToken(map[string]any{"v": 2, "h": "h", "url": srv.URL}), csrPEM); err == nil {
+		t.Fatal("expected a malformed config_signing_key to be rejected")
+	}
+}

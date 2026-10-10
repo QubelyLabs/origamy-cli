@@ -532,6 +532,11 @@ type dockerEnvParams struct {
 	OrchKEK, OrchToken                          string
 	AIEnabled                                   bool
 	MTLS                                        bool
+	// SigningKey is the control plane's config-signing public key ("" when it
+	// hands none out); RequireSigned turns on strict mode (validated by the
+	// caller against ImageTag).
+	SigningKey    string
+	RequireSigned bool
 }
 
 // renderDockerEnv writes the .env the served compose bundle expects. The
@@ -577,6 +582,15 @@ func renderDockerEnv(p dockerEnvParams) string {
 		b.WriteString("# mTLS client identity for the tunnel (written to ./certs; the agent renews it in place).\n")
 		w("TUNNEL_TLS_CERT", "/certs/tls.crt")
 		w("TUNNEL_TLS_KEY", "/certs/tls.key")
+	}
+	// Always written, even blank, so a re-deploy owns them: a control plane
+	// that stopped handing out a key must not leave a stale one behind.
+	b.WriteString("# Config signing: the control plane's PUBLIC key. Services verify config with CONFIG_SIGNING_KEY, set only on\n# release " + minSigningVersion + "+ (older ones reject all config given it); " + signingKeyCopyVar + " is the CLI's copy,\n# which `origamy upgrade` applies once the release can verify.\n")
+	sig := dockerSigningEnv(p.SigningKey, p.ImageTag)
+	w(signingKeyCopyVar, sig[signingKeyCopyVar])
+	w("CONFIG_SIGNING_KEY", sig["CONFIG_SIGNING_KEY"])
+	if p.RequireSigned {
+		w("CONFIG_SIGNING_REQUIRED", "true")
 	}
 	return b.String()
 }

@@ -41,14 +41,23 @@ plane's storage reset: ClickHouse moves to 25.3 and the events table is
 recreated with native JSON columns, which discards the event history
 collected so far (profiles, traits, segments and journeys are kept). The
 upgrade explains this and asks for confirmation; pass --yes to skip the
-prompt.`,
+prompt.
+
+Config signing: a key stored at deploy (Docker: ` + signingKeyCopyVar + ` in .env;
+Kubernetes: the ` + configSigningSecret + ` Secret) is applied once the target release is
+` + minSigningVersion + ` or newer, and dropped again on Docker when moving below it. A plane
+deployed without a key has none to apply: re-deploy with a fresh token, or set
+it by hand (Docker: CONFIG_SIGNING_KEY in .env; Kubernetes:
+--set controlPlane.publicKey=<key>). --require-signed-config turns on strict
+mode, where the services refuse to start without the key.`,
 	Example: `  origamy upgrade                 # Kubernetes: latest published chart; Docker: this CLI's release
   origamy upgrade --version 0.1.17
   origamy upgrade --channel edge  # track the moving :staging images; not for production
   origamy upgrade --enable-ai     # switch the AI engine on
   origamy upgrade --disable-ai    # switch the AI engine off
   origamy upgrade --enable-predictor   # switch the predictor (scoring) service on
-  origamy upgrade --disable-predictor  # switch the predictor off`,
+  origamy upgrade --disable-predictor  # switch the predictor off
+  origamy upgrade --require-signed-config  # refuse to run on unverified config`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		version, _ := cmd.Flags().GetString("version")
 		channel, _ := cmd.Flags().GetString("channel")
@@ -58,7 +67,8 @@ prompt.`,
 		enablePredictor, _ := cmd.Flags().GetBool("enable-predictor")
 		disablePredictor, _ := cmd.Flags().GetBool("disable-predictor")
 		yes, _ := cmd.Flags().GetBool("yes")
-		return runUpgrade(version, channel, sets, enableAI, disableAI, enablePredictor, disablePredictor, yes)
+		requireSigned, _ := cmd.Flags().GetBool("require-signed-config")
+		return runUpgrade(version, channel, sets, enableAI, disableAI, enablePredictor, disablePredictor, requireSigned, yes)
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -73,9 +83,10 @@ func init() {
 	upgradeCmd.Flags().Bool("disable-ai", false, "Switch the Origamy AI (agentic) engine off for the existing install")
 	upgradeCmd.Flags().Bool("enable-predictor", false, "Switch the predictor (conversion scoring) service on for the existing release (Kubernetes only)")
 	upgradeCmd.Flags().Bool("disable-predictor", false, "Switch the predictor (conversion scoring) service off for the existing release (Kubernetes only)")
+	upgradeCmd.Flags().Bool("require-signed-config", false, "Make the services refuse to start without the control plane's config signing key (release "+minSigningVersion+"+)")
 }
 
-func runUpgrade(version, channel string, sets []string, enableAI, disableAI, enablePredictor, disablePredictor, assumeYes bool) error {
+func runUpgrade(version, channel string, sets []string, enableAI, disableAI, enablePredictor, disablePredictor, requireSigned, assumeYes bool) error {
 	// Validate the toggles up front (before any registry/cluster calls) so a
 	// conflicting request fails fast with a clear message.
 	if _, err := aiToggleArgs(enableAI, disableAI); err != nil {
@@ -87,7 +98,7 @@ func runUpgrade(version, channel string, sets []string, enableAI, disableAI, ena
 	ui.Title("Origamy data plane — upgrade")
 	switch {
 	case hasKubernetes() && releaseInstalled():
-		return upgradeKubernetes(version, channel, sets, enableAI, disableAI, enablePredictor, disablePredictor, assumeYes)
+		return upgradeKubernetes(version, channel, sets, enableAI, disableAI, enablePredictor, disablePredictor, requireSigned, assumeYes)
 	case hasDocker():
 		if len(sets) > 0 {
 			return fail("--set applies to Kubernetes installs only.",
@@ -97,25 +108,26 @@ func runUpgrade(version, channel string, sets []string, enableAI, disableAI, ena
 			return fail("--enable-predictor/--disable-predictor apply to Kubernetes installs only.",
 				"The predictor runs on Kubernetes data planes; the Docker compose bundle doesn't include it.")
 		}
-		return upgradeDocker(version, channel, enableAI, disableAI, assumeYes)
+		return upgradeDocker(version, channel, enableAI, disableAI, requireSigned, assumeYes)
 	default:
 		return fail("No existing Origamy data plane found on this machine.",
 			"Run `origamy deploy --token …` first, or point kubectl/Docker at the host where it's installed.")
 	}
 }
 
-func upgradeKubernetes(version, channel string, sets []string, enableAI, disableAI, enablePredictor, disablePredictor, assumeYes bool) error {
+func upgradeKubernetes(version, channel string, sets []string, enableAI, disableAI, enablePredictor, disablePredictor, requireSigned, assumeYes bool) error {
 	if _, err := exec.LookPath("helm"); err != nil {
 		return fail("Helm is required for Kubernetes upgrades.",
 			"Install it from https://helm.sh/docs/intro/install/ and retry.")
 	}
 
 	// A toggle means the run's purpose includes flipping a feature boolean
-	// (orchestratorEngine.enabled / predictor.enabled), which forces the
+	// (orchestratorEngine.enabled / predictor.enabled / strict signing) or
+	// setting a value (--set, e.g. controlPlane.publicKey), which forces the
 	// upgrade to proceed even when already on the target version.
 	aiToggle := enableAI || disableAI
 	predictorToggle := enablePredictor || disablePredictor
-	toggle := aiToggle || predictorToggle
+	toggle := aiToggle || predictorToggle || requireSigned || len(sets) > 0
 
 	installedVer := ""
 	if cur, err := installedRelease(); err == nil {
@@ -146,13 +158,30 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	// A release on an external ClickHouse needs a chart that can still reach
 	// it: an older one renders a password-less DSN, never creates the schema
 	// on that server and blocks egress to it.
-	external := false
+	external, signing := false, false
 	if vals, err := releaseValues(); err == nil {
 		external = usesExternalClickHouse(vals)
+		signing = signingConfigured(vals)
 	}
 	if external && versionLess(target, minChartExternalClickHouse) {
 		return fail(fmt.Sprintf("This data plane uses an external ClickHouse, which needs chart %s or newer (targeting %s).", minChartExternalClickHouse, target),
 			"Pass --version "+minChartExternalClickHouse+" or newer.")
+	}
+	// Likewise a release that verifies signed config: an older chart given the
+	// key rejects all config.
+	if signing && !signingSupported(target) {
+		return fail(fmt.Sprintf("This data plane verifies signed config, which needs chart %s or newer (targeting %s).", minSigningVersion, target),
+			"Pass --version "+minSigningVersion+" or newer, or return to an earlier revision with `origamy rollback`.")
+	}
+	// A key stored at deploy on a chart that could not verify yet is wired in
+	// now that the target can. There is no control-plane endpoint to fetch a
+	// missing key from with the plane's credentials, so without one the
+	// operator re-deploys with a fresh token or sets it by hand.
+	stored := !signing && signingSupported(target) && runQuiet("kubectl", "get", "secret", configSigningSecret, "-n", namespace) == nil
+	if requireSigned {
+		if why := requireSigningProblem(target, signing || stored); why != "" {
+			return fail(why, "Upgrade to "+minSigningVersion+" or newer with the key set first: re-deploy with a fresh token, or pass --set controlPlane.publicKey=<key from your dashboard's Kubernetes install snippet>.")
+		}
 	}
 
 	// A feature toggle must run even at the same version (that's how "buy AI
@@ -229,6 +258,7 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	if predArgs, _ := predictorToggleArgs(enablePredictor, disablePredictor); len(predArgs) > 0 {
 		args = append(args, predArgs...)
 	}
+	args = append(args, signingSetArgs(stored, requireSigned)...)
 
 	// Operator-supplied values LAST so they win over the pins above (e.g. a key
 	// a new chart version introduced, which --reuse-values can't know about, or
@@ -302,12 +332,19 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	} else if disableAI {
 		boxLines = append(boxLines, ui.Gray("AI engine  ")+"disabled")
 	}
+	if line := signingSummary(signing || stored, signingSupported(target), requireSigned); line != "" {
+		boxLines = append(boxLines, ui.Gray("Config     ")+line)
+	}
 	if reset {
 		boxLines = append(boxLines, "", ui.Yellow("Event history was discarded (storage reset); profiles, traits, segments and journeys were kept."))
 	} else {
 		boxLines = append(boxLines, "", ui.Green("Your data (ClickHouse/Postgres/NATS/Redis) was not touched."))
 	}
 	boxLines = append(boxLines, ui.Gray("Roll back with: ")+"origamy rollback")
+	if !signing && !stored && signingSupported(target) {
+		boxLines = append(boxLines, "", ui.Gray("Config signing is not set up (no verify key stored). If your control plane signs config:"),
+			"  origamy upgrade --set controlPlane.publicKey=<key from your dashboard's Kubernetes install snippet>")
+	}
 	ui.Box("Upgraded", boxLines)
 	return nil
 }
@@ -370,7 +407,7 @@ func reinitKubernetesClickHouse() error {
 // is missing entirely for the AI engine and predictor images.
 const dockerEdgeTag = "staging"
 
-func upgradeDocker(version, channel string, enableAI, disableAI, assumeYes bool) error {
+func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, assumeYes bool) error {
 	dir, err := composeProjectDir()
 	if err != nil {
 		return fail("No Origamy compose project found here.",
@@ -411,6 +448,20 @@ func upgradeDocker(version, channel string, enableAI, disableAI, assumeYes bool)
 			if why := bundleSchemaMismatch(string(initSQL), tag); why != "" {
 				return fail(why, "Pass --version <release> that matches your control plane's schema, or --channel edge to stay on the moving images.")
 			}
+		}
+	}
+
+	// Config signing: the CLI's copy of the verify key, or a CONFIG_SIGNING_KEY
+	// set by hand or by the dashboard's snippet. Applied, or dropped again,
+	// below together with the tag. There is no control-plane endpoint to fetch
+	// a missing key from with the plane's credentials.
+	signingKey := readEnvVar(envPath, signingKeyCopyVar)
+	if signingKey == "" {
+		signingKey = readEnvVar(envPath, "CONFIG_SIGNING_KEY")
+	}
+	if requireSigned {
+		if why := requireSigningProblem(tag, signingKey != ""); why != "" {
+			return fail(why, "Pass --version "+minSigningVersion+" or newer, and set the key first: re-deploy with a fresh token, or put the key from your dashboard's Docker install snippet in CONFIG_SIGNING_KEY in "+envPath+".")
 		}
 	}
 
@@ -460,6 +511,20 @@ func upgradeDocker(version, channel string, enableAI, disableAI, assumeYes bool)
 	sp.Success("Images pulled")
 	if err := setEnvVar(envPath, "DP_IMAGE_TAG", tag); err != nil {
 		return fail("Could not update .env.", err.Error())
+	}
+	// The key follows the tag: only a release that verifies gets
+	// CONFIG_SIGNING_KEY, so a move below minSigningVersion blanks it.
+	signingVars := map[string]string{}
+	if signingKey != "" {
+		signingVars = dockerSigningEnv(signingKey, tag)
+	}
+	if requireSigned {
+		signingVars["CONFIG_SIGNING_REQUIRED"] = "true"
+	}
+	for k, v := range signingVars {
+		if err := setEnvVar(envPath, k, v); err != nil {
+			return fail("Could not update .env.", err.Error())
+		}
 	}
 
 	// Storage reset on Docker: fetch the control plane's current schema (the
@@ -511,10 +576,17 @@ func upgradeDocker(version, channel string, enableAI, disableAI, assumeYes bool)
 	} else if disableAI {
 		boxLines = append(boxLines, ui.Gray("AI engine  ")+"disabled")
 	}
+	if line := signingSummary(signingKey != "", signingSupported(tag), requireSigned); line != "" {
+		boxLines = append(boxLines, ui.Gray("Config     ")+line)
+	}
 	if reset {
 		boxLines = append(boxLines, "", ui.Yellow("Event history was discarded (storage reset); profiles, traits, segments and journeys were kept."))
 	} else {
 		boxLines = append(boxLines, "", ui.Green("Named volumes (your data) were not touched."))
+	}
+	if signingKey == "" && signingSupported(tag) {
+		boxLines = append(boxLines, "", ui.Gray("Config signing is not set up (no verify key stored). If your control plane signs config,"),
+			ui.Gray("set CONFIG_SIGNING_KEY in .env to the key from your dashboard's Docker install snippet and rerun `origamy upgrade`."))
 	}
 	ui.Box("Upgraded", boxLines)
 	return nil
