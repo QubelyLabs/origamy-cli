@@ -51,7 +51,7 @@ it by hand (Docker: CONFIG_SIGNING_KEY in .env; Kubernetes:
 --set controlPlane.publicKey=<key>). --require-signed-config turns on strict
 mode, where the services refuse to start without the key.`,
 	Example: `  origamy upgrade                 # Kubernetes: latest published chart; Docker: this CLI's release
-  origamy upgrade --version 0.1.17
+  origamy upgrade --version 0.1.19
   origamy upgrade --channel edge  # track the moving :staging images; not for production
   origamy upgrade --enable-ai     # switch the AI engine on
   origamy upgrade --disable-ai    # switch the AI engine off
