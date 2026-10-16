@@ -22,13 +22,15 @@ const (
 	helmChart = "oci://ghcr.io/qubelylabs/charts/origamy-data-plane"
 	// helmVersion is the data-plane release a fresh install gets: the Helm
 	// chart version on Kubernetes AND the image tag (DP_IMAGE_TAG) on Docker —
-	// chart and images share one version per release. 0.1.19 is the first
-	// release carrying every feature this CLI can toggle (mTLS identity 0.1.15,
-	// orchestrator engine 0.1.16, predictor 0.1.17, external ClickHouse and
-	// config signing 0.1.19) plus 0.1.18's config-sync liveness fix and the
-	// post-storage-reset ClickHouse schema. `origamy upgrade` resolves the
-	// latest published chart at run time, so this pin only governs a fresh install.
-	helmVersion = "0.1.19"
+	// chart and images share one version per release. 0.1.20 carries every
+	// feature this CLI can toggle (mTLS identity 0.1.15, orchestrator engine
+	// 0.1.16, predictor 0.1.17, external ClickHouse and config signing 0.1.19),
+	// plus 0.1.20's at-most-once sends with a 45 s shutdown drain for the
+	// workflow and orchestrator engines and the events.page_name column (the
+	// bulker adds it to an existing table on start). On Kubernetes `origamy
+	// upgrade` resolves the latest published chart at run time, so there this
+	// pin only governs a fresh install; on Docker it is also upgrade's default.
+	helmVersion = "0.1.20"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
