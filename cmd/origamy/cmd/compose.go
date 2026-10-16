@@ -184,31 +184,152 @@ func waitForCompose(dir, envPath string, sp *ui.Spinner) (healthy bool, failed [
 	}
 }
 
-// liveSchemaGeneration asks the running ClickHouse of a compose project which
-// generation its events table is ("json", "string"), "" when the container is
-// not running or the table does not exist yet. The served init SQL says what
-// the control plane would create; this says what the volume already holds.
-func liveSchemaGeneration(dir, envPath string) string {
-	out, err := dockerRun(nil, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "exec", "-T", "clickhouse", "sh", "-c", clickhouseEventsPropertiesType)
+// What probeLiveSchema can find besides the two generations ("json",
+// "string"): ClickHouse answered and has no events table (liveMissing), or a
+// payload column of a type neither generation writes (liveOther).
+const (
+	liveMissing = "missing"
+	liveOther   = "other"
+)
+
+// liveSchema is what the running ClickHouse of a compose project holds.
+type liveSchema struct {
+	// gen is "json", "string", liveMissing or liveOther; "" when ClickHouse
+	// could not be asked (not running, no answer within clickhouseProbeTimeout).
+	gen string
+	// typ is the payload column's type as ClickHouse reported it; out, what
+	// a failed ask printed.
+	typ, out string
+}
+
+// known reports whether ClickHouse said which events table it holds.
+func (l liveSchema) known() bool { return l.gen == "json" || l.gen == "string" }
+
+// clickhouseProbeTimeout bounds every query the CLI sends into the ClickHouse
+// container (the events-table probe, the readiness ping): a hung container
+// must not stall the upgrade. A probe that runs out is "could not be asked".
+// A variable so tests need not wait.
+var clickhouseProbeTimeout = 20 * time.Second
+
+// probeLiveSchema asks the running ClickHouse of a compose project what its
+// events table is. The served init SQL says what the control plane would
+// create; this says what the volume already holds. env is extra environment
+// for compose (DP_IMAGE_TAG during the reset).
+func probeLiveSchema(dir, envPath string, env []string) liveSchema {
+	out, err := dockerRunTimeout(clickhouseProbeTimeout, env, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "exec", "-T", "clickhouse", "sh", "-c", clickhouseEventsPropertiesType)
 	if err != nil {
-		return ""
+		return liveSchema{out: out}
 	}
 	// The output is combined: compose's warnings about variables an older
-	// .env lacks come before the answer.
+	// .env lacks come before the answer, which is the column's type and
+	// eventsColumnMark (a bare type is taken too when it is one of ours).
 	for _, l := range strings.Split(out, "\n") {
-		switch t := strings.TrimSpace(l); {
-		case strings.HasPrefix(t, "JSON"):
-			return "json"
-		case strings.HasPrefix(t, "String"):
-			return "string"
+		typ, mark, row := strings.Cut(strings.TrimSpace(l), "\t")
+		if row && mark != eventsColumnMark {
+			continue
 		}
+		switch {
+		case strings.HasPrefix(typ, "JSON"):
+			return liveSchema{gen: "json", typ: typ}
+		case strings.HasPrefix(typ, "String"):
+			return liveSchema{gen: "string", typ: typ}
+		case row:
+			return liveSchema{gen: liveOther, typ: typ}
+		}
+	}
+	return liveSchema{gen: liveMissing}
+}
+
+// liveSchemaGeneration is probeLiveSchema's generation, "" unless ClickHouse
+// holds one of the two (not running, no events table, another type).
+func liveSchemaGeneration(dir, envPath string) string {
+	if l := probeLiveSchema(dir, envPath, nil); l.known() {
+		return l.gen
 	}
 	return ""
 }
 
+// eventsColumnMark follows the type on the probe's answer, so a type of
+// neither generation is told from compose's own output.
+const eventsColumnMark = "events.events.properties"
+
 // clickhouseEventsPropertiesType prints the type of the events table's
-// payload column, nothing when the table does not exist.
-const clickhouseEventsPropertiesType = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT type FROM system.columns WHERE database = 'events' AND table = 'events' AND name = 'properties'"`
+// payload column and eventsColumnMark, tab-separated; nothing when the table
+// does not exist.
+const clickhouseEventsPropertiesType = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT type, '` + eventsColumnMark + `' FROM system.columns WHERE database = 'events' AND table = 'events' AND name = 'properties'"`
+
+// composeConfig is what the CLI reads of `docker compose config --format
+// json`: the project's effective configuration.
+type composeConfig struct {
+	Name     string `json:"name"`
+	Services map[string]struct {
+		Image   string `json:"image"`
+		Volumes []struct {
+			Type   string `json:"type"`
+			Source string `json:"source"`
+		} `json:"volumes"`
+	} `json:"services"`
+	Volumes map[string]struct {
+		Name string `json:"name"`
+	} `json:"volumes"`
+}
+
+// effectiveCompose renders the configuration `docker compose up` would run in
+// dir with DP_IMAGE_TAG=tag: the files in fileArgs (composeFileArgs, so
+// override files and COMPOSE_FILE count), interpolated with envPath.
+func effectiveCompose(dir, envPath, tag string, fileArgs []string) (composeConfig, error) {
+	args := append(append([]string{"compose", "--project-directory", dir}, fileArgs...), "--env-file", envPath, "config", "--format", "json")
+	out, err := dockerRun([]string{"DP_IMAGE_TAG=" + tag}, "docker", args...)
+	if err != nil {
+		return composeConfig{}, fmt.Errorf("docker compose config failed: %s", strings.ReplaceAll(lastLines(out, 3), "\n", " "))
+	}
+	// compose's warnings come first on the same output; the JSON starts on a
+	// line of its own.
+	start, off := -1, 0
+	for _, l := range strings.SplitAfter(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "{") {
+			start = off
+			break
+		}
+		off += len(l)
+	}
+	var cfg composeConfig
+	if start < 0 {
+		return cfg, errors.New("docker compose config printed no configuration")
+	}
+	if err := json.NewDecoder(strings.NewReader(out[start:])).Decode(&cfg); err != nil {
+		return composeConfig{}, fmt.Errorf("could not read docker compose config: %w", err)
+	}
+	return cfg, nil
+}
+
+// serviceVolumes names the Docker volumes service keeps its data in, as the
+// configuration resolves them.
+func (c composeConfig) serviceVolumes(service string) []string {
+	var out []string
+	for _, v := range c.Services[service].Volumes {
+		if v.Type != "volume" || v.Source == "" {
+			continue
+		}
+		name := c.Volumes[v.Source].Name
+		if name == "" {
+			name = c.Name + "_" + v.Source
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// existingVolumes keeps the volumes Docker has.
+func existingVolumes(names []string) []string {
+	var out []string
+	for _, n := range names {
+		if _, err := dockerRun(nil, "docker", "volume", "inspect", n); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
 
 // composeLogs returns the last n log lines of one service.
 func composeLogs(dir, envPath, service string, n int) string {

@@ -156,7 +156,7 @@ func uninstallDocker(id string, assumeYes bool) error {
 	sp := ui.Start("Stopping and removing containers + volumes")
 	if out, err := runCaptured("docker", "compose", "-f", compose, "down", "-v", "--remove-orphans"); err != nil {
 		sp.Fail("docker compose down failed")
-		return diagnose(out)
+		return diagnoseDocker(out, "rerun `origamy uninstall "+id+"`")
 	}
 	sp.Success("Containers and volumes removed")
 

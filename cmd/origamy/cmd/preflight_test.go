@@ -241,6 +241,19 @@ func TestDockerSchemaResetNeeded(t *testing.T) {
 		{"tag and file moved, table did not", "0.1.20", "json", "string", "0.1.20", true},
 		{"already across", "0.1.19", "json", "json", "0.1.20", false},
 		{"already across, ClickHouse not running", "0.1.19", "json", "", "0.1.20", false},
+		// The new table is never dropped, whatever the schema file and the
+		// tags say: an operator can have put the pre-reset file back.
+		{"String file, ClickHouse holds JSON, same release", "0.1.20", "string", "json", "0.1.20", false},
+		{"String file, ClickHouse holds JSON, 0.1.19", "0.1.19", "string", "json", "0.1.20", false},
+		{"String file, ClickHouse holds JSON, main", "main", "string", "json", "0.1.20", false},
+		{"before the reset by tag, ClickHouse holds JSON", "0.1.16", "string", "json", "0.1.20", false},
+		{"edge, ClickHouse holds JSON", "0.1.16", "string", "json", dockerEdgeTag, false},
+		// The old table resets whatever the file says.
+		{"JSON file, ClickHouse holds String", "0.1.19", "json", "string", "0.1.20", true},
+		// Only a ClickHouse that cannot say lets the file and tags decide.
+		{"no events table, String file", "0.1.20", "string", liveMissing, "0.1.20", true},
+		{"no events table, JSON file", "0.1.20", "json", liveMissing, "0.1.20", false},
+		{"another type, String file", "0.1.20", "string", liveOther, "0.1.20", true},
 		{"edge from a pre-reset project", "0.1.16", "string", "", dockerEdgeTag, true},
 		{"edge on the JSON schema", dockerEdgeTag, "json", "", dockerEdgeTag, false},
 		// A target that does not write JSON never resets.
@@ -253,28 +266,37 @@ func TestDockerSchemaResetNeeded(t *testing.T) {
 	}
 }
 
-func TestComposeClickHouseProblem(t *testing.T) {
-	svc := func(img string) string {
-		return "  clickhouse:\n    image: " + img + "\n  clickhouse-init:\n    image: " + img + "\n"
-	}
+func TestClickHouseImageProblem(t *testing.T) {
 	for _, c := range []struct {
-		name, compose string
-		want          string // substring; "" = fine
+		image string
+		want  string // substring; "" = fine
 	}{
-		{"0.1.20 bundle", "services:\n" + svc("clickhouse/clickhouse-server:25.3"), ""},
-		{"newer", "services:\n" + svc("clickhouse/clickhouse-server:26.1.2"), ""},
-		{"quoted, registry prefix", "services:\n" + svc(`"docker.io/clickhouse/clickhouse-server:25.8-alpine"`), ""},
-		{"pre-reset bundle", "services:\n" + svc("clickhouse/clickhouse-server:24.8"), "clickhouse-server:24.8"},
-		{"25.x before JSON was GA", "services:\n" + svc("clickhouse/clickhouse-server:25.2"), "clickhouse-server:25.2"},
-		{"one service left behind", "services:\n" + svc("clickhouse/clickhouse-server:25.3") + "  extra:\n    image: clickhouse/clickhouse-server:24.3\n", "24.3"},
-		{"no version", "services:\n" + svc("clickhouse/clickhouse-server:latest"), "no clickhouse-server image"},
-		{"no ClickHouse", "services:\n  x:\n    image: busybox\n", "no clickhouse-server image"},
-		// A comment naming an image is not an image line.
-		{"comment", "# was clickhouse/clickhouse-server:24.8\nservices:\n" + svc("clickhouse/clickhouse-server:25.3"), ""},
+		{"clickhouse/clickhouse-server:25.3", ""},
+		{"clickhouse/clickhouse-server:26.1.2", ""},
+		{"clickhouse/clickhouse-server:25.3.2.39", ""},
+		{"clickhouse/clickhouse-server:25.8-alpine", ""},
+		{"docker.io/clickhouse/clickhouse-server:25.8-alpine", ""},
+		{"registry.example.com:5000/mirror/clickhouse/clickhouse-server:25.3", ""},
+		{"clickhouse/clickhouse-server:25.3@sha256:0000000000000000000000000000000000000000000000000000000000000000", ""},
+		{`"clickhouse/clickhouse-server:25.3"`, ""},
+		{"clickhouse/clickhouse-server:24.8", "it runs clickhouse/clickhouse-server:24.8"},
+		{"clickhouse/clickhouse-server:25.2", "it runs clickhouse/clickhouse-server:25.2"},
+		{"clickhouse/clickhouse-server:24.8@sha256:0000000000000000000000000000000000000000000000000000000000000000", "it runs clickhouse/clickhouse-server:24.8@"},
+		{"registry.example.com:5000/clickhouse/clickhouse-server:24.8", "it runs registry.example.com:5000/"},
+		// A version the tag does not tell is refused, not allowed.
+		{"clickhouse/clickhouse-server:latest", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-server", "whose ClickHouse version the tag does not tell"},
+		{"registry.example.com:5000/clickhouse/clickhouse-server", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-server@sha256:0000000000000000000000000000000000000000000000000000000000000000", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-server:head", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-server:25", "whose ClickHouse version the tag does not tell"},
+		{"mirror/ch:25.3", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-keeper:25.3", "whose ClickHouse version the tag does not tell"},
+		{"", "it has no clickhouse service"},
 	} {
-		got := composeClickHouseProblem([]byte(c.compose))
+		got := clickHouseImageProblem(c.image)
 		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
-			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+			t.Errorf("%q: got %q, want %q", c.image, got, c.want)
 		}
 	}
 }

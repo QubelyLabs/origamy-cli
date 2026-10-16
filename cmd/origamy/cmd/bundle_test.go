@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeControlPlane serves files at /byod/<name> and answers anything else
@@ -29,13 +30,24 @@ func fakeControlPlane(t *testing.T, files map[string]string) string {
 	return srv.URL
 }
 
-// fakeDocker stands in for dockerRun: it records every call and fails those
+// stubDocker stands fn in for both Docker runners (dockerRun, and
+// dockerRunTimeout, whose time limit fn does not see) for one test.
+func stubDocker(t *testing.T, fn func(env []string, name string, args ...string) (string, error)) {
+	t.Helper()
+	prevRun, prevTimeout := dockerRun, dockerRunTimeout
+	dockerRun = fn
+	dockerRunTimeout = func(_ time.Duration, env []string, name string, args ...string) (string, error) {
+		return fn(env, name, args...)
+	}
+	t.Cleanup(func() { dockerRun, dockerRunTimeout = prevRun, prevTimeout })
+}
+
+// fakeDocker stands in for Docker: it records every call and fails those
 // whose arguments contain a word in failOn.
 func fakeDocker(t *testing.T, failOn ...string) *[]string {
 	t.Helper()
 	var calls []string
-	prev := dockerRun
-	dockerRun = func(env []string, name string, args ...string) (string, error) {
+	stubDocker(t, func(env []string, name string, args ...string) (string, error) {
 		call := strings.Join(append(append(env, name), args...), " ")
 		calls = append(calls, call)
 		for _, w := range failOn {
@@ -44,8 +56,7 @@ func fakeDocker(t *testing.T, failOn ...string) *[]string {
 			}
 		}
 		return "", nil
-	}
-	t.Cleanup(func() { dockerRun = prev })
+	})
 	return &calls
 }
 
@@ -236,7 +247,7 @@ func TestPlanBundleRefreshV018Env(t *testing.T) {
 		t.Fatalf("no refresh: %q", skipped)
 	}
 	defer r.cleanup()
-	if bak := backupRelease([]byte(oldCompose), r.prev, r.installedTag); !slices.Equal(r.changed(), []string{"docker-compose.yml", "clickhouse-users.xml"}) || bak != "main" {
+	if bak := backupRelease("docker-compose.yml", []byte(oldCompose), r.prev, r.installedTag); !slices.Equal(r.changed(), []string{"docker-compose.yml", "clickhouse-users.xml"}) || bak != "main" {
 		t.Fatalf("changed %v, backups .bak-%s", r.changed(), bak)
 	}
 }
@@ -498,7 +509,7 @@ func TestBundleRefreshApplyCommit(t *testing.T) {
 	if ow := r3.overwritten(); len(ow) != 1 || ow[0].name != "Caddyfile" || filepath.Base(ow[0].backup) != "Caddyfile.bak-0.1.20" {
 		t.Fatalf("overwritten = %+v", ow)
 	}
-	if box := strings.Join(bundleBoxLines(r3, ""), "\n"); !strings.Contains(box, "replaced your edited Caddyfile") || !strings.Contains(box, "Caddyfile.bak-0.1.20") {
+	if box := strings.Join(bundleBoxLines(r3, "", nil), "\n"); !strings.Contains(box, "replaced your edited Caddyfile") || !strings.Contains(box, "Caddyfile.bak-0.1.20") {
 		t.Fatalf("box = %q", box)
 	}
 	if err := r3.commit(); err != nil {
@@ -600,13 +611,59 @@ func TestBackupRelease(t *testing.T) {
 		{"edited, manifest", edited, m("0.1.19"), "0.1.20", "0.1.19"},
 		{"edited, no manifest", edited, m(""), "0.1.18", "0.1.18"},
 		{"edited, nothing", edited, m(""), "", ""},
+		// An edit a refresh kept: the release the file itself came with, not
+		// the bundle's newer one. Recorded per file by this CLI…
+		{"edited, the file's own release", edited, bundleManifest{Version: "0.1.20", Releases: map[string]string{"docker-compose.yml": "0.1.17"}}, "0.1.20", "0.1.17"},
+		// …and for a manifest from an earlier CLI, the release of the version
+		// it recorded for the file, which the edit was made from.
+		{"edited, the release of the version recorded for it", edited, bundleManifest{Version: "0.1.20", Files: map[string]string{"docker-compose.yml": sha256Hex(served017)}}, "0.1.20", "0.1.17"},
+		{"edited, recorded version of several releases", edited, bundleManifest{Version: "0.1.20", Files: map[string]string{"docker-compose.yml": sha256Hex(served019)}}, "0.1.20", "0.1.19"},
+		{"edited, recorded version unknown", edited, bundleManifest{Version: "0.1.20", Files: map[string]string{"docker-compose.yml": sha256Hex(edited)}}, "0.1.19", "0.1.20"},
+		// Another file's record says nothing about this one.
+		{"edited, only another file's release", edited, bundleManifest{Version: "0.1.20", Releases: map[string]string{"Caddyfile": "0.1.17"}}, "0.1.20", "0.1.20"},
+		// Known bytes still go by the table.
+		{"known version, the file's release says otherwise", served017, bundleManifest{Version: "0.1.20", Releases: map[string]string{"docker-compose.yml": "0.1.19"}}, "0.1.20", "0.1.17"},
 	} {
-		if got := backupRelease(tc.data, tc.m, tc.installed); got != tc.want {
+		if got := backupRelease("docker-compose.yml", tc.data, tc.m, tc.installed); got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}
-	if got := backupTag(backupRelease(edited, m(""), "")); got != "previous" {
+	if got := backupTag(backupRelease("docker-compose.yml", edited, m(""), "")); got != "previous" {
 		t.Errorf("no release at all: backupTag = %q", got)
+	}
+}
+
+func TestKeptEditBackedUpUnderItsOwnRelease(t *testing.T) {
+	// Deployed with the 0.1.17 bundle; the Caddyfile edited here and kept
+	// through a refresh to 0.1.20, which moved the manifest's version on.
+	p := newBundleProject(t, "0.1.20")
+	fakeDocker(t)
+	withKnownReleases(t, map[string][]string{})
+	writeFile(t, filepath.Join(p.dir, "clickhouse-users.xml"), p.served["clickhouse-users.xml"])
+	writeFile(t, filepath.Join(p.dir, "Caddyfile"), p.served["Caddyfile"]+"# 0.1.17's\n")
+	if err := recordDeployedBundle(p.dir, "0.1.17"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(p.dir, "Caddyfile"), "my.domain {\n}\n")
+	if _, kept := refreshOnce(t, p, "0.1.17", bundleAuto); !slices.Equal(kept, []string{"Caddyfile"}) {
+		t.Fatalf("kept %v", kept)
+	}
+	m := readBundleManifest(p.dir)
+	if m.Version != "0.1.20" || m.Releases["Caddyfile"] != "0.1.17" || m.Releases["docker-compose.yml"] != "0.1.20" {
+		t.Fatalf("manifest after the refresh: %+v", m)
+	}
+	// --replace-bundle later backs the edit up under 0.1.17, the release it
+	// was made from, not 0.1.20.
+	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", bundleReplace, false)
+	if r == nil {
+		t.Fatal("no refresh planned")
+	}
+	defer r.cleanup()
+	if err := r.apply(); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := r.file("Caddyfile"); filepath.Base(f.backup) != "Caddyfile.bak-0.1.17" {
+		t.Fatalf("backup %q", f.backup)
 	}
 }
 
@@ -874,14 +931,28 @@ func TestBundleManifest(t *testing.T) {
 		t.Fatalf("manifest format: %s", raw)
 	}
 
-	// The storage reset rewrites the schema outside a refresh.
+	if len(m.Releases) != 0 {
+		t.Fatalf("a bundle of no known release records none: %+v", m.Releases)
+	}
+	if err := recordDeployedBundle(dir, "0.1.20"); err != nil {
+		t.Fatal(err)
+	}
+	if m = readBundleManifest(dir); len(m.Releases) != len(bundleFiles) || m.Releases["Caddyfile"] != "0.1.20" {
+		t.Fatalf("deploy manifest releases = %+v", m.Releases)
+	}
+
+	// The storage reset rewrites the schema outside a refresh, from a control
+	// plane that does not say which release it is.
 	writeFile(t, filepath.Join(dir, "clickhouse-init.sql"), "new schema\n")
-	if err := recordBundleFile(dir, "clickhouse-init.sql"); err != nil {
+	if err := recordBundleFile(dir, "clickhouse-init.sql", ""); err != nil {
 		t.Fatal(err)
 	}
 	m2 := readBundleManifest(dir)
 	if m2.Files["clickhouse-init.sql"] != sha256Hex([]byte("new schema\n")) || m2.Files["Caddyfile"] != m.Files["Caddyfile"] {
 		t.Fatalf("after recordBundleFile: %+v", m2)
+	}
+	if _, ok := m2.Releases["clickhouse-init.sql"]; ok || m2.Releases["Caddyfile"] != "0.1.20" {
+		t.Fatalf("after recordBundleFile, releases: %+v", m2.Releases)
 	}
 	if _, err := os.Stat(filepath.Join(dir, bundleManifestFile+".tmp")); !os.IsNotExist(err) {
 		t.Fatal("temporary manifest left behind")
@@ -921,7 +992,18 @@ func TestBundleModeFlags(t *testing.T) {
 }
 
 func TestBundleBoxLines(t *testing.T) {
-	if got := strings.Join(bundleBoxLines(nil, "--keep-bundle"), "\n"); !strings.Contains(got, "left as-is (--keep-bundle)") {
+	if got := strings.Join(bundleBoxLines(nil, "--keep-bundle", nil), "\n"); !strings.Contains(got, "left as-is (--keep-bundle)") {
+		t.Fatalf("got %q", got)
+	}
+	// The storage reset wrote clickhouse-init.sql although the bundle was not
+	// refreshed: the box says exactly that, never "left as-is".
+	w := &resetSchemaWrite{backup: "/dp/clickhouse-init.sql.bak-main", edited: true}
+	got := strings.Join(bundleBoxLines(nil, "--keep-bundle", w), "\n")
+	if strings.Contains(got, "left as-is") || !strings.Contains(got, "not refreshed (--keep-bundle)") ||
+		!strings.Contains(got, "replaced your edited clickhouse-init.sql") || !strings.Contains(got, "clickhouse-init.sql.bak-main") {
+		t.Fatalf("got %q", got)
+	}
+	if got := strings.Join(bundleBoxLines(nil, "control plane serves 0.1.19", &resetSchemaWrite{}), "\n"); strings.Contains(got, "left as-is") || !strings.Contains(got, "clickhouse-init.sql replaced with your control plane's current schema") {
 		t.Fatalf("got %q", got)
 	}
 	r := &bundleRefresh{version: "0.1.20", files: []bundleFile{
@@ -929,16 +1011,16 @@ func TestBundleBoxLines(t *testing.T) {
 		{name: "Caddyfile", state: bundleModified},
 		{name: "clickhouse-users.xml", state: bundleMissing},
 	}}
-	got := strings.Join(bundleBoxLines(r, ""), "\n")
+	got = strings.Join(bundleBoxLines(r, "", nil), "\n")
 	if !strings.Contains(got, "0.1.20") || !strings.Contains(got, "(docker-compose.yml, clickhouse-users.xml)") || !strings.Contains(got, "see Caddyfile.new") {
 		t.Fatalf("got %q", got)
 	}
 	r.files = r.files[1:2]
-	if got := strings.Join(bundleBoxLines(r, ""), "\n"); !strings.Contains(got, "0.1.20: nothing replaced") || !strings.Contains(got, "see Caddyfile.new") {
+	if got := strings.Join(bundleBoxLines(r, "", nil), "\n"); !strings.Contains(got, "0.1.20: nothing replaced") || !strings.Contains(got, "see Caddyfile.new") {
 		t.Fatalf("got %q", got)
 	}
 	r.files[0].state = bundleUnchanged
-	if got := strings.Join(bundleBoxLines(r, ""), "\n"); !strings.Contains(got, "already 0.1.20") {
+	if got := strings.Join(bundleBoxLines(r, "", nil), "\n"); !strings.Contains(got, "already 0.1.20") {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -1069,5 +1151,70 @@ func TestBackfillDockerEnv(t *testing.T) {
 	}
 	if notes, err := backfillDockerEnv(t.TempDir(), filepath.Join(t.TempDir(), ".env"), ""); notes != nil || err != nil {
 		t.Fatalf("no control plane URL: %q, %v", notes, err)
+	}
+}
+
+func TestWriteResetSchema(t *testing.T) {
+	newSQL := []byte("CREATE TABLE events (properties JSON);\n")
+	withKnownHashes(t, map[string][]string{"clickhouse-init.sql": {sha256Hex([]byte("served old\n"))}})
+	withKnownReleases(t, map[string][]string{sha256Hex([]byte("served old\n")): {"0.1.19"}})
+	for _, tc := range []struct {
+		name       string
+		setup      func(t *testing.T, path string)
+		backup     string // "" = none
+		edited     bool
+		backupBody string
+	}{
+		{"a served version", func(t *testing.T, p string) { writeFile(t, p, "served old\n") }, "clickhouse-init.sql.bak-0.1.19", false, "served old\n"},
+		{"edited here", func(t *testing.T, p string) { writeFile(t, p, "mine\n") }, "clickhouse-init.sql.bak-0.1.18", true, "mine\n"},
+		{"already the new schema", func(t *testing.T, p string) { writeFile(t, p, string(newSQL)) }, "", false, ""},
+		{"missing", func(*testing.T, string) {}, "", false, ""},
+		{"the empty directory Docker leaves", func(t *testing.T, p string) {
+			if err := os.Mkdir(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}, "", false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "clickhouse-init.sql")
+			tc.setup(t, path)
+			if why := resetSchemaProblem(dir); why != "" {
+				t.Fatalf("refused: %s", why)
+			}
+			w, err := writeResetSchema(dir, newSQL, "0.1.18")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if filepath.Base(w.backup) != tc.backup && !(tc.backup == "" && w.backup == "") || w.edited != tc.edited {
+				t.Fatalf("got %+v", w)
+			}
+			if tc.backup != "" && readFile(t, w.backup) != tc.backupBody {
+				t.Fatalf("backup holds %q", readFile(t, w.backup))
+			}
+			if readFile(t, path) != string(newSQL) || readBundleManifest(dir).Files["clickhouse-init.sql"] != sha256Hex(newSQL) {
+				t.Fatal("not written, or not recorded")
+			}
+		})
+	}
+	// A link or a populated directory: refused, and never written through.
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "elsewhere.sql")
+	writeFile(t, target, "theirs\n")
+	if err := os.Symlink(target, filepath.Join(dir, "clickhouse-init.sql")); err != nil {
+		t.Fatal(err)
+	}
+	if why := resetSchemaProblem(dir); !strings.Contains(why, "symbolic link (to "+target+")") {
+		t.Fatalf("why = %q", why)
+	}
+	if _, err := writeResetSchema(dir, newSQL, "0.1.18"); err == nil || readFile(t, target) != "theirs\n" {
+		t.Fatalf("wrote through the link: %v", err)
+	}
+	dir = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "clickhouse-init.sql", "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if why := resetSchemaProblem(dir); !strings.Contains(why, "not a regular file") {
+		t.Fatalf("why = %q", why)
 	}
 }

@@ -33,6 +33,7 @@ func TestEnrollHint(t *testing.T) {
 }
 
 func TestDeployPendingReset(t *testing.T) {
+	t.Setenv("COMPOSE_FILE", "")
 	project := func(t *testing.T, env, compose, initSQL string) string {
 		dir := t.TempDir()
 		writeFile(t, filepath.Join(dir, ".env"), env)
@@ -41,35 +42,67 @@ func TestDeployPendingReset(t *testing.T) {
 		return dir
 	}
 	pending := "DATA_PLANE_ID=dp-1\nDP_IMAGE_TAG=0.1.20\n" + resetPendingVar + "=0.1.20\n"
-
-	// Nothing pending: nothing asked.
-	withAnswers(t, false, "")
-	if got, err := deployPendingReset(project(t, "DATA_PLANE_ID=dp-1\n", compose248, stringSchemaSQL), "0.1.20"); got != "" || err != nil {
-		t.Fatalf("no reset pending: %q, %v", got, err)
+	run := func(t *testing.T, dir, tag, answers string) (got string, done bool, err error, out string) {
+		withAnswers(t, false, answers)
+		out = captureStdout(t, func() { got, done, err = deployPendingReset(dir, tag) })
+		return got, done, err, out
 	}
 
-	// Pending, with the current bundle downloaded: the operator is asked, and
-	// the deploy finishes it.
-	withAnswers(t, false, "yes\n")
-	var got string
-	var err error
-	out := captureStdout(t, func() { got, err = deployPendingReset(project(t, pending, compose253, jsonSchemaSQL), "0.1.20") })
-	if got != "0.1.20" || err != nil || !strings.Contains(out, "did not finish it") || !strings.Contains(out, "DISCARDED") {
-		t.Fatalf("got %q, %v\n%s", got, err, out)
+	// Nothing pending: nothing asked, Docker not asked either.
+	f := newFakeCompose(t)
+	if got, done, err, _ := run(t, project(t, "DATA_PLANE_ID=dp-1\n", compose248, stringSchemaSQL), "0.1.20", ""); got != "" || done || err != nil || len(f.calls) != 0 {
+		t.Fatalf("no reset pending: %q, %v, %v, calls %v", got, done, err, f.calls)
+	}
+
+	// Pending, ClickHouse on the old table or none, the current bundle
+	// downloaded: the operator is asked, and the deploy finishes it.
+	for _, live := range []string{liveStringRow, ""} {
+		f = newFakeCompose(t)
+		f.live = live
+		got, done, err, out := run(t, project(t, pending, compose253, jsonSchemaSQL), "0.1.20", "yes\n")
+		if got != "0.1.20" || done || err != nil || !strings.Contains(out, "did not finish it") || !strings.Contains(out, "DISCARDED") {
+			t.Fatalf("live %q: got %q, %v, %v\n%s", live, got, done, err, out)
+		}
+	}
+
+	// Pending, and ClickHouse already holds the new table (another CLI
+	// finished it, or the record outlived the reset): nothing to drop, so
+	// nothing is asked, whatever the bundle.
+	f = newFakeCompose(t)
+	f.live = liveJSONRow
+	got, done, err, out := run(t, project(t, pending, compose248, stringSchemaSQL), "0.1.20", "")
+	if got != "0.1.20" || !done || err != nil || strings.Contains(out, asked) || !strings.Contains(out, "already holds the new events table") {
+		t.Fatalf("live JSON: got %q, %v, %v\n%s", got, done, err, out)
 	}
 
 	for _, tc := range []struct {
 		name, compose, initSQL, tag, answers, want string
+		override                                   string
+		noDocker                                   bool // refused before Docker is asked anything
 	}{
-		{"declined", compose253, jsonSchemaSQL, "0.1.20", "no\n", "Cancelled."},
-		{"to a release before the reset", compose253, jsonSchemaSQL, "0.1.17", "yes\n", "Finish it first: origamy upgrade --version 0.1.20"},
-		{"the control plane's bundle predates the reset (ClickHouse)", compose248, jsonSchemaSQL, "0.1.20", "yes\n", "Update the control plane"},
-		{"the control plane's bundle predates the reset (schema)", compose253, stringSchemaSQL, "0.1.20", "yes\n", "Update the control plane"},
+		{"declined", compose253, jsonSchemaSQL, "0.1.20", "no\n", "Cancelled.", "", false},
+		{"to a release before the reset", compose253, jsonSchemaSQL, "0.1.17", "yes\n", "Finish it first: origamy upgrade --version 0.1.20", "", true},
+		{"to a moving tag", compose253, jsonSchemaSQL, "main", "yes\n", "the :main images are not a numbered release", "", true},
+		{"the control plane's bundle predates the reset (ClickHouse)", compose248, jsonSchemaSQL, "0.1.20", "yes\n", "Update the control plane", "", false},
+		{"the control plane's bundle predates the reset (schema)", compose253, stringSchemaSQL, "0.1.20", "yes\n", "Update the control plane", "", false},
+		{"an override pins the old ClickHouse", compose253, jsonSchemaSQL, "0.1.20", "yes\n", "docker-compose.override.yml, which compose loads with docker-compose.yml here, changes the clickhouse service: it runs clickhouse/clickhouse-server:24.8",
+			"services:\n  clickhouse:\n    image: clickhouse/clickhouse-server:24.8\n", false},
 	} {
-		withAnswers(t, false, tc.answers)
-		out := captureStdout(t, func() { got, err = deployPendingReset(project(t, pending, tc.compose, tc.initSQL), tc.tag) })
-		if got != "" || err == nil || !strings.Contains(out, tc.want) || !strings.Contains(out, "Nothing has been enrolled") {
-			t.Errorf("%s: got %q, %v\n%s", tc.name, got, err, out)
+		f = newFakeCompose(t)
+		f.live = liveStringRow
+		dir := project(t, pending, tc.compose, tc.initSQL)
+		if tc.override != "" {
+			writeFile(t, filepath.Join(dir, "docker-compose.override.yml"), tc.override)
+		}
+		got, done, err, out := run(t, dir, tc.tag, tc.answers)
+		if got != "" || done || err == nil || !strings.Contains(out, tc.want) || !strings.Contains(out, "Nothing has been enrolled") {
+			t.Errorf("%s: got %q, %v, %v\n%s", tc.name, got, done, err, out)
+		}
+		if tc.answers == "yes\n" && strings.Contains(out, asked) {
+			t.Errorf("%s: refused after asking:\n%s", tc.name, out)
+		}
+		if tc.noDocker && len(f.calls) != 0 {
+			t.Errorf("%s: Docker was asked: %v", tc.name, f.calls)
 		}
 	}
 }
