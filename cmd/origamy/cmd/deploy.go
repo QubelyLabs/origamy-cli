@@ -783,6 +783,9 @@ type dockerPlan struct {
 	aiEnabled     bool
 	ingestDomain  string
 	requireSigned bool
+	// resetPending is the target of a storage reset an earlier upgrade began
+	// here and did not finish (resetPendingVar): this deploy finishes it.
+	resetPending string
 }
 
 // planDocker runs the preflight checks, downloads the bundle and asks every
@@ -850,14 +853,23 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 		ui.Warn("Could not write %s (%v); `origamy upgrade` falls back to the bundle versions it knows.", bundleManifestFile, err)
 	}
 
+	// — Unfinished storage reset ——————————————————————————————————————
+	if p.existingID != "" {
+		pending, err := deployPendingReset(p.dir, imageTag)
+		if err != nil {
+			return nil, err
+		}
+		p.resetPending = pending
+	}
+
 	// — Schema guard ————————————————————————————————————————————————————
 	// The bundle's ClickHouse schema follows the control plane's current build;
 	// the images follow imageTag. A mismatch comes up looking healthy and then
 	// drops every event at insert — refuse it here rather than find out later.
 	// For a plane that already runs, what its volume holds beats what a fresh
-	// volume would get.
+	// volume would get, unless the reset above is about to replace it.
 	live := ""
-	if p.existingID != "" {
+	if p.existingID != "" && p.resetPending == "" {
 		live = liveSchemaGeneration(p.dir, envPath)
 	}
 	if live != "" {
@@ -914,6 +926,34 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 		p.ingestDomain = ingestDefault
 	}
 	return p, nil
+}
+
+// deployPendingReset handles a storage reset an earlier upgrade began in the
+// project dir and did not finish (resetPendingVar): the events table may be
+// the old one or gone, so the re-deploy finishes it before the services
+// start. It returns the reset's target ("" when none is pending) once the
+// bundle just downloaded can finish it for imageTag and the operator agreed,
+// like the upgrade asks. Nothing has been enrolled when it refuses.
+func deployPendingReset(dir, imageTag string) (string, error) {
+	pending := readEnvVar(filepath.Join(dir, ".env"), resetPendingVar)
+	if pending == "" {
+		return "", nil
+	}
+	finish := upgradeCommand(pending) + " (in ./" + filepath.Base(dir) + ")"
+	if releaseSchemaGeneration(imageTag) == "string" {
+		return "", fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env), and release %s cannot write the schema it moves to.", pending, resetPendingVar, imageTag),
+			"Finish it first: "+finish+". Nothing has been enrolled or installed.")
+	}
+	compose, _ := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	initSQL, _ := os.ReadFile(filepath.Join(dir, "clickhouse-init.sql"))
+	if why := composeClickHouseProblem(compose); why != "" || schemaGeneration(string(initSQL)) == "string" {
+		return "", fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env), and your control plane's bundle predates the reset, so it cannot finish it.", pending, resetPendingVar),
+			"Update the control plane, then rerun deploy, or run "+finish+". Nothing has been enrolled or installed.")
+	}
+	if !confirmResumedReset(pending, imageTag, false) {
+		return "", fail("Cancelled.", "Nothing has been enrolled or installed.")
+	}
+	return pending, nil
 }
 
 // applyDocker installs the plane described by p for the enrolled token.
@@ -1011,6 +1051,19 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 		ui.Success("Wrote mTLS identity (certs/tls.crt, tls.key, ca.crt)")
 	}
 
+	// The storage reset an earlier upgrade left unfinished, on the bundle just
+	// downloaded, before anything runs on the new release.
+	if p.resetPending != "" {
+		ui.Title("Storage reset")
+		wd, err := os.Getwd()
+		if err != nil {
+			return fail("Could not read the working directory.", err.Error())
+		}
+		if err := runDockerReset(wd, filepath.Join(wd, ".env"), p.imageTag); err != nil {
+			return err
+		}
+	}
+
 	ui.Title("Bringing services online")
 	sp := ui.Start("Starting services")
 	// Profiles come from COMPOSE_PROFILES in .env, so every later compose
@@ -1060,6 +1113,9 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	}
 	if line := signingSummary(tok.CSK != "", signingSupported(p.imageTag), p.requireSigned); line != "" {
 		lines = append(lines, ui.Gray("Config      ")+line)
+	}
+	if p.resetPending != "" {
+		lines = append(lines, ui.Gray("Storage     ")+ui.Yellow("reset finished: event history was discarded; profiles, traits, segments and journeys were kept"))
 	}
 	if p.ingestDomain != "" {
 		lines = append(lines,

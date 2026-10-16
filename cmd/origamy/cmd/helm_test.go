@@ -214,6 +214,29 @@ func TestSetEnvVarKeepsTrailingNewline(t *testing.T) {
 	}
 }
 
+func TestUnsetEnvVar(t *testing.T) {
+	env := filepath.Join(t.TempDir(), ".env")
+	if err := unsetEnvVar(env, "A"); err != nil {
+		t.Fatalf("a missing file is not an error: %v", err)
+	}
+	if err := os.WriteFile(env, []byte("A=1\nAB=2\nB=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !envHasKey(env, "B") || envHasKey(env, "C") || envHasKey(env, "") {
+		t.Fatal("envHasKey")
+	}
+	if err := unsetEnvVar(env, "A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := unsetEnvVar(env, "C"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(env)
+	if string(got) != "AB=2\nB=\n" {
+		t.Fatalf("unexpected .env: %q", got)
+	}
+}
+
 func TestRenderDockerEnv(t *testing.T) {
 	env := renderDockerEnv(dockerEnvParams{
 		TunnelAddr: "tunnel.origamy.io:443", HTTPURL: "https://v1.origamy.io/",

@@ -57,6 +57,14 @@ func withKnownHashes(t *testing.T, table map[string][]string) {
 	t.Cleanup(func() { knownBundleHashes = prev })
 }
 
+// withKnownReleases replaces the generated hash → releases table for one test.
+func withKnownReleases(t *testing.T, table map[string][]string) {
+	t.Helper()
+	prev := knownBundleReleases
+	knownBundleReleases = table
+	t.Cleanup(func() { knownBundleReleases = prev })
+}
+
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
@@ -228,8 +236,8 @@ func TestPlanBundleRefreshV018Env(t *testing.T) {
 		t.Fatalf("no refresh: %q", skipped)
 	}
 	defer r.cleanup()
-	if !slices.Equal(r.changed(), []string{"docker-compose.yml", "clickhouse-users.xml"}) || r.backupTag != "main" {
-		t.Fatalf("changed %v, backups .bak-%s", r.changed(), r.backupTag)
+	if bak := backupRelease([]byte(oldCompose), r.prev, r.installedTag); !slices.Equal(r.changed(), []string{"docker-compose.yml", "clickhouse-users.xml"}) || bak != "main" {
+		t.Fatalf("changed %v, backups .bak-%s", r.changed(), bak)
 	}
 }
 
@@ -562,16 +570,109 @@ func TestBundleRefreshStableAcrossRuns(t *testing.T) {
 	}
 }
 
+func TestBackupRelease(t *testing.T) {
+	served017, served019 := []byte("compose 0.1.17\n"), []byte("compose 0.1.17 and 0.1.19\n")
+	preRelease, edited := []byte("compose main\n"), []byte("compose, edited\n")
+	withKnownReleases(t, map[string][]string{
+		sha256Hex(served017):  {"0.1.17"},
+		sha256Hex(served019):  {"0.1.17", "0.1.19"},
+		sha256Hex(preRelease): {"main"},
+	})
+	m := func(v string) bundleManifest { return bundleManifest{Version: v} }
+	for _, tc := range []struct {
+		name      string
+		data      []byte
+		m         bundleManifest
+		installed string
+		want      string
+	}{
+		// The release the control plane handed out with these exact bytes,
+		// whatever the manifest and the tag say.
+		{"known version, newer manifest and tag", served017, m("0.1.20"), "0.1.20", "0.1.17"},
+		{"known version of a pre-release bundle", preRelease, m(""), "0.1.16", "main"},
+		// Served under several releases: the one installed, else the
+		// manifest's, else the newest.
+		{"several releases, installed is one", served019, m("0.1.20"), "0.1.17", "0.1.17"},
+		{"several releases, manifest is one", served019, m("0.1.17"), "0.1.20", "0.1.17"},
+		{"several releases, neither", served019, m("0.1.20"), "0.1.20", "0.1.19"},
+		// An edit: the release the manifest says the bundle came from, else
+		// the installed tag, else nothing ("previous").
+		{"edited, manifest", edited, m("0.1.19"), "0.1.20", "0.1.19"},
+		{"edited, no manifest", edited, m(""), "0.1.18", "0.1.18"},
+		{"edited, nothing", edited, m(""), "", ""},
+	} {
+		if got := backupRelease(tc.data, tc.m, tc.installed); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	if got := backupTag(backupRelease(edited, m(""), "")); got != "previous" {
+		t.Errorf("no release at all: backupTag = %q", got)
+	}
+}
+
+func TestBundleRefreshRemovesStaleNew(t *testing.T) {
+	p := newBundleProject(t, "0.1.20")
+	fakeDocker(t)
+	// Run 1 keeps the edited Caddyfile and writes Caddyfile.new next to it.
+	if _, kept := refreshOnce(t, p, "0.1.19", bundleAuto); !slices.Equal(kept, []string{"Caddyfile"}) {
+		t.Fatalf("kept %v", kept)
+	}
+	if p.read(t, "Caddyfile.new") != p.served["Caddyfile"] {
+		t.Fatal("no Caddyfile.new")
+	}
+	// A compose.new from some earlier refresh, and a directory that only
+	// looks like one: not a file the CLI wrote, never touched.
+	writeFile(t, filepath.Join(p.dir, "docker-compose.yml.new"), "services: {older: {}}\n")
+	if err := os.Mkdir(filepath.Join(p.dir, "clickhouse-users.xml.new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Run 2 replaces the Caddyfile (--replace-bundle): its .new is stale now,
+	// and so is the compose file's (that one is the served version already).
+	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", bundleReplace, false)
+	if r == nil {
+		t.Fatal("no refresh planned")
+	}
+	if err := r.apply(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.commit(); err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(r.removedNew)
+	if !slices.Equal(r.removedNew, []string{"Caddyfile.new", "docker-compose.yml.new"}) {
+		t.Fatalf("removed %v", r.removedNew)
+	}
+	for _, gone := range []string{"Caddyfile.new", "docker-compose.yml.new"} {
+		if _, err := os.Lstat(filepath.Join(p.dir, gone)); !os.IsNotExist(err) {
+			t.Errorf("%s left behind: %v", gone, err)
+		}
+	}
+	if fi, err := os.Lstat(filepath.Join(p.dir, "clickhouse-users.xml.new")); err != nil || !fi.IsDir() {
+		t.Errorf("a directory was removed: %v", err)
+	}
+}
+
 func TestBundleBackupTag(t *testing.T) {
-	// Backups are named after the bundle being replaced: the manifest's
-	// release when it has one, else the installed tag, else "previous".
-	for _, tc := range []struct{ manifest, installed, want string }{
-		{"0.1.19", "staging", "docker-compose.yml.bak-0.1.19"},
-		{"", "0.1.18", "docker-compose.yml.bak-0.1.18"},
-		{"", "", "docker-compose.yml.bak-previous"},
+	// Backups are named after the release the replaced file belongs to: a
+	// version the control plane served with a known release is named after
+	// it; otherwise the manifest's release when it has one, else the
+	// installed tag, else "previous".
+	for _, tc := range []struct {
+		manifest, installed, want string
+		release                   []string
+	}{
+		{"0.1.19", "staging", "docker-compose.yml.bak-0.1.19", nil},
+		{"", "0.1.18", "docker-compose.yml.bak-0.1.18", nil},
+		{"", "", "docker-compose.yml.bak-previous", nil},
+		{"0.1.20", "0.1.20", "docker-compose.yml.bak-main", []string{"main"}},
+		{"", "main", "docker-compose.yml.bak-0.1.17", []string{"0.1.17"}},
 	} {
 		p := newBundleProject(t, "0.1.20")
 		fakeDocker(t)
+		withKnownReleases(t, map[string][]string{})
+		if tc.release != nil {
+			withKnownReleases(t, map[string][]string{sha256Hex([]byte(oldCompose)): tc.release})
+		}
 		if err := writeBundleManifest(p.dir, bundleManifest{Version: tc.manifest, Files: map[string]string{"docker-compose.yml": sha256Hex([]byte(oldCompose))}}); err != nil {
 			t.Fatal(err)
 		}
@@ -584,7 +685,7 @@ func TestBundleBackupTag(t *testing.T) {
 		}
 		f, _ := r.file("docker-compose.yml")
 		if filepath.Base(f.backup) != tc.want || f.edited {
-			t.Errorf("manifest %q installed %q: backup %q (edited %v), want %s", tc.manifest, tc.installed, filepath.Base(f.backup), f.edited, tc.want)
+			t.Errorf("manifest %q installed %q releases %v: backup %q (edited %v), want %s", tc.manifest, tc.installed, tc.release, filepath.Base(f.backup), f.edited, tc.want)
 		}
 		r.cleanup()
 	}
@@ -860,6 +961,27 @@ func TestKnownBundleHashes(t *testing.T) {
 	if len(knownBundleHashes) != len(bundleFiles) {
 		t.Errorf("table covers %d files, the bundle has %d", len(knownBundleHashes), len(bundleFiles))
 	}
+	// Every release entry is for a known version, and names releases.
+	known := map[string]bool{}
+	for _, sums := range knownBundleHashes {
+		for _, s := range sums {
+			known[s] = true
+		}
+	}
+	for sum, rels := range knownBundleReleases {
+		if !known[sum] {
+			t.Errorf("releases for unknown version %s", sum)
+		}
+		if len(rels) == 0 || slices.ContainsFunc(rels, func(r string) bool { return !reBundleVersion.MatchString(r) }) {
+			t.Errorf("%s: bad releases %q", sum, rels)
+		}
+	}
+	// The current bundle is the pinned release's: a project deployed by this
+	// CLI backs it up under that name.
+	compose := knownBundleHashes["docker-compose.yml"]
+	if rels := knownBundleReleases[compose[len(compose)-1]]; !slices.Contains(rels, helmVersion) {
+		t.Errorf("the newest docker-compose.yml is for %v, not %s", rels, helmVersion)
+	}
 }
 
 // TestKnownBundleHashesUpToDate regenerates the table from a control-plane
@@ -876,5 +998,76 @@ func TestKnownBundleHashesUpToDate(t *testing.T) {
 	}
 	if string(out) != readFile(t, "bundle_hashes.go") {
 		t.Fatal("bundle_hashes.go is stale: run scripts/gen-bundle-hashes.sh " + cp)
+	}
+}
+
+func TestBackfillDockerEnv(t *testing.T) {
+	const base = "https://cp.example.com"
+	// What the 0.1.20 bundle reads (deploy/byod/docker-compose.yml there).
+	compose := "services:\n  config-sync:\n    environment:\n      CONTROL_PLANE_URL: \"${CONFIG_URL}\"\n      TELEMETRY_URL: \"${TELEMETRY_URL}\"\n" +
+		"  workflow-engine:\n    environment:\n      CONTROL_PLANE_URL: \"${CONTROL_PLANE_HTTP_URL}\"\n"
+	current := "CONTROL_PLANE_HTTP_URL=" + base + "\nCONFIG_URL=" + base + "/api/v1/config\nTELEMETRY_URL=" + base + "/api/v1/telemetry\n"
+	for _, tc := range []struct {
+		name, env, compose string
+		want               map[string]string // values after; "-" = absent
+		notes              int
+	}{
+		{"v0.1.18 .env", v018Env(base), compose, map[string]string{
+			"CONTROL_PLANE_HTTP_URL": base, "CONFIG_URL": base + "/api/v1/config", "TELEMETRY_URL": base + "/api/v1/telemetry"}, 3},
+		{"v0.1.18 .env, quoted with a trailing slash", strings.Replace(v018Env(base), "CONFIG_URL="+base, `CONFIG_URL="`+base+`/"`, 1), compose, map[string]string{
+			"CONFIG_URL": base + "/api/v1/config"}, 3},
+		{"dashboard snippet: the endpoint is kept", "CONFIG_URL=" + base + "/api/v1/config\n", compose, map[string]string{
+			"CONTROL_PLANE_HTTP_URL": base, "CONFIG_URL": base + "/api/v1/config", "TELEMETRY_URL": base + "/api/v1/telemetry"}, 2},
+		{"current CLI: nothing to do", current, compose, nil, 0},
+		{"telemetry turned off stays off", "CONTROL_PLANE_HTTP_URL=" + base + "\nCONFIG_URL=" + base + "/api/v1/config\nTELEMETRY_URL=\n", compose, map[string]string{"TELEMETRY_URL": ""}, 0},
+		{"empty CONFIG_URL", "CONTROL_PLANE_HTTP_URL=" + base + "\nCONFIG_URL=\n", compose, map[string]string{"CONFIG_URL": base + "/api/v1/config"}, 2},
+		{"a CONFIG_URL with its own path is kept", "CONTROL_PLANE_HTTP_URL=" + base + "\nCONFIG_URL=https://proxy.example.com/origamy/config\n", compose, map[string]string{
+			"CONFIG_URL": "https://proxy.example.com/origamy/config"}, 1},
+		{"compose without telemetry", v018Env(base), "services:\n  config-sync:\n    environment:\n      CONTROL_PLANE_URL: ${CONFIG_URL:?}\n", map[string]string{
+			"TELEMETRY_URL": "-", "CONFIG_URL": base + "/api/v1/config"}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			env := filepath.Join(dir, ".env")
+			writeFile(t, env, tc.env)
+			writeFile(t, filepath.Join(dir, "docker-compose.yml"), tc.compose)
+			b, _ := controlPlaneHTTPBase(env)
+			notes, err := backfillDockerEnv(dir, env, b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(notes) != tc.notes {
+				t.Errorf("notes %q, want %d", notes, tc.notes)
+			}
+			if tc.notes == 0 && readFile(t, env) != tc.env {
+				t.Errorf("an .env with nothing to add was rewritten:\n%s", readFile(t, env))
+			}
+			for k, v := range tc.want {
+				if v == "-" {
+					if envHasKey(env, k) {
+						t.Errorf("%s added", k)
+					}
+				} else if got := readEnvVar(env, k); got != v || !envHasKey(env, k) {
+					t.Errorf("%s = %q, want %q", k, got, v)
+				}
+			}
+			// Nothing else moves.
+			for _, l := range strings.Split(tc.env, "\n") {
+				k, _, ok := strings.Cut(l, "=")
+				if !ok || k == "CONFIG_URL" || k == "CONTROL_PLANE_HTTP_URL" {
+					continue
+				}
+				if !strings.Contains(readFile(t, env), l+"\n") {
+					t.Errorf("line %q changed", l)
+				}
+			}
+			// A second run has nothing left to do.
+			if again, _ := backfillDockerEnv(dir, env, b); len(again) != 0 {
+				t.Errorf("second run: %q", again)
+			}
+		})
+	}
+	if notes, err := backfillDockerEnv(t.TempDir(), filepath.Join(t.TempDir(), ".env"), ""); notes != nil || err != nil {
+		t.Fatalf("no control plane URL: %q, %v", notes, err)
 	}
 }

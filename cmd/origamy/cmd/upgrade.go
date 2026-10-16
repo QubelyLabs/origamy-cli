@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"os/exec"
@@ -41,7 +42,10 @@ plane's storage reset: ClickHouse moves to 25.3 and the events table is
 recreated with native JSON columns, which discards the event history
 collected so far (profiles, traits, segments and journeys are kept). The
 upgrade explains this and asks for confirmation; pass --yes to skip the
-prompt.
+prompt. On Docker the project's schema decides rather than its tag (CLI
+v0.1.18 and older pinned :main), the reset runs only with the target's
+bundle (ClickHouse 25.3) and one that fails half-way is recorded in .env
+(` + resetPendingVar + `): the next upgrade finishes it before anything else.
 
 Config signing: a key stored at deploy (Docker: ` + signingKeyCopyVar + ` in .env;
 Kubernetes: the ` + configSigningSecret + ` Secret) is applied once the target release is
@@ -57,11 +61,11 @@ but only when it serves the bundle for exactly the target release
 (/byod/VERSION). Otherwise (an older control plane, a --version other than
 the one it serves, --channel edge) the files are left as they are and only
 the image tag moves. A file you have not edited is replaced and backed up as
-<file>.bak-<previous release>; one you edited is kept, with the new version
-next to it as <file>.new. The new compose file is checked against your .env
-and the images are pulled with it before any file is replaced, so a failed
-pull leaves the project as it was. --replace-bundle replaces edited files
-too (still backed up); --keep-bundle leaves the bundle alone.`,
+<file>.bak-<the release it came with>; one you edited is kept, with the new
+version next to it as <file>.new. The new compose file is checked against
+your .env and the images are pulled with it before any file is replaced, so
+a failed pull leaves the project as it was. --replace-bundle replaces edited
+files too (still backed up); --keep-bundle leaves the bundle alone.`,
 	Example: `  origamy upgrade                 # Kubernetes: latest published chart; Docker: this CLI's release
   origamy upgrade --version 0.1.20
   origamy upgrade --channel edge  # track the moving :staging images; not for production
@@ -378,6 +382,17 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 // for an explicit yes (unless --yes).
 func confirmSchemaReset(from, to string, assumeYes bool) bool {
 	ui.Warn("Upgrading %s → %s crosses the data plane's storage reset.", from, to)
+	return confirmResetDetails(assumeYes)
+}
+
+// confirmResumedReset is confirmSchemaReset for a reset an earlier run began
+// and did not finish (resetPendingVar names its target).
+func confirmResumedReset(pending, to string, assumeYes bool) bool {
+	ui.Warn("An earlier upgrade to %s began the storage reset and did not finish it (%s in .env); this run finishes it before %s starts.", pending, resetPendingVar, to)
+	return confirmResetDetails(assumeYes)
+}
+
+func confirmResetDetails(assumeYes bool) bool {
 	ui.Detail("ClickHouse moves to 25.3 and the events table is recreated with native JSON payload columns.")
 	ui.Detail("The event history collected so far is DISCARDED. Profiles, traits, segments and journeys are kept.")
 	if assumeYes {
@@ -434,6 +449,24 @@ var (
 	clickhouseReadyPoll    = 2 * time.Second
 )
 
+// resetPendingVar records in a Docker project's .env a storage reset that has
+// begun and not finished, as the release it moves to. It is set before
+// anything is replaced or dropped and removed once the schema is applied;
+// .env names the new release (DP_IMAGE_TAG) only after that. While it is set,
+// `origamy upgrade` and an in-place `origamy deploy` redo the reset (asking
+// again) before the services start, so a reset that failed half-way is never
+// taken for a finished one. Every step can run again: the drop is IF EXISTS
+// and the bundle's schema creates everything IF NOT EXISTS.
+const resetPendingVar = "ORIGAMY_RESET_PENDING"
+
+// upgradeCommand is the command that moves a Docker plane to tag again.
+func upgradeCommand(tag string) string {
+	if tag == dockerEdgeTag {
+		return "origamy upgrade --channel edge"
+	}
+	return "origamy upgrade --version " + tag
+}
+
 // resetDockerEvents recreates a Docker project's events table with the schema
 // now in clickhouse-init.sql. ClickHouse is first brought up on the image the
 // project's compose file names now and waited for: a refreshed bundle moves it
@@ -444,10 +477,12 @@ func resetDockerEvents(dir, envPath, tag string) error {
 	compose := func(args ...string) (string, error) {
 		return dockerRun([]string{"DP_IMAGE_TAG=" + tag}, "docker", append([]string{"compose", "--project-directory", dir, "--env-file", envPath}, args...)...)
 	}
+	// Every failure leaves the reset recorded in .env, and a rerun finishes it.
+	rerun := "rerun `" + upgradeCommand(tag) + "`: the unfinished reset is recorded in .env (" + resetPendingVar + ") and is finished before anything else."
 	sp := ui.Start("Starting ClickHouse")
 	if out, err := compose("up", "-d", "clickhouse"); err != nil {
 		sp.Fail("Could not start ClickHouse")
-		return diagnose(out)
+		return fail("ClickHouse did not start, so the events table was not reset yet.", outputHint(out)+"Fix the cause, then "+rerun)
 	}
 	deadline := time.Now().Add(clickhouseReadyTimeout)
 	for {
@@ -456,12 +491,8 @@ func resetDockerEvents(dir, envPath, tag string) error {
 		}
 		if time.Now().After(deadline) {
 			sp.Fail("ClickHouse did not answer within %s", clickhouseReadyTimeout)
-			dc := "docker compose --project-directory " + dir + " --env-file " + envPath
 			return fail("ClickHouse is not accepting queries, so the events table was not reset yet.",
-				"Check: "+dc+" logs clickhouse\nOnce it answers, finish the reset by hand:\n  "+
-					dc+" exec -T clickhouse sh -c '"+clickhouseDropEvents+"'\n  "+
-					dc+" run --rm --no-deps clickhouse-init\n  "+
-					dc+" up -d --remove-orphans")
+				"Check: docker compose --project-directory "+dir+" --env-file "+envPath+" logs clickhouse\nOnce it answers, "+rerun)
 		}
 		time.Sleep(clickhouseReadyPoll)
 	}
@@ -470,14 +501,36 @@ func resetDockerEvents(dir, envPath, tag string) error {
 	sp = ui.Start("Recreating the events table with the new schema")
 	if out, err := compose("exec", "-T", "clickhouse", "sh", "-c", clickhouseDropEvents); err != nil {
 		sp.Fail("Could not drop the old events table")
-		return diagnose(out)
+		return fail("The old events table could not be dropped.", outputHint(out)+"Fix the cause, then "+rerun)
 	}
 	if out, err := compose("run", "--rm", "--no-deps", "clickhouse-init"); err != nil {
 		sp.Fail("Schema init failed")
-		return diagnose(out)
+		return fail("The old events table was dropped, but the new schema could not be applied.", outputHint(out)+"Fix the cause, then "+rerun)
 	}
 	sp.Success("Events table recreated")
 	return nil
+}
+
+// runDockerReset is the storage reset of a project whose .env records it
+// (resetPendingVar): resetDockerEvents, then the record is cleared.
+func runDockerReset(dir, envPath, tag string) error {
+	if err := resetDockerEvents(dir, envPath, tag); err != nil {
+		return err
+	}
+	if err := unsetEnvVar(envPath, resetPendingVar); err != nil {
+		return fail("The events table was recreated, but .env could not be updated.",
+			err.Error()+"\nRemove the "+resetPendingVar+" line from "+envPath+" by hand, then rerun `"+upgradeCommand(tag)+"`.")
+	}
+	return nil
+}
+
+// outputHint is the tail of a failed command's output as the first lines of a
+// fail hint ("" when there was none).
+func outputHint(out string) string {
+	if tail := lastLines(out, 6); tail != "" {
+		return tail + "\n"
+	}
+	return ""
 }
 
 // dockerEdgeTag is what `--channel edge` runs on Docker. The :staging tag is
@@ -500,8 +553,8 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	}
 	// Where the bundle and the schema come from. Projects deployed by CLI
 	// v0.1.18 or older only have it as CONFIG_URL; it is recorded as
-	// CONTROL_PLANE_HTTP_URL once the upgrade goes ahead.
-	base, baseFromConfigURL := controlPlaneHTTPBase(envPath)
+	// CONTROL_PLANE_HTTP_URL once the upgrade goes through (backfillDockerEnv).
+	base, _ := controlPlaneHTTPBase(envPath)
 
 	// Docker pins images via DP_IMAGE_TAG. An explicit version wins; "edge"
 	// tracks the moving :staging tag; otherwise the release this CLI ships with
@@ -515,32 +568,54 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	default:
 		tag = helmVersion
 	}
-	_, installedSemver := parseVersion(installedTag)
+	// (:main, which CLI v0.1.18 and older pinned, is months older than any
+	// release this moves to, so only :staging warrants the warning.)
 	_, targetSemver := parseVersion(tag)
 	switch {
 	case installedTag != "" && versionLess(tag, installedTag):
 		ui.Warn("Moving from %s back to %s — an older release may not understand data written by the newer one.", installedTag, tag)
-	case installedTag != "" && !installedSemver && targetSemver:
+	case installedTag == dockerEdgeTag && targetSemver:
 		ui.Warn("Moving from the moving %s images to release %s may be a downgrade; pass --channel edge to stay on %s.", installedTag, tag, installedTag)
 	}
-	reset := crossesSchemaReset(installedTag, tag)
+
+	// Storage reset. One an earlier run began and did not finish
+	// (resetPendingVar) is finished first, whatever the tags say. Otherwise
+	// the schema generations decide (dockerSchemaResetNeeded): the one this
+	// project's ClickHouse was created from and holds, against the one tag
+	// writes.
+	pending := readEnvVar(envPath, resetPendingVar)
+	installedSQL, _ := os.ReadFile(filepath.Join(dir, "clickhouse-init.sql"))
+	reset, live := pending != "", ""
+	if !reset && releaseSchemaGeneration(tag) == "json" {
+		live = liveSchemaGeneration(dir, envPath)
+		reset = dockerSchemaResetNeeded(installedTag, schemaGeneration(string(installedSQL)), live, tag)
+	}
+	if pending != "" && releaseSchemaGeneration(tag) == "string" {
+		return fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset and did not finish it (%s in .env), and release %s cannot write the schema it moves to.", pending, resetPendingVar, tag),
+			"Finish it first: "+upgradeCommand(pending))
+	}
 	// The reset recreates the events table from the control plane's current
 	// schema, so it cannot start without knowing where that is.
 	if reset && base == "" {
 		return fail("The control plane URL is missing from .env (no CONTROL_PLANE_HTTP_URL or CONFIG_URL), and crossing the storage reset needs its current ClickHouse schema.",
 			"Re-deploy with `origamy deploy --token …`, or add CONTROL_PLANE_HTTP_URL=https://<your control plane> to "+envPath+" and retry.")
 	}
-	if reset && !confirmSchemaReset(installedTag, tag, assumeYes) {
-		return fail("Cancelled.", "")
-	}
-	// Same guard as deploy: the schema in this project is what the control
-	// plane served, and a release that cannot write it must not be started
-	// against it. Crossing the reset re-fetches the schema below instead.
-	if !reset {
-		if initSQL, err := os.ReadFile(filepath.Join(dir, "clickhouse-init.sql")); err == nil {
-			if why := bundleSchemaMismatch(string(initSQL), tag); why != "" {
-				return fail(why, "Pass --version <release> that matches your control plane's schema, or --channel edge to stay on the moving images.")
-			}
+	if reset {
+		from := cmp.Or(installedTag, "the installed release")
+		var yes bool
+		switch {
+		case pending != "":
+			yes = confirmResumedReset(pending, tag, assumeYes)
+		case live == "string":
+			// Say why when the tags alone would not: an earlier upgrade can
+			// have moved them on and left the old table behind.
+			ui.Warn("ClickHouse here still holds the pre-reset events table (String payload columns), which %s cannot write: upgrading %s → %s crosses the data plane's storage reset.", tag, from, tag)
+			yes = confirmResetDetails(assumeYes)
+		default:
+			yes = confirmSchemaReset(from, tag, assumeYes)
+		}
+		if !yes {
+			return fail("Cancelled.", "")
 		}
 	}
 
@@ -562,30 +637,24 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// secrets locally on first use (the KEK is never regenerated afterwards —
 	// per-workspace LLM keys are encrypted under it) and points portal-agent
 	// at the engine; disabling drops the profile and that pointer, keeping the
-	// secrets so a later re-enable finds the same KEK.
+	// secrets so a later re-enable finds the same KEK. Written to .env once the
+	// checks below pass, before the pull (which pulls the profiles' images).
 	profiles := composeProfiles(envPath)
+	aiVars := map[string]string{}
 	switch {
 	case enableAI:
-		for k, v := range map[string]string{
+		aiVars = map[string]string{
 			"ORCH_KEK":                existingOrRandomKEK(envPath, "ORCH_KEK"),
 			"ORCH_ENGINE_API_TOKEN":   existingOrRandom(envPath, "ORCH_ENGINE_API_TOKEN"),
 			"ORCHESTRATOR_ENGINE_URL": orchestratorEngineURL,
-		} {
-			if err := setEnvVar(envPath, k, v); err != nil {
-				return fail("Could not update .env.", err.Error())
-			}
 		}
 		profiles = withProfile(profiles, "agentic", true)
 	case disableAI:
-		if err := setEnvVar(envPath, "ORCHESTRATOR_ENGINE_URL", ""); err != nil {
-			return fail("Could not update .env.", err.Error())
-		}
+		aiVars = map[string]string{"ORCHESTRATOR_ENGINE_URL": ""}
 		profiles = withProfile(profiles, "agentic", false)
 	}
 	if enableAI || disableAI {
-		if err := setEnvVar(envPath, "COMPOSE_PROFILES", strings.Join(profiles, ",")); err != nil {
-			return fail("Could not update .env.", err.Error())
-		}
+		aiVars["COMPOSE_PROFILES"] = strings.Join(profiles, ",")
 	}
 	ui.KV("Directory", dir)
 	ui.KV("Image tag", tag)
@@ -596,6 +665,57 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// refreshed when it serves the bundle for exactly this tag, and only the
 	// files nobody edited here.
 	refresh, bundleSkipped := planBundleRefresh(dir, envPath, base, tag, installedTag, bundle, reset)
+	// abort drops the prepared refresh (its download directory) on the way out.
+	abort := func(err error) error {
+		if refresh != nil {
+			refresh.cleanup()
+		}
+		return err
+	}
+
+	// What the project will run once the refresh is in is checked before
+	// anything is touched. Across the reset: the ClickHouse its compose file
+	// starts must hold the new schema, and the schema the reset applies (the
+	// refreshed one, else the control plane's current one, fetched now) must
+	// be the new one.
+	var fetchedSQL []byte
+	if reset {
+		if why := resetComposeProblem(dir, refresh); why != "" {
+			return abort(fail(resetComposeRefusal(tag, refresh, bundleSkipped, why)))
+		}
+		var resetSQL []byte
+		if refresh != nil && refresh.served("clickhouse-init.sql") {
+			resetSQL, _ = os.ReadFile(filepath.Join(refresh.tmp, "clickhouse-init.sql"))
+		} else {
+			sp := ui.Start("Fetching the current ClickHouse schema")
+			b, err := fetchBundleBytes(base, "clickhouse-init.sql")
+			if err != nil {
+				sp.Fail("Could not download clickhouse-init.sql")
+				return abort(diagnose(err.Error()))
+			}
+			sp.Success("Schema fetched from %s", base)
+			resetSQL, fetchedSQL = b, b
+		}
+		if schemaGeneration(string(resetSQL)) == "string" {
+			return abort(fail("Your control plane serves the pre-reset ClickHouse schema (String payload columns), so the storage reset cannot recreate the events table from it.",
+				"Update the control plane first, then rerun `"+upgradeCommand(tag)+"`."))
+		}
+	}
+	// Same guard as deploy, on the schema the project keeps when the refresh
+	// does not replace it (a refreshed one was checked with the bundle). A
+	// pre-reset String schema cannot trip it: moving that to a release that
+	// writes JSON is the storage reset above.
+	if !reset && (refresh == nil || !refresh.served("clickhouse-init.sql")) &&
+		schemaGeneration(string(installedSQL)) == "json" && releaseSchemaGeneration(tag) == "string" {
+		return abort(fail(fmt.Sprintf("This data plane's ClickHouse schema is the post-reset one (native JSON payload columns), which release %s cannot write.", tag),
+			"Pass --version "+minImageForJSONSchema+" or newer; plain `origamy upgrade` moves to "+helmVersion+"."))
+	}
+
+	for k, v := range aiVars {
+		if err := setEnvVar(envPath, k, v); err != nil {
+			return abort(fail("Could not update .env.", err.Error()))
+		}
+	}
 
 	// Pull BEFORE touching the project: a tag that does not exist for one of
 	// the services (or a registry outage) must leave .env and the bundle files
@@ -614,11 +734,27 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 		return diagnose(out)
 	}
 	sp.Success("Images pulled")
+	// From here on the reset is under way. It is recorded before any file is
+	// replaced or anything dropped, so whatever fails next, the next run
+	// finishes it.
+	if reset {
+		if err := setEnvVar(envPath, resetPendingVar, tag); err != nil {
+			return abort(fail("Could not update .env.", err.Error()))
+		}
+	}
 	if refresh != nil {
 		if err := refresh.apply(); err != nil {
 			if rerr := refresh.rollback(); rerr != nil {
 				return fail("Could not swap in the new bundle files, nor put the previous ones back.",
 					err.Error()+"\n"+rerr.Error()+"\nThe backups are next to them in "+dir+" (*.bak-*).")
+			}
+			if reset {
+				// Nothing was dropped yet, and the reset needs these files.
+				if pending == "" {
+					_ = unsetEnvVar(envPath, resetPendingVar)
+				}
+				return fail("Could not swap in the new bundle files the storage reset needs; they were put back as they were.",
+					err.Error()+"\nFix the cause and rerun `"+upgradeCommand(tag)+"`.")
 			}
 			ui.Warn("Bundle files left as-is: could not swap them in (%v)", err)
 			refresh, bundleSkipped = nil, "swap failed"
@@ -635,15 +771,39 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 			ui.Warn("Kept your edited %s; the %s version is next to it as %s.new", name, tag, name)
 			ui.Detail("Compare: diff -u %s %s.new", filepath.Join(dir, name), filepath.Join(dir, name))
 		}
+		for _, name := range refresh.removedNew {
+			ui.Step("Removed %s, left by an earlier upgrade: %s is the %s version now.", name, strings.TrimSuffix(name, ".new"), tag)
+		}
 	}
+
+	// Storage reset on Docker: drop the old events table and re-run the
+	// bundle's one-shot init service with the new schema (the refreshed one,
+	// forced in across the reset, or the one fetched above) before the
+	// services roll.
+	if reset {
+		if fetchedSQL != nil {
+			if err := os.WriteFile(filepath.Join(dir, "clickhouse-init.sql"), fetchedSQL, 0o644); err != nil {
+				return fail("Could not write clickhouse-init.sql.", err.Error()+"\nFix the cause and rerun `"+upgradeCommand(tag)+"`.")
+			}
+			// The control plane's file now, not an edit, for the next upgrade.
+			_ = recordBundleFile(dir, "clickhouse-init.sql")
+		}
+		if err := runDockerReset(dir, envPath, tag); err != nil {
+			return err
+		}
+	}
+
+	// Only now does .env name the new release: until here every `docker
+	// compose up`, and the next upgrade, still see the one that runs.
 	if err := setEnvVar(envPath, "DP_IMAGE_TAG", tag); err != nil {
 		return fail("Could not update .env.", err.Error())
 	}
-	if baseFromConfigURL {
-		if err := setEnvVar(envPath, "CONTROL_PLANE_HTTP_URL", base); err != nil {
-			return fail("Could not update .env.", err.Error())
-		}
-		ui.Step("Recorded CONTROL_PLANE_HTTP_URL=%s in .env (from CONFIG_URL).", base)
+	notes, err := backfillDockerEnv(dir, envPath, base)
+	for _, n := range notes {
+		ui.Step("%s", n)
+	}
+	if err != nil {
+		return fail("Could not update .env.", err.Error())
 	}
 	// The key follows the tag: only a release that verifies gets
 	// CONFIG_SIGNING_KEY, so a move below minSigningVersion blanks it.
@@ -660,38 +820,10 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 		}
 	}
 
-	// Storage reset on Docker: fetch the control plane's current schema (the
-	// one the new images write), then drop the old events table and re-run
-	// the bundle's one-shot init service against it before the services roll.
-	// A bundle refresh has already put that schema in place (it is forced in
-	// across the reset).
-	if reset {
-		if refresh == nil || !refresh.served("clickhouse-init.sql") {
-			sp = ui.Start("Fetching the current ClickHouse schema")
-			wd, _ := os.Getwd()
-			if err := os.Chdir(dir); err != nil {
-				sp.Fail("Could not enter %s", dir)
-				return fail("Could not enter the project directory.", err.Error())
-			}
-			ferr := fetchBundleFile(base, "clickhouse-init.sql", ".")
-			_ = os.Chdir(wd)
-			if ferr != nil {
-				sp.Fail("Could not download clickhouse-init.sql")
-				return diagnose(ferr.Error())
-			}
-			sp.Success("Schema fetched from %s", base)
-			// The control plane's file now, not an edit, for the next upgrade.
-			_ = recordBundleFile(dir, "clickhouse-init.sql")
-		}
-		if err := resetDockerEvents(dir, envPath, tag); err != nil {
-			return err
-		}
-	}
-
 	// --remove-orphans stops containers of profiles that were just turned off
 	// (compose otherwise leaves them running); named volumes are untouched.
 	sp = ui.Start("Restarting services")
-	if out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "up", "-d", "--remove-orphans"); err != nil {
+	if out, err := dockerRun(nil, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "up", "-d", "--remove-orphans"); err != nil {
 		sp.Fail("docker compose up failed")
 		return diagnose(out)
 	}
@@ -731,4 +863,46 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	}
 	ui.Box("Upgraded", boxLines)
 	return nil
+}
+
+// resetComposeProblem says why the storage reset cannot run on the compose
+// file the project has once refresh r (nil: none) is in — the served one when
+// r takes it, else the project's own — "" when it can.
+func resetComposeProblem(dir string, r *bundleRefresh) string {
+	path := filepath.Join(dir, "docker-compose.yml")
+	if r != nil && r.served("docker-compose.yml") {
+		path = filepath.Join(r.tmp, "docker-compose.yml")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err.Error()
+	}
+	return composeClickHouseProblem(b)
+}
+
+// resetComposeRefusal explains a refusal by resetComposeProblem (why): the
+// compose file at fault is the served one when refresh r takes it, the
+// operator's edited one when r keeps it, else the project's own, which
+// planBundleRefresh did not refresh for the reason skipped.
+func resetComposeRefusal(tag string, r *bundleRefresh, skipped, why string) (headline, hint string) {
+	switch {
+	case r != nil && r.served("docker-compose.yml"):
+		return fmt.Sprintf("The storage reset needs ClickHouse %s or newer, and the docker-compose.yml your control plane serves for %s does not run it (%s).", minClickHouseForJSON, tag, why),
+			"Update the control plane, then rerun `" + upgradeCommand(tag) + "`."
+	case r != nil:
+		return fmt.Sprintf("The storage reset needs ClickHouse %s or newer, and your edited docker-compose.yml, which the refresh keeps, does not run it (%s).", minClickHouseForJSON, why),
+			"Pass --replace-bundle to take the " + tag + " compose file (yours is backed up next to it) and re-apply your edits afterwards,\nor move its clickhouse and clickhouse-init services to clickhouse/clickhouse-server:" + minClickHouseForJSON + " yourself and rerun."
+	}
+	headline = fmt.Sprintf("The storage reset needs ClickHouse %s or newer, which comes with the %s bundle, but the bundle files cannot be refreshed (%s) and this project's docker-compose.yml does not run it (%s).", minClickHouseForJSON, tag, skipped, why)
+	switch {
+	case skipped == "--keep-bundle":
+		hint = "Rerun without --keep-bundle."
+	case skipped == "control plane has no /byod/VERSION":
+		hint = "Your control plane must serve /byod/VERSION for " + tag + " before the CLI takes its bundle: update the control plane, then rerun `origamy upgrade`.\nOr re-deploy here with a fresh token (`origamy deploy --token …`), which downloads its current bundle."
+	case strings.HasPrefix(skipped, "control plane serves "):
+		hint = "Pass --version " + strings.TrimPrefix(skipped, "control plane serves ") + " (the release your control plane's bundle is for), or update the control plane to serve " + tag + "."
+	default:
+		hint = "Fix the cause above, then rerun `origamy upgrade`."
+	}
+	return headline, hint
 }

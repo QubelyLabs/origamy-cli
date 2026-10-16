@@ -189,19 +189,26 @@ func waitForCompose(dir, envPath string, sp *ui.Spinner) (healthy bool, failed [
 // not running or the table does not exist yet. The served init SQL says what
 // the control plane would create; this says what the volume already holds.
 func liveSchemaGeneration(dir, envPath string) string {
-	out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "exec", "-T", "clickhouse", "sh", "-c",
-		`clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT type FROM system.columns WHERE database = 'events' AND table = 'events' AND name = 'properties'"`)
+	out, err := dockerRun(nil, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "exec", "-T", "clickhouse", "sh", "-c", clickhouseEventsPropertiesType)
 	if err != nil {
 		return ""
 	}
-	switch t := strings.TrimSpace(out); {
-	case strings.HasPrefix(t, "JSON"):
-		return "json"
-	case strings.HasPrefix(t, "String"):
-		return "string"
+	// The output is combined: compose's warnings about variables an older
+	// .env lacks come before the answer.
+	for _, l := range strings.Split(out, "\n") {
+		switch t := strings.TrimSpace(l); {
+		case strings.HasPrefix(t, "JSON"):
+			return "json"
+		case strings.HasPrefix(t, "String"):
+			return "string"
+		}
 	}
 	return ""
 }
+
+// clickhouseEventsPropertiesType prints the type of the events table's
+// payload column, nothing when the table does not exist.
+const clickhouseEventsPropertiesType = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT type FROM system.columns WHERE database = 'events' AND table = 'events' AND name = 'properties'"`
 
 // composeLogs returns the last n log lines of one service.
 func composeLogs(dir, envPath, service string, n int) string {

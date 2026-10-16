@@ -115,11 +115,74 @@ func controlPlaneHTTPBase(envPath string) (base string, fromConfigURL bool) {
 		return v, false
 	}
 	v := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONFIG_URL")), "/")
-	v = strings.TrimRight(strings.TrimSuffix(v, "/api/v1/config"), "/")
+	v = strings.TrimRight(strings.TrimSuffix(v, configPath), "/")
 	if u, err := url.Parse(v); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return "", false
 	}
 	return v, true
+}
+
+// configPath and telemetryPath are where config-sync and its telemetry
+// reporter reach the control plane. Both take the FULL endpoint URL
+// (CONFIG_URL, TELEMETRY_URL), which renderDockerEnv writes from the base.
+const (
+	configPath    = "/api/v1/config"
+	telemetryPath = "/api/v1/telemetry"
+)
+
+// backfillDockerEnv brings an .env from CLI v0.1.18 or older up to what
+// renderDockerEnv writes for the control plane at base, without changing a
+// value set here: CONTROL_PLANE_HTTP_URL when it is empty (the CLI reads it
+// for the next refresh); CONFIG_URL when it is empty and TELEMETRY_URL when
+// it is absent (empty turns telemetry off), those two only when the
+// project's compose file reads them. Those CLIs also wrote CONFIG_URL as the
+// bare control-plane URL, which config-sync requests as it is (it never
+// appends the endpoint), so such a plane has never received its config:
+// that one value is corrected. It returns a line for each change.
+func backfillDockerEnv(dir, envPath, base string) ([]string, error) {
+	if base == "" {
+		return nil, nil
+	}
+	compose, _ := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	reads := func(key string) bool {
+		return regexp.MustCompile(`\$\{` + regexp.QuoteMeta(key) + `[}:?-]`).Match(compose)
+	}
+	var notes []string
+	set := func(key, val, note string) error {
+		if err := setEnvVar(envPath, key, val); err != nil {
+			return err
+		}
+		notes = append(notes, note)
+		return nil
+	}
+	if readEnvVar(envPath, "CONTROL_PLANE_HTTP_URL") == "" {
+		if err := set("CONTROL_PLANE_HTTP_URL", base, "Recorded CONTROL_PLANE_HTTP_URL="+base+" in .env."); err != nil {
+			return notes, err
+		}
+	}
+	switch cfg := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONFIG_URL")), "/"); {
+	case !reads("CONFIG_URL"):
+	case cfg == "":
+		if err := set("CONFIG_URL", base+configPath, "Recorded CONFIG_URL="+base+configPath+" in .env."); err != nil {
+			return notes, err
+		}
+	case isBareURL(cfg):
+		if err := set("CONFIG_URL", cfg+configPath, "Corrected CONFIG_URL to "+cfg+configPath+" in .env: config-sync requests it as it is, and the bare control-plane URL CLI v0.1.18 and older wrote never returned this plane's config."); err != nil {
+			return notes, err
+		}
+	}
+	if reads("TELEMETRY_URL") && !envHasKey(envPath, "TELEMETRY_URL") {
+		if err := set("TELEMETRY_URL", base+telemetryPath, "Recorded TELEMETRY_URL="+base+telemetryPath+" in .env, so the dashboard gets this plane's health."); err != nil {
+			return notes, err
+		}
+	}
+	return notes, nil
+}
+
+// isBareURL reports whether v is an http(s) URL with no path.
+func isBareURL(v string) bool {
+	u, err := url.Parse(v)
+	return err == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Host != "" && strings.Trim(u.Path, "/") == "" && u.RawQuery == ""
 }
 
 // unquoteEnv strips the quotes compose's dotenv parser would.
@@ -279,12 +342,14 @@ func (f bundleFile) changes() bool { return f.state == bundlePristine || f.state
 // swaps the files in (rollback puts the previous ones back if that fails
 // half-way) and commit finishes it.
 type bundleRefresh struct {
-	dir, tmp, version, backupTag string
-	files                        []bundleFile
+	dir, tmp, version, installedTag string
+	files                           []bundleFile
 	// prev is the manifest as the refresh found it.
 	prev bundleManifest
 	// undo holds, in order, the steps apply took; rollback reverses them.
 	undo []func() error
+	// removedNew lists the stale <name>.new files commit removed.
+	removedNew []string
 }
 
 // bundleTempPrefix names the download directory prepareBundleRefresh makes
@@ -315,14 +380,14 @@ func removeStaleBundleDirs(dir string) []string {
 // prepareBundleRefresh downloads the bundle from base into a temporary
 // directory inside dir and classifies every file. force names files replaced
 // even when edited (the storage reset's schema). Backups are named after the
-// bundle being replaced: the manifest's release, else the installed tag.
+// release each replaced file belongs to (backupRelease).
 func prepareBundleRefresh(dir, base, version, installedTag string, replaceEdited bool, force map[string]bool) (*bundleRefresh, error) {
 	tmp, err := os.MkdirTemp(dir, bundleTempPrefix)
 	if err != nil {
 		return nil, err
 	}
 	m := readBundleManifest(dir)
-	r := &bundleRefresh{dir: dir, tmp: tmp, version: version, backupTag: backupTag(cmp.Or(m.Version, installedTag)), prev: m}
+	r := &bundleRefresh{dir: dir, tmp: tmp, version: version, installedTag: installedTag, prev: m}
 	for _, name := range bundleFiles {
 		served, err := fetchBundleBytes(base, name)
 		if err == nil {
@@ -348,7 +413,24 @@ func prepareBundleRefresh(dir, base, version, installedTag string, replaceEdited
 	return r, nil
 }
 
-// backupTag names backups after the release being moved away from.
+// backupRelease is the release a bundle file's backup is named after: one the
+// control plane handed out with exactly these bytes (knownBundleReleases; the
+// installed tag or the manifest's release when it is one of them, else the
+// newest), else the release the manifest recorded the bundle as (an edited
+// file started from it), else the installed tag.
+func backupRelease(data []byte, m bundleManifest, installedTag string) string {
+	if rels := knownBundleReleases[sha256Hex(data)]; len(rels) > 0 {
+		for _, v := range []string{installedTag, m.Version} {
+			if v != "" && slices.Contains(rels, v) {
+				return v
+			}
+		}
+		return rels[len(rels)-1]
+	}
+	return cmp.Or(m.Version, installedTag)
+}
+
+// backupTag makes a release name a backup suffix ("previous" for none).
 func backupTag(installedTag string) string {
 	t := strings.Map(func(c rune) rune {
 		if c == '.' || c == '-' || c == '_' || ('0' <= c && c <= '9') || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') {
@@ -493,7 +575,7 @@ func (r *bundleRefresh) apply() error {
 		dst, src := filepath.Join(r.dir, f.name), filepath.Join(r.tmp, f.name)
 		switch {
 		case f.state == bundlePristine:
-			bak, err := writeBackup(dst, f.cur.data, f.cur.mode, r.backupTag)
+			bak, err := writeBackup(dst, f.cur.data, f.cur.mode, backupTag(backupRelease(f.cur.data, r.prev, r.installedTag)))
 			if err != nil {
 				return fmt.Errorf("back up %s: %w", f.name, err)
 			}
@@ -571,7 +653,9 @@ func (r *bundleRefresh) rollback() error {
 // of every file kept because it was edited goes next to it as <name>.new, and
 // the manifest records the files now on disk that are the bundle's. An edited
 // file keeps the entry it had (none for a project from an older CLI), so the
-// next upgrade decides about it exactly as this one did.
+// next upgrade decides about it exactly as this one did. A <name>.new an
+// earlier upgrade left next to a file that is now the served version is
+// stale, and removed.
 func (r *bundleRefresh) commit() error {
 	defer r.cleanup()
 	r.undo = nil
@@ -588,6 +672,14 @@ func (r *bundleRefresh) commit() error {
 			continue
 		}
 		m.Files[f.name] = f.sum
+		stale := filepath.Join(r.dir, f.name+".new")
+		if fi, err := os.Lstat(stale); err == nil && fi.Mode().IsRegular() {
+			if err := os.Remove(stale); err != nil {
+				errs = append(errs, err)
+			} else {
+				r.removedNew = append(r.removedNew, f.name+".new")
+			}
+		}
 	}
 	if err := writeBundleManifest(r.dir, m); err != nil {
 		errs = append(errs, err)

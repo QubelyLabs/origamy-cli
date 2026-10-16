@@ -211,6 +211,74 @@ func TestCrossesSchemaReset(t *testing.T) {
 	}
 }
 
+func TestReleaseSchemaGeneration(t *testing.T) {
+	for tag, want := range map[string]string{
+		"0.1.15": "string", "0.1.17": "string",
+		"0.1.18": "json", "0.1.20": "json", "1.0.0": "json",
+		dockerEdgeTag: "json",
+		"main":        "unknown", "sha-881359f": "unknown", "": "unknown",
+	} {
+		if got := releaseSchemaGeneration(tag); got != want {
+			t.Errorf("releaseSchemaGeneration(%q) = %q, want %q", tag, got, want)
+		}
+	}
+}
+
+func TestDockerSchemaResetNeeded(t *testing.T) {
+	for _, c := range []struct {
+		name                         string
+		installed, gen, live, target string
+		want                         bool
+	}{
+		// CLI v0.1.15–v0.1.18 pinned :main; what the schema file says decides.
+		{"main on the String schema", "main", "string", "", "0.1.20", true},
+		{"main on the JSON schema", "main", "json", "", "0.1.20", false},
+		{"main, ClickHouse holds String", "main", "unknown", "string", "0.1.20", true},
+		{"release before the reset", "0.1.16", "string", "", "0.1.20", true},
+		{"release before the reset, schema file gone", "0.1.16", "unknown", "", "0.1.20", true},
+		// An upgrade by an earlier CLI moved the tag and the file but left the
+		// old table: the running ClickHouse says so.
+		{"tag and file moved, table did not", "0.1.20", "json", "string", "0.1.20", true},
+		{"already across", "0.1.19", "json", "json", "0.1.20", false},
+		{"already across, ClickHouse not running", "0.1.19", "json", "", "0.1.20", false},
+		{"edge from a pre-reset project", "0.1.16", "string", "", dockerEdgeTag, true},
+		{"edge on the JSON schema", dockerEdgeTag, "json", "", dockerEdgeTag, false},
+		// A target that does not write JSON never resets.
+		{"to a pre-reset release", "0.1.16", "string", "", "0.1.17", false},
+		{"to a moving tag of unknown schema", "0.1.16", "string", "", "main", false},
+	} {
+		if got := dockerSchemaResetNeeded(c.installed, c.gen, c.live, c.target); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestComposeClickHouseProblem(t *testing.T) {
+	svc := func(img string) string {
+		return "  clickhouse:\n    image: " + img + "\n  clickhouse-init:\n    image: " + img + "\n"
+	}
+	for _, c := range []struct {
+		name, compose string
+		want          string // substring; "" = fine
+	}{
+		{"0.1.20 bundle", "services:\n" + svc("clickhouse/clickhouse-server:25.3"), ""},
+		{"newer", "services:\n" + svc("clickhouse/clickhouse-server:26.1.2"), ""},
+		{"quoted, registry prefix", "services:\n" + svc(`"docker.io/clickhouse/clickhouse-server:25.8-alpine"`), ""},
+		{"pre-reset bundle", "services:\n" + svc("clickhouse/clickhouse-server:24.8"), "clickhouse-server:24.8"},
+		{"25.x before JSON was GA", "services:\n" + svc("clickhouse/clickhouse-server:25.2"), "clickhouse-server:25.2"},
+		{"one service left behind", "services:\n" + svc("clickhouse/clickhouse-server:25.3") + "  extra:\n    image: clickhouse/clickhouse-server:24.3\n", "24.3"},
+		{"no version", "services:\n" + svc("clickhouse/clickhouse-server:latest"), "no clickhouse-server image"},
+		{"no ClickHouse", "services:\n  x:\n    image: busybox\n", "no clickhouse-server image"},
+		// A comment naming an image is not an image line.
+		{"comment", "# was clickhouse/clickhouse-server:24.8\nservices:\n" + svc("clickhouse/clickhouse-server:25.3"), ""},
+	} {
+		got := composeClickHouseProblem([]byte(c.compose))
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestIsDesktopContext(t *testing.T) {
 	for ctx, want := range map[string]bool{
 		"docker-desktop": true, "kind-kind": true, "minikube": true, "orbstack": true,

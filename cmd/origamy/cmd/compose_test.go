@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -148,5 +149,37 @@ func TestClassifyComposeRestarting(t *testing.T) {
 	})
 	if len(failed) != 1 || failed[0] != "portal-agent" {
 		t.Fatalf("restarting service must be failed, got %v", failed)
+	}
+}
+
+func TestLiveSchemaGeneration(t *testing.T) {
+	warn := "time=\"2026-10-16T20:00:00Z\" level=warning msg=\"The \\\"WRITE_KEYS\\\" variable is not set. Defaulting to a blank string.\"\n"
+	for _, tc := range []struct {
+		name, out string
+		err       error
+		want      string
+	}{
+		{"JSON", "JSON\n", nil, "json"},
+		{"JSON with parameters", "JSON(max_dynamic_paths=1024)\n", nil, "json"},
+		{"String", "String\n", nil, "string"},
+		// compose warns about variables an older .env lacks, on the same output.
+		{"String after compose warnings", warn + warn + "String\n", nil, "string"},
+		{"no events table", "", nil, ""},
+		{"ClickHouse not running", "service \"clickhouse\" is not running", errors.New("exit status 1"), ""},
+	} {
+		prev := dockerRun
+		var call string
+		dockerRun = func(env []string, name string, args ...string) (string, error) {
+			call = strings.Join(args, " ")
+			return tc.out, tc.err
+		}
+		got := liveSchemaGeneration("/dp", "/dp/.env")
+		dockerRun = prev
+		if got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+		if !strings.HasPrefix(call, "compose --project-directory /dp --env-file /dp/.env exec -T clickhouse sh -c ") {
+			t.Errorf("%s: call %q", tc.name, call)
+		}
 	}
 }

@@ -30,3 +30,29 @@ var knownBundleHashes = map[string][]string{
 		"18c12e5ff92d7487d94f946ad833191f2e3680067efd710bb37f157e71ca9f53", // 2026-06-30 c17d877
 	},
 }
+
+// knownBundleReleases maps each of those versions to the data-plane releases
+// the control plane handed out while it served it (byodDataPlaneRelease, or
+// the DP_IMAGE_TAG its Docker handoff wrote before that existed), moving
+// tags first, then numbered releases in order.
+var knownBundleReleases = map[string][]string{
+	// docker-compose.yml
+	"cebd0f5c5608d1b24599e18eedfaf11b7de2c1e0cc2a0931d6dd64c1a96b0b18": {"main"},
+	"49174bd6edd55d33d256930bca71ef95c154dd5fae0cc2941854b72a12c34131": {"main"},
+	"f30c8ac491435ac283a77b3f213dd2878fe23c46013673d124dd293733c1e1a7": {"main"},
+	"9eaaba66914c4e8d0bc52a7a1fa0f8e5a427f17b511630f9a5909ef75d0aad28": {"main"},
+	"3853757b6f377583b84671b1c4b9166ac638ab27f4012cffaffae130bcc7255c": {"0.1.17"},
+	"3afba760312f30a98566baa889439f0b0b0e714494035ef5a45c8b44e64e6e78": {"0.1.17"},
+	"97a6249ced7891c26134fa4721e27ab9b436effa975354bda5bde271fd51cf6a": {"0.1.17"},
+	"f31ff6f381bbabc2a0f8f762a008ef939fd367286e15fa3891fba24d885a8bde": {"0.1.17"},
+	"c0fa4499802ad2e355c82df437617fb90b88dd31e48aa9ba45db09b94b8ee6fe": {"0.1.17", "0.1.19"},
+	"3eb634fc56cd75553bc90894a5d0ffc3758988d60f0e7977a4f1cda6c9f73f91": {"0.1.20"},
+	// clickhouse-init.sql
+	"25ecc21b17a68b585cdbcfc189255c710d34d1a27a1c5a1947ea2e2fe17421a3": {"main"},
+	"02843ca0231f0a96803aa1522c6d97a387191eeaa85d951339d81094f319eb48": {"main", "0.1.17", "0.1.19"},
+	"7d389a0f4654fb7696fbcefebb9d86f3419b2bf0a22acc6c98acd48489889b20": {"0.1.20"},
+	// clickhouse-users.xml
+	"f4e20e2de05152499bb2183fb7e311e99acb9aebf8bb0c097dc7f63fb5225926": {"main", "0.1.17", "0.1.19", "0.1.20"},
+	// Caddyfile
+	"18c12e5ff92d7487d94f946ad833191f2e3680067efd710bb37f157e71ca9f53": {"main", "0.1.17", "0.1.19", "0.1.20"},
+}

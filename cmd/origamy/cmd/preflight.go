@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -264,6 +265,63 @@ func crossesSchemaReset(from, to string) bool {
 		return false
 	}
 	return versionLess(from, minImageForJSONSchema) && !versionLess(to, minImageForJSONSchema)
+}
+
+// releaseSchemaGeneration is the schema generation (see schemaGeneration) the
+// images of a release write: "string" before minImageForJSONSchema, "json"
+// from it on and for the edge channel's :staging images, "unknown" for any
+// other moving tag (main, sha-…).
+func releaseSchemaGeneration(tag string) string {
+	switch _, semver := parseVersion(tag); {
+	case semver && versionLess(tag, minImageForJSONSchema):
+		return "string"
+	case semver, tag == dockerEdgeTag:
+		return "json"
+	}
+	return "unknown"
+}
+
+// dockerSchemaResetNeeded reports whether moving a Docker project to tag
+// crosses the storage reset. The project's own clickhouse-init.sql
+// (installedGen) is what its events table was created from, and the running
+// ClickHouse (liveGen, "" when it cannot be asked) says what the volume holds
+// now: either on the pre-reset String columns means a reset for a target that
+// writes JSON, whatever the installed tag says. That catches a project
+// deployed by CLI v0.1.15–v0.1.18, whose tag is the moving `main`, and one an
+// earlier upgrade left on the old table. The release comparison still counts
+// on its own (crossesSchemaReset), for a project whose schema file is gone or
+// was already replaced by an interrupted upgrade.
+func dockerSchemaResetNeeded(installedTag, installedGen, liveGen, tag string) bool {
+	if releaseSchemaGeneration(tag) != "json" {
+		return false
+	}
+	return installedGen == "string" || liveGen == "string" || crossesSchemaReset(installedTag, tag)
+}
+
+// minClickHouseForJSON is the first ClickHouse release whose JSON column type
+// is generally available; earlier ones need a setting the schema does not
+// set. The bundle moved to it at the storage reset.
+const minClickHouseForJSON = "25.3"
+
+var reClickHouseImage = regexp.MustCompile(`(?m)^\s*image:.*\bclickhouse-server:(\d+)\.(\d+)`)
+
+// composeClickHouseProblem explains why the ClickHouse images a compose file
+// runs cannot hold the post-reset schema, "" when every one is
+// minClickHouseForJSON or newer.
+func composeClickHouseProblem(compose []byte) string {
+	ms := reClickHouseImage.FindAllSubmatch(compose, -1)
+	if len(ms) == 0 {
+		return "no clickhouse-server image with a version tag was found in it"
+	}
+	want, _ := parseVersion(minClickHouseForJSON + ".0")
+	for _, m := range ms {
+		major, _ := strconv.Atoi(string(m[1]))
+		minor, _ := strconv.Atoi(string(m[2]))
+		if major < want[0] || (major == want[0] && minor < want[1]) {
+			return fmt.Sprintf("it runs clickhouse-server:%s.%s", m[1], m[2])
+		}
+	}
+	return ""
 }
 
 // eventsTable is the ClickHouse table the storage reset recreates.

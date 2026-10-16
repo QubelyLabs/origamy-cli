@@ -294,6 +294,43 @@ func setEnvVar(path, key, val string) error {
 	return os.Chmod(path, 0o600)
 }
 
+// unsetEnvVar removes KEY from a dotenv file, preserving the rest. A missing
+// key or file is not an error.
+func unsetEnvVar(path, key string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	kept := lines[:0]
+	for _, l := range lines {
+		if !strings.HasPrefix(l, key+"=") {
+			kept = append(kept, l)
+		}
+	}
+	if len(kept) == len(lines) {
+		return nil
+	}
+	return os.WriteFile(path, []byte(strings.Join(kept, "\n")), 0o600)
+}
+
+// envHasKey reports whether a dotenv file sets KEY at all (even to "").
+func envHasKey(path, key string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, l := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(l, key+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 func readEnvVar(path, key string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -565,8 +602,8 @@ func renderDockerEnv(p dockerEnvParams) string {
 	w("CONTROL_PLANE_HTTP_URL", base)
 	// config-sync and the telemetry reporter take FULL endpoint URLs (the Helm
 	// chart derives the same two paths from controlPlane.httpUrl).
-	w("CONFIG_URL", base+"/api/v1/config")
-	w("TELEMETRY_URL", base+"/api/v1/telemetry")
+	w("CONFIG_URL", base+configPath)
+	w("TELEMETRY_URL", base+telemetryPath)
 	w("DATA_PLANE_ID", p.DataPlaneID)
 	w("AUTH_TOKEN", p.AuthToken)
 	w("TLS_ENABLED", "true")
