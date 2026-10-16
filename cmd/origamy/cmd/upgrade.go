@@ -59,9 +59,9 @@ the one it serves, --channel edge) the files are left as they are and only
 the image tag moves. A file you have not edited is replaced and backed up as
 <file>.bak-<previous release>; one you edited is kept, with the new version
 next to it as <file>.new. The new compose file is checked against your .env
-first, and the previous files are put back if the image pull fails.
---replace-bundle replaces edited files too (still backed up); --keep-bundle
-leaves the bundle alone.`,
+and the images are pulled with it before any file is replaced, so a failed
+pull leaves the project as it was. --replace-bundle replaces edited files
+too (still backed up); --keep-bundle leaves the bundle alone.`,
 	Example: `  origamy upgrade                 # Kubernetes: latest published chart; Docker: this CLI's release
   origamy upgrade --version 0.1.20
   origamy upgrade --channel edge  # track the moving :staging images; not for production
@@ -426,6 +426,60 @@ func reinitKubernetesClickHouse() error {
 	return nil
 }
 
+// clickhouseReadyTimeout bounds the wait for a Docker project's ClickHouse to
+// answer before the storage reset; clickhouseReadyPoll is how often it asks.
+// Variables so tests need not wait.
+var (
+	clickhouseReadyTimeout = 3 * time.Minute
+	clickhouseReadyPoll    = 2 * time.Second
+)
+
+// resetDockerEvents recreates a Docker project's events table with the schema
+// now in clickhouse-init.sql. ClickHouse is first brought up on the image the
+// project's compose file names now and waited for: a refreshed bundle moves it
+// to a newer server (24.8 → 25.3 for a project from before the reset), whose
+// JSON columns the new schema needs, and the old container would otherwise
+// still be the one running until the `up -d` after this.
+func resetDockerEvents(dir, envPath, tag string) error {
+	compose := func(args ...string) (string, error) {
+		return dockerRun([]string{"DP_IMAGE_TAG=" + tag}, "docker", append([]string{"compose", "--project-directory", dir, "--env-file", envPath}, args...)...)
+	}
+	sp := ui.Start("Starting ClickHouse")
+	if out, err := compose("up", "-d", "clickhouse"); err != nil {
+		sp.Fail("Could not start ClickHouse")
+		return diagnose(out)
+	}
+	deadline := time.Now().Add(clickhouseReadyTimeout)
+	for {
+		if _, err := compose("exec", "-T", "clickhouse", "sh", "-c", clickhousePing); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			sp.Fail("ClickHouse did not answer within %s", clickhouseReadyTimeout)
+			dc := "docker compose --project-directory " + dir + " --env-file " + envPath
+			return fail("ClickHouse is not accepting queries, so the events table was not reset yet.",
+				"Check: "+dc+" logs clickhouse\nOnce it answers, finish the reset by hand:\n  "+
+					dc+" exec -T clickhouse sh -c '"+clickhouseDropEvents+"'\n  "+
+					dc+" run --rm --no-deps clickhouse-init\n  "+
+					dc+" up -d --remove-orphans")
+		}
+		time.Sleep(clickhouseReadyPoll)
+	}
+	sp.Success("ClickHouse is up")
+
+	sp = ui.Start("Recreating the events table with the new schema")
+	if out, err := compose("exec", "-T", "clickhouse", "sh", "-c", clickhouseDropEvents); err != nil {
+		sp.Fail("Could not drop the old events table")
+		return diagnose(out)
+	}
+	if out, err := compose("run", "--rm", "--no-deps", "clickhouse-init"); err != nil {
+		sp.Fail("Schema init failed")
+		return diagnose(out)
+	}
+	sp.Success("Events table recreated")
+	return nil
+}
+
 // dockerEdgeTag is what `--channel edge` runs on Docker. The :staging tag is
 // rebuilt for every service on each staging deploy; :main is not (the
 // data-plane's main branch is development-only), so it lags for months and
@@ -440,6 +494,14 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	}
 	envPath := filepath.Join(dir, ".env")
 	installedTag := readEnvVar(envPath, "DP_IMAGE_TAG")
+	// The bundle download of an upgrade interrupted before its swap.
+	if stale := removeStaleBundleDirs(dir); len(stale) > 0 {
+		ui.Step("Removed the bundle download an interrupted upgrade left behind (%s).", strings.Join(stale, ", "))
+	}
+	// Where the bundle and the schema come from. Projects deployed by CLI
+	// v0.1.18 or older only have it as CONFIG_URL; it is recorded as
+	// CONTROL_PLANE_HTTP_URL once the upgrade goes ahead.
+	base, baseFromConfigURL := controlPlaneHTTPBase(envPath)
 
 	// Docker pins images via DP_IMAGE_TAG. An explicit version wins; "edge"
 	// tracks the moving :staging tag; otherwise the release this CLI ships with
@@ -462,6 +524,12 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 		ui.Warn("Moving from the moving %s images to release %s may be a downgrade; pass --channel edge to stay on %s.", installedTag, tag, installedTag)
 	}
 	reset := crossesSchemaReset(installedTag, tag)
+	// The reset recreates the events table from the control plane's current
+	// schema, so it cannot start without knowing where that is.
+	if reset && base == "" {
+		return fail("The control plane URL is missing from .env (no CONTROL_PLANE_HTTP_URL or CONFIG_URL), and crossing the storage reset needs its current ClickHouse schema.",
+			"Re-deploy with `origamy deploy --token …`, or add CONTROL_PLANE_HTTP_URL=https://<your control plane> to "+envPath+" and retry.")
+	}
 	if reset && !confirmSchemaReset(installedTag, tag, assumeYes) {
 		return fail("Cancelled.", "")
 	}
@@ -526,9 +594,26 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// The compose file, ClickHouse config and Caddyfile follow the release
 	// too, and only the control plane has them (bundle.go). They are
 	// refreshed when it serves the bundle for exactly this tag, and only the
-	// files nobody edited here; swapped in before the pull so images of
-	// services the new bundle adds are pulled, and put back if it fails.
-	refresh, bundleSkipped := planBundleRefresh(dir, envPath, tag, installedTag, bundle, reset)
+	// files nobody edited here.
+	refresh, bundleSkipped := planBundleRefresh(dir, envPath, base, tag, installedTag, bundle, reset)
+
+	// Pull BEFORE touching the project: a tag that does not exist for one of
+	// the services (or a registry outage) must leave .env and the bundle files
+	// — and therefore every later `docker compose up` — on the release that is
+	// actually running. The process environment wins over the env file in
+	// compose interpolation, so the pull sees the candidate tag without
+	// writing it, and a refreshed compose file is pulled with from where it
+	// was downloaded, so images of services it adds come too.
+	sp := ui.Start("Pulling %s images", tag)
+	if out, err := pullImages(dir, envPath, tag, refresh); err != nil {
+		sp.Fail("docker compose pull failed")
+		if refresh != nil {
+			refresh.cleanup()
+			ui.Step("Bundle files left as they were.")
+		}
+		return diagnose(out)
+	}
+	sp.Success("Images pulled")
 	if refresh != nil {
 		if err := refresh.apply(); err != nil {
 			if rerr := refresh.rollback(); rerr != nil {
@@ -539,27 +624,12 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 			refresh, bundleSkipped = nil, "swap failed"
 		}
 	}
-
-	// Pull BEFORE recording the tag: a tag that does not exist for one of the
-	// services (or a registry outage) must leave .env — and therefore every
-	// later `docker compose up` — on the release that is actually running.
-	// The process environment wins over the env file in compose
-	// interpolation, so the pull sees the candidate tag without writing it.
-	sp := ui.Start("Pulling %s images", tag)
-	if out, err, restoreErr := pullImages(dir, envPath, tag, refresh); err != nil {
-		sp.Fail("docker compose pull failed")
-		switch {
-		case refresh != nil && restoreErr != nil:
-			ui.Warn("Could not put the previous bundle files back (%v); the backups are next to them in %s (*.bak-*).", restoreErr, dir)
-		case refresh != nil:
-			ui.Step("Put the previous bundle files back.")
-		}
-		return diagnose(out)
-	}
-	sp.Success("Images pulled")
 	if refresh != nil {
 		if err := refresh.commit(); err != nil {
 			ui.Warn("Could not record the refreshed bundle in %s (%v); the next upgrade may take these files for edits.", bundleManifestFile, err)
+		}
+		for _, f := range refresh.overwritten() {
+			ui.Warn("Replaced your edited %s with the %s version; yours is backed up as %s", f.name, tag, filepath.Base(f.backup))
 		}
 		for _, name := range refresh.kept() {
 			ui.Warn("Kept your edited %s; the %s version is next to it as %s.new", name, tag, name)
@@ -568,6 +638,12 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	}
 	if err := setEnvVar(envPath, "DP_IMAGE_TAG", tag); err != nil {
 		return fail("Could not update .env.", err.Error())
+	}
+	if baseFromConfigURL {
+		if err := setEnvVar(envPath, "CONTROL_PLANE_HTTP_URL", base); err != nil {
+			return fail("Could not update .env.", err.Error())
+		}
+		ui.Step("Recorded CONTROL_PLANE_HTTP_URL=%s in .env (from CONFIG_URL).", base)
 	}
 	// The key follows the tag: only a release that verifies gets
 	// CONFIG_SIGNING_KEY, so a move below minSigningVersion blanks it.
@@ -585,13 +661,12 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	}
 
 	// Storage reset on Docker: fetch the control plane's current schema (the
-	// one the new images write), drop the old events table, and re-run the
-	// bundle's one-shot init service against it before the services roll.
+	// one the new images write), then drop the old events table and re-run
+	// the bundle's one-shot init service against it before the services roll.
 	// A bundle refresh has already put that schema in place (it is forced in
 	// across the reset).
 	if reset {
 		if refresh == nil || !refresh.served("clickhouse-init.sql") {
-			base := readEnvVar(envPath, "CONTROL_PLANE_HTTP_URL")
 			sp = ui.Start("Fetching the current ClickHouse schema")
 			wd, _ := os.Getwd()
 			if err := os.Chdir(dir); err != nil {
@@ -608,17 +683,9 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 			// The control plane's file now, not an edit, for the next upgrade.
 			_ = recordBundleFile(dir, "clickhouse-init.sql")
 		}
-
-		sp = ui.Start("Recreating the events table with the new schema")
-		if out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "exec", "-T", "clickhouse", "sh", "-c", clickhouseDropEvents); err != nil {
-			sp.Fail("Could not drop the old events table")
-			return diagnose(out)
+		if err := resetDockerEvents(dir, envPath, tag); err != nil {
+			return err
 		}
-		if out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "run", "--rm", "--no-deps", "clickhouse-init"); err != nil {
-			sp.Fail("Schema init failed")
-			return diagnose(out)
-		}
-		sp.Success("Events table recreated")
 	}
 
 	// --remove-orphans stops containers of profiles that were just turned off
