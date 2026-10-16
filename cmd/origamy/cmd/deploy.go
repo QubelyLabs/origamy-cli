@@ -831,9 +831,8 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 	if err := os.MkdirAll(p.dir, 0o755); err != nil {
 		return nil, fail("Could not create the working directory.", err.Error())
 	}
-	files := []string{"docker-compose.yml", "clickhouse-init.sql", "clickhouse-users.xml", "Caddyfile"}
 	sp := ui.Start("Downloading the deploy bundle")
-	for _, f := range files {
+	for _, f := range bundleFiles {
 		if err := fetchBundleFile(base, f, p.dir); err != nil {
 			sp.Fail("Could not download %s", f)
 			if errors.Is(err, errNotServed) {
@@ -843,7 +842,13 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 			return nil, diagnose(err.Error())
 		}
 	}
-	sp.Success("Bundle downloaded (%s)", strings.Join(files, ", "))
+	sp.Success("Bundle downloaded (%s)", strings.Join(bundleFiles, ", "))
+	// Record what was downloaded, and for which release when the control plane
+	// says, so `origamy upgrade` can tell these files from later edits here.
+	served, _ := servedBundleVersion(base)
+	if err := recordDeployedBundle(p.dir, served); err != nil {
+		ui.Warn("Could not write %s (%v); `origamy upgrade` falls back to the bundle versions it knows.", bundleManifestFile, err)
+	}
 
 	// — Schema guard ————————————————————————————————————————————————————
 	// The bundle's ClickHouse schema follows the control plane's current build;

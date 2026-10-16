@@ -278,6 +278,9 @@ const clickhouseDropEvents = `clickhouse-client --password "$CH_DEFAULT_PASSWORD
 // clickhouseInitStdin applies the schema fed on stdin inside the container.
 const clickhouseInitStdin = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --multiquery`
 
+// clickhousePing succeeds once the server inside the container answers.
+const clickhousePing = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT 1"`
+
 // isDesktopContext reports whether a kubectl context names a local desktop
 // distribution (Docker Desktop, kind, minikube, OrbStack, Rancher Desktop,
 // Colima, k3d). Their single node is arm64 on Apple Silicon, yet they run

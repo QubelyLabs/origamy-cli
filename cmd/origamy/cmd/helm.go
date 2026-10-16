@@ -422,7 +422,8 @@ func withProfile(profiles []string, name string, on bool) []string {
 }
 
 // errNotServed means the control plane answered a bundle-file request with its
-// SPA index.html: the file is not part of the bundle that control plane ships.
+// SPA index.html (or a 404): the file is not part of the bundle that control
+// plane ships.
 var errNotServed = errors.New("not served by the control plane")
 
 // isLocalBase reports whether a plaintext base URL points at this machine —
@@ -441,16 +442,26 @@ func isLocalBase(raw string) bool {
 }
 
 // fetchBundleFile downloads one file of the BYOD deploy bundle from the
-// control plane into dir. The bundle is executable configuration (compose
-// file, schema), so it only travels over HTTPS (or to a local dev plane) and
-// a redirect to another host or scheme is refused. The control plane's SPA
+// control plane into dir (see fetchBundleBytes).
+func fetchBundleFile(base, name, dir string) error {
+	b, err := fetchBundleBytes(base, name)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name), b, 0o644)
+}
+
+// fetchBundleBytes downloads one file of the BYOD deploy bundle from the
+// control plane. The bundle is executable configuration (compose file,
+// schema), so it only travels over HTTPS (or to a local dev plane) and a
+// redirect to another host or scheme is refused. The control plane's SPA
 // handler answers unknown paths with index.html and HTTP 200, so a successful
 // status alone can't tell "missing" from "found" — sniff the body and reject
 // HTML. Plain net/http: the CLI must not depend on a curl being installed.
-func fetchBundleFile(base, name, dir string) error {
+func fetchBundleBytes(base, name string) ([]byte, error) {
 	base = strings.TrimRight(base, "/")
 	if !strings.HasPrefix(base, "https://") && !isLocalBase(base) {
-		return fmt.Errorf("refusing to fetch the deploy bundle from %s: the control plane URL must be https", base)
+		return nil, fmt.Errorf("refusing to fetch the deploy bundle from %s: the control plane URL must be https", base)
 	}
 	target := base + "/byod/" + name
 	client := &http.Client{
@@ -470,20 +481,23 @@ func fetchBundleFile(base, name, dir string) error {
 	}
 	resp, err := client.Get(target)
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", target, err)
+		return nil, fmt.Errorf("GET %s: %w", target, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("GET %s: HTTP 404: %w", target, errNotServed)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: HTTP %d", target, resp.StatusCode)
+		return nil, fmt.Errorf("GET %s: HTTP %d", target, resp.StatusCode)
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", target, err)
+		return nil, fmt.Errorf("GET %s: %w", target, err)
 	}
 	if looksLikeHTML(b) {
-		return errNotServed
+		return nil, errNotServed
 	}
-	return os.WriteFile(filepath.Join(dir, name), b, 0o644)
+	return b, nil
 }
 
 // mergeEnv returns rendered (the keys the CLI owns, freshly generated) with
