@@ -63,6 +63,13 @@ func namespaceManifest(ns string) string {
 // configMapManifest renders a ConfigMap with the values under `data` (keys
 // sorted), each a double-quoted YAML string.
 func configMapManifest(ns, name string, data map[string]string) string {
+	return configMapManifestAt(ns, name, data, "")
+}
+
+// configMapManifestAt is configMapManifest for `kubectl replace` of the
+// ConfigMap as it was at resourceVersion: the replace fails when it has
+// changed since.
+func configMapManifestAt(ns, name string, data map[string]string, resourceVersion string) string {
 	keys := make([]string, 0, len(data))
 	for k := range data {
 		keys = append(keys, k)
@@ -70,7 +77,11 @@ func configMapManifest(ns, name string, data map[string]string) string {
 	sort.Strings(keys)
 	var b strings.Builder
 	b.WriteString("apiVersion: v1\nkind: ConfigMap\nmetadata:\n")
-	fmt.Fprintf(&b, "  name: %s\n  namespace: %s\n  labels:\n    app.kubernetes.io/managed-by: origamy-cli\ndata:\n", name, ns)
+	fmt.Fprintf(&b, "  name: %s\n  namespace: %s\n", name, ns)
+	if resourceVersion != "" {
+		fmt.Fprintf(&b, "  resourceVersion: %q\n", resourceVersion)
+	}
+	b.WriteString("  labels:\n    app.kubernetes.io/managed-by: origamy-cli\ndata:\n")
 	for _, k := range keys {
 		fmt.Fprintf(&b, "  %s: %q\n", k, data[k])
 	}

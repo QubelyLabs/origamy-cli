@@ -178,19 +178,39 @@ func TestExternalClickHouseDescribe(t *testing.T) {
 }
 
 func TestUsesExternalClickHouse(t *testing.T) {
+	bundled := release + "-clickhouse"
 	cases := []struct {
 		vals map[string]any
 		want bool
+		both bool // the chart's own ClickHouse also runs
 	}{
-		{map[string]any{}, false},
-		{map[string]any{"clickhouse": map[string]any{"enabled": true}}, false},
-		{map[string]any{"clickhouse": map[string]any{"host": "ch.example.com"}}, false},
-		{map[string]any{"clickhouse": map[string]any{"enabled": false, "host": "ch.example.com"}}, true},
-		{map[string]any{"clickhouse": "garbage"}, false},
+		{map[string]any{}, false, false},
+		{map[string]any{"clickhouse": map[string]any{"enabled": true}}, false, false},
+		// The chart points the services at clickhouse.host whatever
+		// clickhouse.enabled says: a host other than the bundled Service is an
+		// external ClickHouse, with the bundled one still running when enabled.
+		{map[string]any{"clickhouse": map[string]any{"host": "ch.example.com"}}, true, true},
+		{map[string]any{"clickhouse": map[string]any{"enabled": true, "host": "ch.example.com"}}, true, true},
+		{map[string]any{"clickhouse": map[string]any{"enabled": false, "host": "ch.example.com"}}, true, false},
+		{map[string]any{"clickhouse": map[string]any{"enabled": false}}, true, false},
+		{map[string]any{"clickhouse": map[string]any{"host": ""}}, false, false},
+		{map[string]any{"clickhouse": map[string]any{"host": bundled}}, false, false},
+		{map[string]any{"clickhouse": map[string]any{"host": bundled + "." + namespace + ".svc.cluster.local"}}, false, false},
+		{map[string]any{"clickhouse": map[string]any{"host": bundled + "." + namespace + ".svc"}}, false, false},
+		{map[string]any{"clickhouse": map[string]any{"host": bundled + "." + namespace}}, false, false},
+		{map[string]any{"clickhouse": map[string]any{"host": bundled + ".other-ns.svc.cluster.local"}}, true, true},
+		{map[string]any{"clickhouse": map[string]any{"host": "evil-" + bundled}}, true, true},
+		// The DSN names a host too.
+		{map[string]any{"clickhouse": map[string]any{"dsn": "clickhouse://default:pw@ch.example.com:9000/events"}}, true, true},
+		{map[string]any{"clickhouse": map[string]any{"dsn": "clickhouse://default:$(CLICKHOUSE_PASSWORD)@" + bundled + "." + namespace + ".svc.cluster.local:9000/events"}}, false, false},
+		{map[string]any{"clickhouse": "garbage"}, false, false},
 	}
 	for i, c := range cases {
 		if got := usesExternalClickHouse(c.vals); got != c.want {
 			t.Errorf("case %d: got %v, want %v", i, got, c.want)
+		}
+		if got := bundledClickHouseAlsoRuns(c.vals); got != c.both {
+			t.Errorf("case %d: bundled also runs: got %v, want %v", i, got, c.both)
 		}
 	}
 }

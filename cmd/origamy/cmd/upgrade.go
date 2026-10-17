@@ -67,21 +67,31 @@ uninstall works on a project at a time (an operating system lock on
 ` + projectLockFile + ` in it, gone with its process); Ctrl-C ends an upgrade with exit
 code 130 and leaves neither the lock nor a download.
 
-On Kubernetes the release's ClickHouse decides too (asked in its pod, or,
-for an external ClickHouse, through a short-lived Job made from the chart's
-schema Job), never the chart versions: a chart that cannot write what it
-holds is refused before anything changes. Once the chart is on the target,
-the reset waits for ClickHouse ` + minClickHouseForJSON + ` or newer, moves a String table
-aside (RENAME, as on Docker), applies the chart's schema in the ClickHouse
-pod, checks the new table and only then drops the renamed one. It is
-recorded in the release namespace (ConfigMap ` + resetMarkerConfigMap + `) before the
-table moves, until the check after the upgrade passed: while it is there
-the next upgrade finishes it, even on the same chart version, and rollback
-and an in-place deploy are refused. An external ClickHouse is never reset.
-Every Kubernetes upgrade, one with nothing to do included, ends with a check
-that ClickHouse holds the events table every data-plane image of the release
-writes (in the Deployments' and StatefulSets' specs and in the pods that
-run), and fails otherwise.
+On Kubernetes only an upgrade that can touch the events table is checked
+against ClickHouse: one that takes the images across the storage reset (the
+installed release writes String and the target JSON, or the other way round,
+or either cannot be told), or one made while a reset is recorded as
+unfinished. The first chart past the reset that is published is ` + firstJSONChart + ` (chart
+0.1.18 never was). Any other upgrade (0.1.19 to 0.1.20, --enable-ai, a --set)
+is helm's own, needs no permission beyond helm's and reading the release's
+objects, and ends with a look at the images the release runs. For one that
+can touch the table the release's ClickHouse decides, never the chart
+versions: it is asked in its pod (the user needs create on pods/exec in ` + namespace + `;
+a missing permission is named, not waited for) or, for an external
+ClickHouse, through a short-lived Job made from the chart's schema Job, under
+a lease (ConfigMap ` + kubeLeaseConfigMap + `) that keeps two runs off the table. A chart
+that cannot write what it holds is refused before anything changes, as are
+images that are not numbered releases or are pinned by digest (clear a pin
+with --set <service>.image.digest=). The reset is recorded in the release
+namespace (ConfigMap ` + resetMarkerConfigMap + `) before the chart moves; once the
+chart is on the target, it waits for ClickHouse ` + minClickHouseForJSON + ` or newer, moves a
+String table aside (RENAME, as on Docker), applies the chart's schema in the
+ClickHouse pod, checks the new table and only then drops the renamed one,
+and the record is deleted after the check that ends the upgrade passed. While
+it is there the next upgrade finishes the reset, even on the same chart
+version, and rollback and an in-place deploy are refused. An external
+ClickHouse (clickhouse.host naming another server, whatever clickhouse.enabled
+says) is never reset.
 
 Config signing: a key stored at deploy (Docker: ` + signingKeyCopyVar + ` in .env;
 Kubernetes: the ` + configSigningSecret + ` Secret) is applied once the target release is
@@ -132,7 +142,7 @@ files too (still backed up); --keep-bundle leaves the bundle alone.`,
 func init() {
 	upgradeCmd.Flags().BoolP("yes", "y", false, "Skip the confirmation prompt when the upgrade discards event history (storage reset)")
 	upgradeCmd.Flags().String("version", "", "Target release (default: latest published chart on Kubernetes, "+helmVersion+" on Docker)")
-	upgradeCmd.Flags().String("channel", "stable", "Release channel: stable (pinned) or edge (the moving :staging images; Kubernetes needs chart "+minImageForJSONSchema+"+)")
+	upgradeCmd.Flags().String("channel", "stable", "Release channel: stable (pinned) or edge (the moving :staging images; Kubernetes needs chart "+firstJSONChart+"+)")
 	upgradeCmd.Flags().StringArray("set", nil, "Set a chart value (key=value, repeatable; Kubernetes only), e.g. a key a newer chart introduced.")
 	upgradeCmd.Flags().Bool("enable-ai", false, "Switch the Origamy AI (agentic) engine on for the existing install")
 	upgradeCmd.Flags().Bool("disable-ai", false, "Switch the Origamy AI (agentic) engine off for the existing install")
@@ -194,10 +204,10 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	predictorToggle := enablePredictor || disablePredictor
 	toggle := aiToggle || predictorToggle || requireSigned || len(sets) > 0
 
-	installedVer := ""
+	installedVer, installedRev := "", ""
 	if cur, err := installedRelease(); err == nil {
 		ui.KV("Installed", cur.Chart+"  (revision "+cur.Revision+")")
-		installedVer = chartVersion(cur.Chart)
+		installedVer, installedRev = chartVersion(cur.Chart), cur.Revision
 	}
 
 	// Resolve the target version (explicit flag wins; otherwise ask the registry).
@@ -222,12 +232,16 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 
 	// A release on an external ClickHouse needs a chart that can still reach
 	// it: an older one renders a password-less DSN, never creates the schema
-	// on that server and blocks egress to it.
+	// on that server and blocks egress to it. The release's values with this
+	// run's --set flags applied say where its ClickHouse is (clickhouse.host
+	// points the services away from the bundled one whatever clickhouse.enabled
+	// says).
 	vals, err := releaseValues()
 	if err != nil {
 		return fail("Could not read the current release values.", err.Error())
 	}
-	external, signing := usesExternalClickHouse(vals), signingConfigured(vals)
+	eff := effectiveValues(vals, sets)
+	external, signing := usesExternalClickHouse(eff), signingConfigured(vals)
 	if external && versionLess(target, minChartExternalClickHouse) {
 		return fail(fmt.Sprintf("This data plane uses an external ClickHouse, which needs chart %s or newer (targeting %s).", minChartExternalClickHouse, target),
 			"Pass --version "+minChartExternalClickHouse+" or newer.")
@@ -263,69 +277,137 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 		// Those images write the post-reset ClickHouse schema, so they need a
 		// chart that ships it.
 		if versionLess(target, minImageForJSONSchema) {
-			return fail(fmt.Sprintf("The edge images need chart %s or newer (targeting %s).", minImageForJSONSchema, target),
-				"Pass --version "+minImageForJSONSchema+" or newer together with --channel edge, or drop --channel edge.")
+			return fail(fmt.Sprintf("The edge images need chart %s or newer (targeting %s).", firstJSONChart, target),
+				"Pass --version "+firstJSONChart+" or newer together with --channel edge, or drop --channel edge.")
 		}
 		imageTag = dockerEdgeTag
 		ui.Warn("The edge channel runs the moving :%s images; not for production.", imageTag)
 	}
-	targetGen := releaseSchemaGeneration(imageTag)
+	// The tags the services will have: the release's, and any a --set gives a
+	// service of its own (which wins over it). Services of both sides of the
+	// storage reset cannot all write the one events table.
+	services := serviceImageKeys()
+	tags := targetTags(imageTag, sets, services)
+	targetGen := genOfTags(tags)
 	recheck := kubeUpgradeCommand(target, channel)
+	if targetGen == "mixed" {
+		return fail("This upgrade would give the data-plane services images that write different events tables (tags "+strings.Join(tags, ", ")+"), so events from some of them would be accepted and then dropped at insert.",
+			"Give every service a release on the same side of the storage reset (a per-service --set <service>.image.tag=… is what differs). Nothing has been changed.")
+	}
+	// The new events table needs ClickHouse 25.3 or newer, whatever else the
+	// run does: a pin below that is read from the values, not from the cluster.
+	if targetGen == "json" && !external {
+		if why := kubeClickHouseImageProblem(eff); why != "" {
+			return fail("The data-plane images of this upgrade write the new events table, but "+why+".",
+				"Set clickhouse.image to clickhouse/clickhouse-server:"+minClickHouseForJSON+" or newer (--set clickhouse.image=…), or take it out of your values. Nothing has been changed.")
+		}
+	}
 
-	// Storage reset. What the release's ClickHouse holds decides, never the
-	// chart versions (kube_reset.go): for a release that writes the new
-	// table, the pre-reset one is moved aside and dropped (asking first) and
-	// a missing one created, and the new table is never dropped; a release
-	// that cannot write what ClickHouse holds is refused. A reset an earlier
-	// run began and did not finish (resetMarkerConfigMap) is finished first,
-	// whatever version the chart is on. An external ClickHouse is the
-	// operator's: it is never reset, and the check after the upgrade asks it.
+	// Which events table this move can touch (kube_move.go). Only a move that
+	// can, or that finishes a reset an earlier run began (resetMarkerConfigMap),
+	// asks ClickHouse, takes the lease and records a reset; any other behaves
+	// as an upgrade did before the storage reset existed.
 	marker, err := readResetMarker()
+	markerUnread := false
 	if err != nil {
-		return fail("Could not read whether an earlier upgrade left a storage reset unfinished.", err.Error()+"\nNothing has been changed.")
+		if re, ok := err.(*kubeReadError); !ok || !re.forbidden {
+			return fail("Could not read whether an earlier upgrade left a storage reset unfinished.", err.Error()+"\nNothing has been changed.")
+		}
+		markerUnread = true
 	}
-	if marker.present && targetGen != "json" {
-		return fail(fmt.Sprintf("An earlier upgrade began the storage reset and did not finish it (ConfigMap %s in %s), and %s.", resetMarkerConfigMap, namespace, cannotFinishReset(imageTag)),
-			"Finish it first: "+marker.command()+" (any chart from "+minImageForJSONSchema+" on, or --channel edge, can). Nothing has been changed.")
+	pinsNow, pinsAfter := digestPins(vals, services), digestPins(eff, services)
+	cleared := slices.ContainsFunc(pinsNow, func(k string) bool { return !slices.Contains(pinsAfter, k) })
+	installed, none := installedImageSet()
+	// Images by digest that the operator's values do not pin come from the
+	// chart itself and name no release (unless this run clears them): the
+	// move cannot be told, nor checked afterwards.
+	unexplained := len(installed.digests) > 0 && len(pinsNow) == 0 && !clearsDigestPins(sets, services)
+	crosses, crossWhy := movesAcrossReset(installed, none || unexplained, tags, cleared)
+	relevant := marker.present || crosses
+	if markerUnread {
+		if relevant {
+			return fail("Could not read whether an earlier upgrade left a storage reset unfinished (your user may not read ConfigMaps in "+namespace+"), and this upgrade can touch the events table.",
+				"Grant get on configmaps in "+namespace+", or move the release with helm yourself. Nothing has been changed.")
+		}
+		ui.Warn("Could not check whether an earlier upgrade left a storage reset unfinished (your user may not read ConfigMaps in %s).", namespace)
 	}
-	if marker.present && external {
-		return fail("A storage reset is recorded as unfinished (ConfigMap "+resetMarkerConfigMap+" in "+namespace+"), but this data plane uses an external ClickHouse, which the CLI does not reset.",
-			"Check "+eventsTable+" on your server (its properties column must be JSON), then delete the record: kubectl delete configmap "+resetMarkerConfigMap+" -n "+namespace+". Nothing has been changed.")
-	}
+
 	var live liveSchema
+	var ask kubeAsk
 	drop, create, finish := false, false, false
-	if !external {
-		live = askKubeClickHouse(false)
+	if relevant {
+		if marker.present {
+			crossWhy = "an earlier upgrade recorded a storage reset as unfinished"
+		}
+		ui.Step("This move can touch the events table (%s), so ClickHouse is asked first.", crossWhy)
+		// What the services write has to be told for the checks of such a move.
+		if targetGen == "unknown" {
+			return fail("This upgrade runs data-plane images whose tag is not a numbered release ("+strings.Join(unnumbered(tags), ", ")+"), so which events table they write is not known and the move cannot be checked.",
+				"Pass a numbered --version, or --channel edge, and no per-service image.tag that is not a release. Nothing has been changed.")
+		}
+		if headline, hint := digestPinProblem(pinsAfter); headline != "" {
+			return fail(headline, hint+" Nothing has been changed.")
+		}
+		if unexplained {
+			return fail("The installed release runs data-plane images pinned by digest that your values do not set ("+strings.Join(installed.digests, ", ")+"), which name no release, so this move cannot be checked.",
+				"Clear the pins so the release's tag decides (--set <service>.image.digest= for each service), or move the release with helm yourself. Nothing has been changed.")
+		}
+		if err := markerRefusal(marker, targetGen, imageTag, external, bundledClickHouseAlsoRuns(eff)); err != nil {
+			return err
+		}
+		// One run at a time on the events table; given up on every way out.
+		giveUp, err := acquireKubeLease("upgrade")
+		if err != nil {
+			return leaseFail(err)
+		}
+		defer onExit(giveUp)()
+		defer exitOnSignal()()
+		// What another run did before the lease was ours is read now.
+		if marker, err = readResetMarker(); err != nil {
+			return fail("Could not read whether an earlier upgrade left a storage reset unfinished.", err.Error()+"\nNothing has been changed.")
+		}
+		if err := markerRefusal(marker, targetGen, imageTag, external, bundledClickHouseAlsoRuns(eff)); err != nil {
+			return err
+		}
+
+		ask = askKubeClickHouse(external)
+		live = ask.live
 		switch {
 		case live.gen == "":
 			return fail("ClickHouse could not be asked which events table it holds, so this upgrade cannot tell what it would do with it.",
-				outputHint(live.out)+"Check: kubectl get pods -n "+namespace+"\nOnce it answers, rerun `"+recheck+"`. Nothing has been changed.")
+				ask.hint()+"\n"+strings.TrimSpace(ask.retry(recheck)+" Nothing has been changed."))
 		case live.gen == liveOther:
 			return fail(fmt.Sprintf("ClickHouse's %s has payload columns of type %s, neither the pre-reset (String) nor the new (JSON) schema, which no release writes and the storage reset does not drop.", eventsTable, live.typ),
 				"Check what created it, and drop it yourself if it should be recreated with the new schema; then rerun `"+recheck+"`. Nothing has been changed.")
 		case live.gen == "json" && targetGen == "string":
 			return fail(fmt.Sprintf("ClickHouse here holds the new events table (JSON payload columns), which chart %s cannot write: events would be accepted and then dropped at insert, and ClickHouse would move back to a release that predates it.", target),
-				"Pass --version "+minImageForJSONSchema+" or newer; plain `origamy upgrade` moves to the latest chart. Nothing has been changed.")
+				"Pass --version "+firstJSONChart+" or newer; plain `origamy upgrade` moves to the latest chart. Nothing has been changed.")
+		case external && live.gen == "string" && targetGen == "json":
+			return fail("Your external ClickHouse holds the pre-reset events table (String payload columns), which chart "+target+" cannot write, and the CLI never resets an external ClickHouse.",
+				externalResetHint(eff)+"\nThen rerun `"+recheck+"`. Nothing has been changed.")
 		}
-		drop, create = dockerResetAction(live.gen, imageTag)
-		finish = marker.present && live.gen == "json"
+		if !external {
+			drop, create = kubeResetAction(live.gen, targetGen)
+		}
+		finish = marker.present && live.gen == "json" && !external
+		if drop || create {
+			if why := kubeResetValuesProblem(eff); why != "" {
+				return fail("The storage reset cannot run: "+why+".", "Fix that, then rerun `"+recheck+"`. Nothing has been changed.")
+			}
+		}
 	}
 	// reset: the events table is (re)created with the chart's schema once the
 	// chart is on the target, by the reset's own steps and checks.
 	reset := drop || create
-	if reset {
-		if why := kubeResetValuesProblem(vals, sets); why != "" {
-			return fail("The storage reset cannot run: "+why+".", "Fix that, then rerun `"+recheck+"`. Nothing has been changed.")
-		}
-	}
 
 	// A feature toggle must run even at the same version (that's how "buy AI
 	// later" flips the value on a release already on latest), so skip the
 	// no-op shortcut. So does a reset, or one an earlier run left unfinished.
-	// With nothing to do, what runs is still checked against what ClickHouse
-	// holds.
+	// With nothing to do, what runs is still checked: against the table
+	// ClickHouse holds when the move could touch it, by its images otherwise.
 	if !toggle && !reset && !finish && !marker.present && installedVer == target && channel != "edge" {
-		if c := kubeEventsCheck(external); c.why != "" {
+		c := kubeNoopCheck(relevant, external, numberedGen(targetGen))
+		if c.why != "" {
 			return kubeCheckFail("The chart is on "+target, recheck, c, external, false)
 		}
 		ui.Success("Already on %s — nothing to upgrade.", target)
@@ -348,11 +430,31 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 			return fail("Cancelled.", "Nothing has been changed.")
 		}
 	case create && marker.present:
-		ui.Step("An earlier upgrade began the storage reset and did not finish it (ConfigMap %s in %s). ClickHouse has no events table now: this run creates it with the new schema once the chart is on %s (a pre-reset table the earlier run moved aside is dropped once it is in place).", resetMarkerConfigMap, namespace, target)
+		ui.Step("An earlier upgrade recorded the storage reset as unfinished (ConfigMap %s in %s). ClickHouse has no events table now: this run creates it with the new schema once the chart is on %s (a pre-reset table that reset moved aside is dropped once it is in place only if you agreed to that then).", resetMarkerConfigMap, namespace, target)
 	case create:
 		ui.Step("ClickHouse has no events table: this run creates it with the new schema once the chart is on %s; nothing is dropped.", target)
 	case finish:
 		ui.Step("An earlier upgrade recorded an unfinished storage reset (ConfigMap %s in %s), but ClickHouse already holds the new events table (%s payload columns): it is kept, and the record is deleted once the check after the upgrade passed.", resetMarkerConfigMap, namespace, live.typ)
+	}
+
+	// The reset is recorded before the chart moves, so a run that stops after
+	// helm applied the chart (a timeout, a lost connection) is finished by the
+	// next, and one that cannot record it (no permission to create the
+	// ConfigMap) does not start. A create never carries consent to drop: it
+	// keeps the agreement of an earlier record only.
+	rec := marker
+	if reset {
+		rec = kubeMarker{present: true, version: target, channel: channel, action: markerCreate}
+		switch {
+		case drop:
+			rec.action, rec.aside = markerReset, chooseAside(ask.ch, marker)
+		case marker.consented():
+			rec.action, rec.aside = markerReset, marker.aside
+		}
+		if err := writeResetMarker(rec); err != nil {
+			return fail("The storage reset could not be recorded in the cluster, so the chart was not moved.",
+				err.Error()+"\nThe record is a ConfigMap ("+resetMarkerConfigMap+") in "+namespace+": the user needs create and update on configmaps there. Nothing has been changed.")
+		}
 	}
 
 	args := []string{
@@ -371,6 +473,7 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	// Secret) lets the target chart's defaults fill the gaps.
 	valsFile, err := exportReleaseValues(target)
 	if err != nil {
+		undoMarker(reset, marker)
 		return fail("Could not read the current release values.", err.Error())
 	}
 	defer func() { _ = os.Remove(valsFile) }()
@@ -387,7 +490,7 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	// the pre-pinning 0.1.12 chart (which froze tag: main) would otherwise stay
 	// on :main no matter the target version.
 	args = append(args, "--set", "global.imageTag="+imageTag)
-	for _, svc := range serviceImageKeys() {
+	for _, svc := range services {
 		args = append(args, "--set", svc+".image.tag="+imageTag)
 	}
 
@@ -428,20 +531,21 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	sp := ui.Start("%s", action)
 	if out, err := kubeRun("helm", args...); err != nil {
 		sp.Fail("Helm upgrade failed")
-		return diagnose(out)
+		if !reset {
+			return diagnose(out)
+		}
+		return helmFailedAfterRecord(out, installedRev, marker, recheck)
 	}
 	sp.Success("Chart upgraded to %s", target)
 
 	// Storage reset: the chart's schema Job only runs CREATE TABLE IF NOT
 	// EXISTS, so the pre-reset events table survives the upgrade and the new
 	// images cannot write it. Once ClickHouse is back on the new image, it is
-	// moved aside and the chart's schema applied in its pod (recorded first,
+	// moved aside and the chart's schema applied in its pod (recorded above,
 	// so a run that stops half-way is finished by the next).
 	var outcome resetResult
 	if reset || finish {
-		// The operator agreed to discard the pre-reset table in this run
-		// (drop), or in the one that began the reset.
-		if outcome, err = resetKubernetesEvents(target, channel, live.gen, drop || marker.present); err != nil {
+		if outcome, err = resetKubernetesEvents(rec, live.gen); err != nil {
 			return err
 		}
 	}
@@ -457,10 +561,15 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 		sp.Success("Service pods rolling")
 	}
 
-	// Whatever this run did or did not do to it, it succeeds only when the
-	// events table ClickHouse holds is the one the images that run write. A
-	// reset this run began stays recorded until then.
-	if c := kubeEventsCheck(external); c.why != "" {
+	// It succeeds only when the events table ClickHouse holds is the one the
+	// images that run write (a move that could touch the table asks ClickHouse;
+	// any other reads the images). A reset this run began stays recorded until
+	// then.
+	mode, want := checkImages, numberedGen(targetGen)
+	if relevant {
+		mode, want = checkFull, ""
+	}
+	if c := kubeEventsCheck(mode, external, want); c.why != "" {
 		return kubeCheckFail("The chart is on "+target, recheck, c, external, reset || finish)
 	}
 	if reset || finish {
@@ -489,7 +598,7 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	// A rollback across the storage reset is refused, so it is only offered
 	// when this run did not cross it.
 	if reset || finish {
-		boxLines = append(boxLines, "", resetSummary(outcome))
+		boxLines = append(boxLines, "", kubeResetSummary(outcome))
 	} else {
 		boxLines = append(boxLines, "", ui.Green("Your data (ClickHouse/Postgres/NATS/Redis) was not touched."),
 			ui.Gray("Roll back with: ")+"origamy rollback")
@@ -500,6 +609,102 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 	}
 	ui.Box("Upgraded", boxLines)
 	return nil
+}
+
+// markerRefusal refuses a run that cannot finish the storage reset an earlier
+// one recorded (marker): to images that do not write the schema it moves to,
+// or on an external ClickHouse, which the CLI does not reset.
+func markerRefusal(marker kubeMarker, targetGen, imageTag string, external, bundledAlso bool) error {
+	switch {
+	case marker.present && targetGen != "json":
+		return fail(fmt.Sprintf("An earlier upgrade began the storage reset and did not finish it (ConfigMap %s in %s), and %s.", resetMarkerConfigMap, namespace, cannotFinishReset(imageTag)),
+			"Finish it first: "+marker.command()+" (any chart from "+firstJSONChart+" on, or --channel edge, can). Nothing has been changed.")
+	case marker.present && external:
+		also := ""
+		if bundledAlso {
+			also = " The chart also runs its own ClickHouse (clickhouse.enabled is not false) while clickhouse.host points the services elsewhere, so it is your server that matters."
+		}
+		return fail("A storage reset is recorded as unfinished (ConfigMap "+resetMarkerConfigMap+" in "+namespace+"), but this data plane uses an external ClickHouse, which the CLI does not reset.",
+			"Check "+eventsTable+" on your server (its properties column must be JSON), then delete the record: kubectl delete configmap "+resetMarkerConfigMap+" -n "+namespace+"."+also+" Nothing has been changed.")
+	}
+	return nil
+}
+
+// externalResetHint says how to give an external ClickHouse the new events
+// table by hand; vals are the release's values, which say whether the chart
+// also runs its own ClickHouse.
+func externalResetHint(vals map[string]any) string {
+	h := "On your server, rename (or drop) " + eventsTable + " if it is the pre-reset one, and apply the chart's schema:\n  kubectl get configmap " + release + "-clickhouse-init -n " + namespace + " -o jsonpath='{.data.init\\.sql}' | clickhouse-client --host … --port … --user … --password … [--secure] --multiquery"
+	if bundledClickHouseAlsoRuns(vals) {
+		h += "\nThis release also runs the chart's own ClickHouse (clickhouse.enabled is not false) while clickhouse.host points the services elsewhere, so the CLI cannot tell which one a reset should touch and resets neither. Set clickhouse.enabled=false, or take clickhouse.host out of your values."
+	}
+	return h
+}
+
+// kubeNoopCheck is the check an upgrade with nothing to do makes: against the
+// table ClickHouse holds when the move could touch it (relevant), by the
+// images alone otherwise.
+func kubeNoopCheck(relevant, external bool, targetGen string) kubeCheck {
+	if relevant {
+		return kubeEventsCheck(checkFull, external, "")
+	}
+	return kubeEventsCheck(checkImages, external, targetGen)
+}
+
+// chooseAside is the name the pre-reset table is moved to by a reset that
+// begins now: the one an earlier record reserved when it is free, else a new
+// events_pre_reset_<unix time>.
+func chooseAside(ch kubeClickHouse, prev kubeMarker) string {
+	if ch.pod == "" {
+		return ""
+	}
+	q := ch.session().query
+	if prev.aside != "" && !asideTaken(q, prev.aside) {
+		return prev.aside
+	}
+	return asideName(q)
+}
+
+// undoMarker takes back the record a run wrote (reset) when the chart did not
+// move: the earlier one is put back (prev), or deleted when there was none.
+func undoMarker(reset bool, prev kubeMarker) {
+	if !reset {
+		return
+	}
+	if err := restoreResetMarker(prev); err != nil {
+		ui.Warn("The reset record of this run could not be taken back (%s): `kubectl delete configmap %s -n %s` removes it, or a rerun finishes the reset.", err, resetMarkerConfigMap, namespace)
+	}
+}
+
+// helmFailedAfterRecord reports a failed `helm upgrade` of a run that had
+// recorded a storage reset (out is helm's output): when the release did not
+// move (its revision is still installedRev) nothing was changed, and the
+// record goes back as it was; when it did, or it cannot be told, the record
+// stays, and the rerun finishes the reset.
+func helmFailedAfterRecord(out, installedRev string, prev kubeMarker, recheck string) error {
+	if cur, cerr := installedRelease(); cerr == nil && cur.Revision == installedRev {
+		undoMarker(true, prev)
+		err := diagnose(out)
+		ui.Detail("The release did not move (still revision %s), so nothing was changed in the cluster or in ClickHouse.", installedRev)
+		return err
+	}
+	// Helm's own account of a timeout ("usually fine, pods keep starting") is
+	// not for a run that has left the events table unreset.
+	err := printDiagnosis(ui.Diagnosis{
+		Headline: "Helm reported an error after it began applying the chart.",
+		Hint: "The release may already run the new images while the events table is not reset yet. The storage reset is recorded as unfinished (ConfigMap " +
+			resetMarkerConfigMap + " in " + namespace + "): `" + recheck + "` finishes it. ClickHouse itself was not touched.",
+	}, out)
+	return err
+}
+
+// kubeResetSummary is the summary box's account of a Kubernetes storage
+// reset.
+func kubeResetSummary(r resetResult) string {
+	if r.outcome == resetCreated && len(r.kept) == 0 && len(r.dropped) == 0 {
+		return ui.Yellow("Storage reset finished: the events table was created with the new schema (ClickHouse had none); profiles, traits, segments and journeys were kept.")
+	}
+	return resetSummary(r)
 }
 
 // confirmResumedReset explains a reset an earlier Docker run began and did
@@ -751,6 +956,14 @@ func dockerSession(dir, envPath string, compose func(...string) (string, error),
 // events table changed between the check and the move, and is kept with how
 // to put it back. A table that cannot be checked or dropped is kept too.
 func settleAside(c chSession, r resetResult, moved string, discard bool) resetResult {
+	return settleAsideOf(c, r, moved, func(string) bool { return discard })
+}
+
+// settleAsideOf is settleAside where the operator's agreement to discard is
+// told table by table (discard says whether the pre-reset table named may be
+// dropped): the Kubernetes reset agrees to drop the table its own record names
+// and no other.
+func settleAsideOf(c chSession, r resetResult, moved string, discard func(name string) bool) resetResult {
 	out, err := c.query(clickhouseAsideTables)
 	if err != nil {
 		if moved != "" {
@@ -769,7 +982,7 @@ func settleAside(c chSession, r resetResult, moved string, discard bool) resetRe
 	for _, name := range names {
 		typ := tables[name]
 		switch {
-		case strings.HasPrefix(typ, "String") && discard:
+		case strings.HasPrefix(typ, "String") && discard(name):
 			sp := ui.Start("Dropping events.%s, the pre-reset events table moved aside", name)
 			if out, err := c.stmt(clickhouseDropAside(name)); err != nil {
 				r.kept = append(r.kept, name)

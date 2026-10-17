@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -171,14 +172,69 @@ func (ch *externalClickHouse) describe() string {
 }
 
 // usesExternalClickHouse reports whether a release's user-supplied values
-// (helm get values) point it at an external ClickHouse.
+// (helm get values) send the data plane to a ClickHouse that is not the one
+// the chart bundles: clickhouse.enabled=false, or a clickhouse.host (or a
+// DSN) other than the bundled Service, whatever clickhouse.enabled says (the
+// chart points every service and its schema Job at the host it is given).
 func usesExternalClickHouse(vals map[string]any) bool {
 	ch, _ := vals["clickhouse"].(map[string]any)
 	if ch == nil {
 		return false
 	}
-	enabled, set := ch["enabled"].(bool)
-	return set && !enabled
+	if enabled, set := ch["enabled"].(bool); set && !enabled {
+		return true
+	}
+	return clickhouseHostElsewhere(ch)
+}
+
+// bundledClickHouseAlsoRuns reports whether the chart still runs its own
+// ClickHouse (clickhouse.enabled is not false) although the services are
+// pointed at another server by clickhouse.host or a DSN: the data plane
+// writes to one ClickHouse and the chart's StatefulSet is another.
+func bundledClickHouseAlsoRuns(vals map[string]any) bool {
+	ch, _ := vals["clickhouse"].(map[string]any)
+	if ch == nil {
+		return false
+	}
+	if enabled, set := ch["enabled"].(bool); set && !enabled {
+		return false
+	}
+	return clickhouseHostElsewhere(ch)
+}
+
+// clickhouseHostElsewhere reports whether the clickhouse block names a host
+// (clickhouse.host, or the host of clickhouse.dsn) that is not the bundled
+// ClickHouse Service.
+func clickhouseHostElsewhere(ch map[string]any) bool {
+	if host, _ := ch["host"].(string); strings.TrimSpace(host) != "" && !isBundledClickHouseHost(host) {
+		return true
+	}
+	if dsn, _ := ch["dsn"].(string); strings.TrimSpace(dsn) != "" {
+		if u, err := url.Parse(strings.TrimSpace(dsn)); err == nil && u.Hostname() != "" && !isBundledClickHouseHost(u.Hostname()) {
+			return true
+		}
+	}
+	return false
+}
+
+// isBundledClickHouseHost reports whether host names the release's own
+// ClickHouse Service: <release>-clickhouse, alone or with the namespace and
+// the cluster domain (.svc, .svc.cluster.local, …). An empty host is the
+// chart's default, which is the bundled Service.
+func isBundledClickHouseHost(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if h == "" {
+		return true
+	}
+	name := release + "-clickhouse"
+	if h == name {
+		return true
+	}
+	rest, ok := strings.CutPrefix(h, name+".")
+	if !ok {
+		return false
+	}
+	return rest == namespace || rest == namespace+".svc" || strings.HasPrefix(rest, namespace+".svc.")
 }
 
 // promptClickHouse asks where ClickHouse runs. It returns nil for the bundled
