@@ -201,9 +201,9 @@ tag (`DP_IMAGE_TAG`) on Docker, since images and chart share a version.
 (Kubernetes) or moves Docker installs to the CLI's pinned release; on
 Kubernetes it re-applies the release's own values from an export (never
 `--reuse-values`, which breaks when the target chart has defaults the old
-release never set). `--channel edge` tracks moving images instead — `:main`
-on Kubernetes, `:staging` on Docker (the only moving tag every service is
-rebuilt under) — and is not for production.
+release never set). `--channel edge` tracks moving images instead — `:staging`
+on Kubernetes and on Docker (the only moving tag every service is rebuilt
+under) — and is not for production.
 
 Two release boundaries the CLI knows about:
 
