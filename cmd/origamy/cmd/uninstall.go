@@ -148,20 +148,31 @@ func uninstallDocker(id string, assumeYes bool) error {
 	}
 	ui.Title("Target")
 	ui.Success("Docker deployment detected (./%s)", dir)
+	// Not while an upgrade or a deploy works on it (lock.go).
+	unlock, err := lockProject(dir, "origamy uninstall")
+	if err != nil {
+		return lockFail(err, "Nothing has been removed.")
+	}
+	defer unlock()
 
 	if !confirmTeardown(fmt.Sprintf("the containers and volumes in ./%s", dir), assumeYes) {
 		return fail("Cancelled.", "")
 	}
 
 	sp := ui.Start("Stopping and removing containers + volumes")
-	if out, err := runCaptured("docker", "compose", "-f", compose, "down", "-v", "--remove-orphans"); err != nil {
+	if out, err := dockerRun(nil, "docker", "compose", "-f", compose, "down", "-v", "--remove-orphans"); err != nil {
 		sp.Fail("docker compose down failed")
 		return diagnoseDocker(out, "rerun `origamy uninstall "+id+"`")
 	}
 	sp.Success("Containers and volumes removed")
 
-	// Best-effort: remove the generated deploy directory (.env, compose, etc.).
-	if err := os.RemoveAll(dir); err == nil {
+	// Best-effort: remove the generated deploy directory (.env, compose, etc.),
+	// lock file included; Windows removes that only once it is unlocked.
+	err = os.RemoveAll(dir)
+	if unlock(); err != nil {
+		err = os.RemoveAll(dir)
+	}
+	if err == nil {
 		ui.Success("Removed ./%s", dir)
 	}
 

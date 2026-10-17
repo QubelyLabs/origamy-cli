@@ -140,6 +140,9 @@ func resetSchemaProblem(dir string) string {
 // does; resetSchemaProblem has ruled out a link or a directory.
 func writeResetSchema(dir string, sql []byte, installedTag string) (resetSchemaWrite, error) {
 	const name = "clickhouse-init.sql"
+	// Not cut in half by an interrupt.
+	exitGate.Lock()
+	defer exitGate.Unlock()
 	path := filepath.Join(dir, name)
 	cur, err := readBundleCurrent(path)
 	if err != nil {
@@ -420,6 +423,9 @@ type bundleRefresh struct {
 	undo []func() error
 	// removedNew lists the stale <name>.new files commit removed.
 	removedNew []string
+	// remove removes tmp, once: by cleanup, or by a prompt or a signal that
+	// ends the CLI first (onExit), the download included.
+	remove func()
 }
 
 // controlPlaneFetchFail explains a bundle file (name) a Docker upgrade could
@@ -481,6 +487,8 @@ func prepareBundleRefresh(dir, base, version, installedTag string, replaceEdited
 	}
 	m := readBundleManifest(dir)
 	r := &bundleRefresh{dir: dir, tmp: tmp, version: version, installedTag: installedTag, prev: m}
+	// An interrupt during the download removes it too.
+	r.remove = onExit(func() { _ = os.RemoveAll(tmp) })
 	for _, name := range bundleFiles {
 		served, err := fetchBundleBytes(base, name)
 		if err == nil {
@@ -650,13 +658,14 @@ func composeFileArgs(dir, envPath, compose string) []string {
 }
 
 // validate checks the new bundle before anything is touched. The new compose
-// file must render against the project's .env with the target tag: one that
-// needs a variable the .env lacks (${X:?}) or is otherwise invalid would take
-// the plane down at `up`. And the new schema must be one tag can write.
-func (r *bundleRefresh) validate(envPath, tag string) error {
+// file must render against the project's .env with the target tag (and what
+// else the run gives compose in env before .env holds it): one that needs a
+// variable the .env lacks (${X:?}) or is otherwise invalid would take the
+// plane down at `up`. And the new schema must be one tag can write.
+func (r *bundleRefresh) validate(envPath string, env []string, tag string) error {
 	if args := r.composeArgs(envPath); args != nil {
 		args = append(append([]string{"compose", "--project-directory", r.dir}, args...), "--env-file", envPath, "config", "-q")
-		if out, err := dockerRun([]string{"DP_IMAGE_TAG=" + tag}, "docker", args...); err != nil {
+		if out, err := dockerRun(env, "docker", args...); err != nil {
 			return fmt.Errorf("the new docker-compose.yml does not validate against your .env: %s", strings.ReplaceAll(lastLines(out, 3), "\n", " "))
 		}
 	}
@@ -708,6 +717,18 @@ func (r *bundleRefresh) apply() error {
 		}
 	}
 	return nil
+}
+
+// swapIn applies the refresh and, when that fails half-way, rolls it back, as
+// one step an interrupt waits for (exitGate). err is apply's error, rerr
+// rollback's.
+func (r *bundleRefresh) swapIn() (err, rerr error) {
+	exitGate.Lock()
+	defer exitGate.Unlock()
+	if err = r.apply(); err != nil {
+		rerr = r.rollback()
+	}
+	return err, rerr
 }
 
 // writeBackup copies data to <path>.bak-<tag>, never over an existing backup
@@ -801,8 +822,12 @@ func (r *bundleRefresh) commit() error {
 	return errors.Join(errs...)
 }
 
+// cleanup removes the download directory.
 func (r *bundleRefresh) cleanup() {
-	if r.tmp != "" {
+	switch {
+	case r.remove != nil:
+		r.remove()
+	case r.tmp != "":
 		_ = os.RemoveAll(r.tmp)
 	}
 }
@@ -841,11 +866,12 @@ func bundleMountServices(profiles []string) []string {
 
 // planBundleRefresh decides whether upgrading the project in dir to tag
 // refreshes its bundle from the control plane at base (controlPlaneHTTPBase),
-// and prepares and validates the refresh. Without one it returns the reason,
-// short enough for the summary box, and the upgrade goes on with the files
-// the project has. reset forces the new schema in: the storage reset
-// recreates the events table from it.
-func planBundleRefresh(dir, envPath, base, tag, installedTag string, mode bundleMode, reset bool) (*bundleRefresh, string) {
+// and prepares and validates the refresh (with env, the run's compose
+// environment). Without one it returns the reason, short enough for the
+// summary box, and the upgrade goes on with the files the project has. reset
+// forces the new schema in: the storage reset recreates the events table
+// from it.
+func planBundleRefresh(dir, envPath, base, tag, installedTag string, env []string, mode bundleMode, reset bool) (*bundleRefresh, string) {
 	// Across the reset a skipped refresh does not leave the files as they
 	// are: the reset writes its schema to clickhouse-init.sql all the same.
 	asIs, resetNote := "left as-is", ""
@@ -877,7 +903,7 @@ func planBundleRefresh(dir, envPath, base, tag, installedTag string, mode bundle
 		sp.Warn("Bundle files %s: could not download the %s bundle (%v)%s", asIs, tag, err, resetNote)
 		return nil, "download failed"
 	}
-	if err := r.validate(envPath, tag); err != nil {
+	if err := r.validate(envPath, env, tag); err != nil {
 		r.cleanup()
 		sp.Warn("Bundle files %s: %v%s", asIs, err, resetNote)
 		return nil, "new bundle failed validation"
@@ -901,14 +927,15 @@ func planBundleRefresh(dir, envPath, base, tag, installedTag string, mode bundle
 	return r, ""
 }
 
-// pullImages pulls tag's images. With a refresh that replaces the compose
-// file it pulls with the new one from the download directory, before
-// anything in the project is touched, so the images of services the new
-// bundle adds come too and a failed or interrupted pull leaves the project
-// as it was.
-func pullImages(dir, envPath, tag string, r *bundleRefresh) (string, error) {
+// pullImages pulls the images of the release env names (tagEnv, and what
+// else the run gives compose before .env holds it: the AI toggle's profile).
+// With a refresh that replaces the compose file it pulls with the new one
+// from the download directory, before anything in the project is touched,
+// so the images of services the new bundle adds come too and a failed or
+// interrupted pull leaves the project as it was.
+func pullImages(dir, envPath string, env []string, r *bundleRefresh) (string, error) {
 	args := append(append([]string{"compose", "--project-directory", dir}, r.composeArgs(envPath)...), "--env-file", envPath, "pull")
-	return dockerRun([]string{"DP_IMAGE_TAG=" + tag}, "docker", args...)
+	return dockerRun(env, "docker", args...)
 }
 
 // bundleBoxLines summarises the refresh for the upgrade's final box, and

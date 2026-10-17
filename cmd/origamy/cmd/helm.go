@@ -262,40 +262,49 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-// setEnvVar replaces (or appends) KEY=value in a dotenv file, preserving the rest.
+// The dotenv helpers below read an .env the way docker compose does: of
+// several KEY= lines, the last one wins.
+
+// setEnvVar sets KEY=value in a dotenv file: the last KEY= line is rewritten
+// and any earlier ones removed, so the one left is the value compose sees, or
+// KEY=value is appended. Every other line stays as it was.
 func setEnvVar(path, key, val string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 	lines := strings.Split(string(data), "\n")
-	found := false
+	last := -1
 	for i, l := range lines {
 		if strings.HasPrefix(l, key+"=") {
-			lines[i] = key + "=" + val
-			found = true
-			break
+			last = i
 		}
 	}
-	if !found {
+	if last >= 0 {
+		kept := make([]string, 0, len(lines))
+		for i, l := range lines {
+			switch {
+			case i == last:
+				kept = append(kept, key+"="+val)
+			case !strings.HasPrefix(l, key+"="):
+				kept = append(kept, l)
+			}
+		}
+		lines = kept
+	} else if n := len(lines); n > 0 && lines[n-1] == "" {
 		// Insert before the trailing "" that a newline-terminated file splits
 		// into, so the file stays newline-terminated with no blank line.
-		if n := len(lines); n > 0 && lines[n-1] == "" {
-			lines = append(lines[:n-1], key+"="+val, "")
-		} else {
-			lines = append(lines, key+"="+val, "")
-		}
+		lines = append(lines[:n-1], key+"="+val, "")
+	} else {
+		lines = append(lines, key+"="+val, "")
 	}
-	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
-		return err
-	}
-	// WriteFile only applies the mode when it creates the file; an .env an
-	// operator created 0644 must not stay world-readable once it holds secrets.
-	return os.Chmod(path, 0o600)
+	// 0600: an .env an operator created 0644 must not stay world-readable
+	// once it holds secrets.
+	return writeEnvFile(path, []byte(strings.Join(lines, "\n")), 0o600)
 }
 
-// unsetEnvVar removes KEY from a dotenv file, preserving the rest. A missing
-// key or file is not an error.
+// unsetEnvVar removes every KEY= line from a dotenv file, preserving the
+// rest. A missing key or file is not an error.
 func unsetEnvVar(path, key string) error {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -314,7 +323,58 @@ func unsetEnvVar(path, key string) error {
 	if len(kept) == len(lines) {
 		return nil
 	}
-	return os.WriteFile(path, []byte(strings.Join(kept, "\n")), 0o600)
+	mode := os.FileMode(0o600)
+	if fi, err := os.Stat(path); err == nil {
+		mode = fi.Mode().Perm()
+	}
+	return writeEnvFile(path, []byte(strings.Join(kept, "\n")), mode)
+}
+
+// writeEnvFile replaces a dotenv file's contents in one step, a file written
+// next to it and renamed over it, so a run that stops half-way (killed,
+// interrupted) never leaves it cut short: it holds the datastores'
+// passwords. A symbolic link is written through, to the file it points at.
+// An interrupt waits until it is done (exitGate).
+func writeEnvFile(path string, data []byte, mode os.FileMode) error {
+	if target, err := filepath.EvalSymlinks(path); err == nil {
+		path = target
+	}
+	exitGate.Lock()
+	defer exitGate.Unlock()
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	_, err = tmp.Write(data)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(name, mode)
+	}
+	if err == nil {
+		err = os.Rename(name, path)
+	}
+	if err != nil {
+		_ = os.Remove(name)
+	}
+	return err
+}
+
+// envKeyCount is how many KEY= lines a dotenv file has.
+func envKeyCount(path, key string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, l := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(l, key+"=") {
+			n++
+		}
+	}
+	return n
 }
 
 // envHasKey reports whether a dotenv file sets KEY at all (even to "").
@@ -331,17 +391,20 @@ func envHasKey(path, key string) bool {
 	return false
 }
 
+// readEnvVar returns KEY's value in a dotenv file: the last KEY= line's, as
+// compose reads it ("" when there is none).
 func readEnvVar(path, key string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
+	val := ""
 	for _, l := range strings.Split(string(data), "\n") {
 		if v, ok := strings.CutPrefix(l, key+"="); ok {
-			return strings.TrimSpace(v)
+			val = strings.TrimSpace(v)
 		}
 	}
-	return ""
+	return val
 }
 
 func orDash(s string) string {

@@ -1,15 +1,17 @@
 package cmd
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/qubelylabs/origamy-cli/internal/ui"
@@ -17,17 +19,17 @@ import (
 
 // ── One run per Docker project ───────────────────────────────────────────────
 
-// projectLockFile, in a Docker project's directory, is held by the one
-// `origamy upgrade` or in-place `origamy deploy` working on it. Two at once
-// could interleave one's storage-reset drop with the other's checks of the
-// events table, or swap bundle files under each other.
+// projectLockFile, in a Docker project's directory, is locked by the one
+// `origamy upgrade`, `origamy deploy` or `origamy uninstall` working on it.
+// Two at once could interleave one's storage reset with the other's checks of
+// the events table, or swap bundle files under each other.
 const projectLockFile = ".origamy.lock"
 
 // projectLock is what a lock file says about the run holding it.
 type projectLock struct {
-	pid              int
-	host, started    string
-	command, rawText string
+	pid           int
+	host, started string
+	command       string
 }
 
 func (l projectLock) String() string {
@@ -41,13 +43,12 @@ func (l projectLock) describe() string {
 }
 
 // readProjectLock parses a lock file; ok is false when it does not name a
-// process (empty, truncated, someone else's file).
+// process (empty, not written yet, someone else's file).
 func readProjectLock(path string) (l projectLock, ok bool) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return projectLock{}, false
 	}
-	l.rawText = string(b)
 	for _, line := range strings.Split(string(b), "\n") {
 		k, v, _ := strings.Cut(line, "=")
 		switch strings.TrimSpace(k) {
@@ -64,8 +65,8 @@ func readProjectLock(path string) (l projectLock, ok bool) {
 	return l, l.pid > 0
 }
 
-// errProjectLocked is a lock another run holds (or a lock file that cannot
-// be read).
+// errProjectLocked is a lock another run holds; held is what its file says
+// (ok false when it says nothing yet).
 type errProjectLocked struct {
 	path string
 	held projectLock
@@ -74,57 +75,69 @@ type errProjectLocked struct {
 
 func (e *errProjectLocked) Error() string {
 	if !e.ok {
-		return e.path + " exists but does not name the run holding it"
+		return e.path + " is held by another run"
 	}
 	return "held by " + e.held.describe()
 }
 
+// errLockHeld is what lockFile returns when another open file holds the lock.
+var errLockHeld = errors.New("the lock is held")
+
 // lockProject takes dir's lock for command, which a refused run names. The
-// lock file is created exclusively (O_EXCL) and records the process, host and
-// start time. A lock left on this host by a process that is gone (killed,
-// crashed, interrupted) is taken over; one held by a live process, by another
-// host (its process cannot be checked from here), or that cannot be read is
-// refused with errProjectLocked. unlock removes it (only while it is still
-// this run's), and so does a prompt that ends the CLI (exitNow).
+// lock is the operating system's advisory lock on .origamy.lock (flock;
+// LockFileEx on Windows), held by this process's open file: a run that is
+// killed, crashes or is interrupted gives it up with its process, so there
+// is no stale lock to take over, and a file such a run left behind is simply
+// locked again. Held by another run, it is refused with errProjectLocked,
+// naming the process, host, start time and command the file records.
+// unlock removes the file and gives the lock up, and so does a prompt or a
+// signal that ends the CLI (exitNow).
 func lockProject(dir, command string) (unlock func(), err error) {
 	path := filepath.Join(dir, projectLockFile)
 	host, _ := os.Hostname()
 	me := projectLock{pid: os.Getpid(), host: host, started: time.Now().UTC().Format(time.RFC3339), command: command}
-	body := []byte(me.String())
-	for range 2 {
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-		if err == nil {
-			_, werr := f.Write(body)
-			if cerr := f.Close(); werr == nil {
-				werr = cerr
-			}
-			if werr != nil {
-				_ = os.Remove(path)
-				return nil, werr
-			}
-			return onExit(func() {
-				if b, err := os.ReadFile(path); err == nil && bytes.Equal(b, body) {
-					_ = os.Remove(path)
-				}
-			}), nil
-		}
-		if !errors.Is(err, os.ErrExist) {
+	for range 10 {
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
 			return nil, err
 		}
-		held, ok := readProjectLock(path)
-		if !ok || held.host != host || held.pid == me.pid || processAlive(held.pid) {
-			return nil, &errProjectLocked{path: path, held: held, ok: ok}
-		}
-		// Stale: removed only while it still says what was judged stale.
-		if b, err := os.ReadFile(path); err == nil && string(b) == held.rawText {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return nil, err
+		if err := lockFile(f); err != nil {
+			_ = f.Close()
+			if errors.Is(err, errLockHeld) {
+				held, ok := readProjectLock(path)
+				return nil, &errProjectLocked{path: path, held: held, ok: ok}
 			}
-			ui.Step("Removed the lock an earlier run left in %s (%s; that process is gone).", projectLockFile, held.describe())
+			return nil, err
 		}
+		// The run that held it may have removed the file between this run's
+		// open and its lock: the lock is then on a file no other run opens.
+		if !samePath(f, path) {
+			_ = unlockFile(f)
+			_ = f.Close()
+			continue
+		}
+		body := []byte(me.String())
+		err = f.Truncate(0)
+		if err == nil {
+			_, err = f.WriteAt(body, 0)
+		}
+		if err != nil {
+			releaseLock(f, path)
+			return nil, err
+		}
+		return onExit(func() { releaseLock(f, path) }), nil
 	}
-	held, ok := readProjectLock(path)
-	return nil, &errProjectLocked{path: path, held: held, ok: ok}
+	return nil, fmt.Errorf("%s kept changing while it was being locked", path)
+}
+
+// samePath reports whether the open file f is still the one at path.
+func samePath(f *os.File, path string) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	pi, err := os.Stat(path)
+	return err == nil && os.SameFile(fi, pi)
 }
 
 // lockFail explains a lock lockProject could not take; nothing was done.
@@ -133,15 +146,15 @@ func lockFail(err error, nothing string) error {
 	switch {
 	case errors.As(err, &locked) && locked.ok:
 		return fail("Another origamy run is working on this data plane ("+locked.held.describe()+").",
-			"Wait for it to finish, then rerun. "+nothing+"\nIf no such run is going on (it was stopped on another host, say), remove "+locked.path+" and rerun.")
+			"Wait for it to finish, then rerun. "+nothing+"\nThe lock goes with that process: once it has ended, however it ended, the next run takes it.")
 	case errors.As(err, &locked):
-		return fail("Another origamy run may be working on this data plane: "+locked.path+" exists but does not say which.",
-			"Wait for any other origamy run here to finish. "+nothing+"\nIf none is going on, remove "+locked.path+" and rerun.")
+		return fail("Another origamy run is working on this data plane (it holds "+locked.path+").",
+			"Wait for it to finish, then rerun. "+nothing)
 	}
 	return fail("Could not take the lock that keeps two origamy runs off this data plane.", err.Error()+"\n"+nothing)
 }
 
-// ── Leaving the project as it was when a prompt ends the CLI ─────────────────
+// ── Leaving the project as it was when a prompt or a signal ends the CLI ────
 
 var (
 	exitMu    sync.Mutex
@@ -149,8 +162,9 @@ var (
 )
 
 // onExit registers f, which undoes something a run put in the project (its
-// lock, a bundle download), to run if a prompt ends the CLI (exitNow), which
-// skips deferred calls. done runs f instead; either way f runs once.
+// lock, a bundle download), to run if a prompt or a signal ends the CLI
+// (exitNow), which skips deferred calls. done runs f instead; either way f
+// runs once.
 func onExit(f func()) (done func()) {
 	var once sync.Once
 	h := new(func())
@@ -168,8 +182,12 @@ func onExit(f func()) (done func()) {
 	return *h
 }
 
+// exiting is set once the CLI is ending through exitNow.
+var exiting atomic.Bool
+
 // exitNow ends the CLI with code after the onExit hooks.
 func exitNow(code int) {
+	exiting.Store(true)
 	runExitHooks()
 	os.Exit(code)
 }
@@ -181,5 +199,51 @@ func runExitHooks() {
 	exitMu.Unlock()
 	for i := len(hooks) - 1; i >= 0; i-- {
 		(*hooks[i])()
+	}
+}
+
+// exitGate holds an interrupt (exitOnSignal) back while a step that must not
+// be cut in half runs: .env being replaced, the bundle files being swapped
+// in or put back.
+var exitGate sync.Mutex
+
+// interruptSignals end an upgrade or a deploy the way an answer that ends
+// the CLI does.
+var interruptSignals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}
+
+// exitOnSignal makes SIGINT, SIGTERM and SIGHUP end the run with exit code
+// 130 once the step under way (exitGate) is through, after the onExit hooks:
+// the bundle download is removed and the lock given up rather than left in
+// the project. stop undoes it; when a signal is already ending the run, the
+// run stops there and leaves the exit to it (the command the signal cut
+// short may have returned first).
+func exitOnSignal() (stop func()) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, interruptSignals...)
+	done, caught := make(chan struct{}), make(chan struct{})
+	go func() {
+		select {
+		case s := <-ch:
+			close(caught)
+			exitGate.Lock()
+			fmt.Println()
+			ui.Fail("Interrupted (%s).", s)
+			exitNow(130)
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			signal.Stop(ch)
+			close(done)
+		})
+		select {
+		case <-caught:
+			if !exiting.Load() {
+				select {} // exitNow(130) ends the process
+			}
+		default:
+		}
 	}
 }

@@ -75,20 +75,22 @@ func TestDeployResetPlan(t *testing.T) {
 		tag, answers string
 		target       string // "" = nothing to do
 		found        string
+		discard      bool // agreed to, here or by the upgrade that began the reset
 		asked        bool
 		says         string
 	}{
-		{"nothing pending, the new table", plain, live("json"), "0.1.20", "", "", "", false, ""},
-		{"nothing pending, the pre-reset table (liveSchemaMismatch refuses it)", plain, live("string"), "0.1.20", "", "", "", false, ""},
-		{"nothing pending, no table, a release before the reset", plain, missing, "0.1.17", "", "", "", false, ""},
+		{"nothing pending, the new table", plain, live("json"), "0.1.20", "", "", "", false, false, ""},
+		{"nothing pending, the pre-reset table (liveSchemaMismatch refuses it)", plain, live("string"), "0.1.20", "", "", "", false, false, ""},
+		{"nothing pending, no table, a release before the reset", plain, missing, "0.1.17", "", "", "", false, false, ""},
 		// No events table under a release that writes the new schema: the
-		// deploy creates it; nothing to drop, so nothing is asked.
-		{"nothing pending, no table", plain, missing, "0.1.20", "", "0.1.20", liveMissing, false, "this deploy creates it with the new schema"},
-		{"pending, the pre-reset table", pending, live("string"), "0.1.20", "yes\n", "0.1.20", "string", true, "did not finish it"},
-		{"pending, no table", pending, missing, "0.1.20", "", "0.1.20", liveMissing, false, "nothing is dropped: this deploy creates it"},
+		// deploy creates it; nothing to drop, so nothing is asked, and
+		// nothing an earlier run moved aside is discarded.
+		{"nothing pending, no table", plain, missing, "0.1.20", "", "0.1.20", liveMissing, false, false, "this deploy creates it with the new schema"},
+		{"pending, the pre-reset table", pending, live("string"), "0.1.20", "yes\n", "0.1.20", "string", true, true, "did not finish it"},
+		{"pending, no table", pending, missing, "0.1.20", "", "0.1.20", liveMissing, true, false, "no events table now: this deploy creates it"},
 		// Another CLI finished it, or the record outlived the reset: nothing
 		// to drop or create, so nothing is asked, whatever the bundle.
-		{"pending, the new table", pending, live("json"), "0.1.20", "", "0.1.20", "json", false, "already holds the new events table"},
+		{"pending, the new table", pending, live("json"), "0.1.20", "", "0.1.20", "json", true, false, "already holds the new events table"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeCompose(t)
@@ -99,10 +101,11 @@ func TestDeployResetPlan(t *testing.T) {
 				r = servedBundle(t, t.TempDir(), compose248, stringSchemaSQL)
 			}
 			var target, found string
+			var discard bool
 			var err error
-			out := captureStdout(t, func() { target, found, err = deployResetPlan(dir, tc.tag, tc.live, r) })
-			if err != nil || target != tc.target || found != tc.found || strings.Contains(out, asked) != tc.asked || !strings.Contains(out, tc.says) {
-				t.Fatalf("got %q, %q, %v\n%s", target, found, err, out)
+			out := captureStdout(t, func() { target, found, discard, err = deployResetPlan(dir, tc.tag, tc.live, r) })
+			if err != nil || target != tc.target || found != tc.found || discard != tc.discard || strings.Contains(out, asked) != tc.asked || !strings.Contains(out, tc.says) {
+				t.Fatalf("got %q, %q, %v, %v\n%s", target, found, discard, err, out)
 			}
 			if tc.target == "" && len(f.calls) != 0 {
 				t.Fatalf("Docker was asked: %v", f.calls)
@@ -139,7 +142,7 @@ func TestDeployResetPlan(t *testing.T) {
 			r := servedBundle(t, dir, tc.compose, tc.initSQL)
 			var target, found string
 			var err error
-			out := captureStdout(t, func() { target, found, err = deployResetPlan(dir, tc.tag, tc.live, r) })
+			out := captureStdout(t, func() { target, found, _, err = deployResetPlan(dir, tc.tag, tc.live, r) })
 			if target != "" || found != "" || err == nil || !strings.Contains(out, tc.want) || !strings.Contains(out, "Nothing has been enrolled") {
 				t.Fatalf("got %q, %q, %v\n%s", target, found, err, out)
 			}
@@ -226,6 +229,9 @@ func TestPlanDockerTouchesNothing(t *testing.T) {
 		{"ClickHouse cannot be started", func(f *fakeCompose) { f.stopped, f.startFails = true, true }, "0.1.20", "ClickHouse could not be asked which events table this plane holds"},
 		{"another type", func(f *fakeCompose) { f.live = "Nullable(String)\t" + eventsColumnMark + "\n" }, "0.1.20", "neither the pre-reset (String) nor the new (JSON) schema"},
 		{"the new table, a release before the reset", func(f *fakeCompose) { f.live = liveJSONRow }, "0.1.17", "which data-plane release 0.1.17 cannot write to"},
+		// The volume's pre-reset table is one 0.1.17 writes, but the schema
+		// the deploy would install is the new one: refused too.
+		{"the pre-reset table, a release before the reset, the new bundle", func(f *fakeCompose) { f.live = liveStringRow }, "0.1.17", "serves the current ClickHouse schema (native JSON payload columns), which data-plane release 0.1.17 cannot write to"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, parent := deployProject(t, compose248, stringSchemaSQL, "main")
@@ -341,5 +347,63 @@ func TestApplyDockerInPlace(t *testing.T) {
 				t.Fatalf("project after the deploy:\n%v", p.snapshot(t))
 			}
 		})
+	}
+}
+
+// TestApplyDockerPinsTheRelease (cardinal rule 2): an in-place deploy gives
+// every docker compose command the release it installs, whatever the shell
+// exports, and fails, without "Deployed", when what then runs is not it.
+func TestApplyDockerPinsTheRelease(t *testing.T) {
+	t.Setenv("COMPOSE_FILE", "")
+	t.Setenv("DP_IMAGE_TAG", "0.1.17")
+	tok := func(base string) *token.Enrollment {
+		return &token.Enrollment{ID: "dp-1", Tok: "tok", Addr: "tunnel.example.com:443", URL: base}
+	}
+	for _, pinned := range []string{"", "0.1.17"} {
+		t.Run("pinned "+pinned, func(t *testing.T) {
+			p, parent := deployProject(t, compose253, jsonSchemaSQL, "0.1.19")
+			f := newFakeCompose(t)
+			f.live, f.runTag = liveJSONRow, pinned
+			plan, out, err := planIn(t, parent, "0.1.20", p.base)
+			if err != nil || !strings.Contains(out, "DP_IMAGE_TAG=0.1.17 is exported in your shell") {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			defer plan.close()
+			n := len(f.calls)
+			out = captureStdout(t, func() { err = applyDocker(tok(p.base), nil, plan) })
+			for _, c := range composeCalls(f.since(n)) {
+				if !strings.HasPrefix(c, "DP_IMAGE_TAG=0.1.20 docker compose ") {
+					t.Fatalf("not given the release: %q", c)
+				}
+			}
+			if pinned == "" && (err != nil || !strings.Contains(out, "Deployed")) {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			if pinned != "" && (err == nil || strings.Contains(out, "Deployed") || !strings.Contains(out, "portal-agent runs ghcr.io/qubelylabs/origamy-data-plane/portal-agent:0.1.17")) {
+				t.Fatalf("%v\n%s", err, out)
+			}
+		})
+	}
+}
+
+// TestDeployRepairsABrokenComposeFile: re-deploying a plane whose
+// docker-compose.yml does not parse asks ClickHouse through the container
+// compose made, and the bundle the deploy installs repairs the project.
+func TestDeployRepairsABrokenComposeFile(t *testing.T) {
+	t.Setenv("COMPOSE_FILE", "")
+	t.Setenv("COMPOSE_PROJECT_NAME", "")
+	p, parent := deployProject(t, compose253+brokenCompose, jsonSchemaSQL, "0.1.19")
+	f := newFakeCompose(t)
+	f.live, f.container = liveJSONRow, "0123456789ab"
+	plan, out, err := planIn(t, parent, "0.1.20", p.base)
+	if err != nil || !strings.Contains(out, "Asked ClickHouse through its container") || callIndex(f.calls, "label=com.docker.compose.project=origamy-dp-dp-1 ") < 0 {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	defer plan.close()
+	out = captureStdout(t, func() {
+		err = applyDocker(&token.Enrollment{ID: "dp-1", Tok: "tok", Addr: "tunnel.example.com:443", URL: p.base}, nil, plan)
+	})
+	if err != nil || !strings.Contains(out, "Deployed") || p.read(t, "docker-compose.yml") != compose253 || !strings.Contains(p.read(t, "docker-compose.yml.bak-0.1.19"), brokenCompose) {
+		t.Fatalf("%v\n%s", err, out)
 	}
 }

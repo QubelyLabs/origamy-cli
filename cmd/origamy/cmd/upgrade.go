@@ -3,6 +3,7 @@ package cmd
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +34,9 @@ values from a clean export so the chart's own defaults for the new service fill
 in; on Docker it flips the "agentic" compose profile (generating the engine's
 KEK + API token locally the first time). Either way your datastores are never
 touched, and the engine stays inert until you enable AI and add an LLM
-credential in your dashboard.
+credential in your dashboard. On Docker .env takes the toggle only once the
+upgrade is through: one that fails or is refused before (a failed pull, say)
+leaves .env as it was.
 
 Use --enable-predictor / --disable-predictor the same way for the predictor
 (conversion scoring) service — Kubernetes only.
@@ -45,19 +48,24 @@ collected so far (profiles, traits, segments and journeys are kept). The
 upgrade explains this and asks for confirmation; pass --yes to skip the
 prompt. On Docker the running ClickHouse decides, never the tags or
 clickhouse-init.sql: for a release that writes the JSON columns, an events
-table with String columns is dropped (asking first) and a missing one
-created (nothing to ask); one that already has the JSON columns is never
-dropped, and moving it to a release before ` + minImageForJSONSchema + `, or an events table
-of any other type, is refused. A ClickHouse that does not answer is started
-on the release and files the project runs now and asked again; when it
-still cannot be asked, the upgrade is refused. The reset runs only on
-ClickHouse 25.3 or newer (as the project's compose configuration, overrides
-included, names it) with your control plane's new schema, and one that
-fails half-way is recorded in .env (` + resetPendingVar + `): the next upgrade
-finishes it before anything else. Once the services are up again, the
-upgrade checks that ClickHouse holds the events table the release writes,
-and fails when it does not (recording the reset still to do). One upgrade
-or in-place deploy works on a project at a time (` + projectLockFile + ` in it).
+table with String columns is moved aside (renamed) and dropped once the new
+one is in place (asking first), and a missing one created (nothing to ask);
+one that already has the JSON columns is never dropped, and moving it to a
+release before ` + minImageForJSONSchema + `, or an events table of any other type, is refused.
+A ClickHouse that does not answer is started on the release and files the
+project runs now and asked again; when it still cannot be asked, the upgrade
+is refused. The reset runs only on ClickHouse 25.3 or newer (as the
+project's compose configuration, overrides included, names it) with your
+control plane's new schema, and one that fails half-way is recorded in .env
+(` + resetPendingVar + `): the next upgrade finishes it before anything else.
+Once the services are up again, the upgrade checks that ClickHouse holds
+the events table the release writes, and that the containers run the
+release's images (every docker compose command gets the release in
+DP_IMAGE_TAG, whatever the shell exports), and fails when they do not
+(recording the reset still to do). One upgrade, in-place deploy or
+uninstall works on a project at a time (an operating system lock on
+` + projectLockFile + ` in it, gone with its process); Ctrl-C ends an upgrade with exit
+code 130 and leaves neither the lock nor a download.
 
 Config signing: a key stored at deploy (Docker: ` + signingKeyCopyVar + ` in .env;
 Kubernetes: the ` + configSigningSecret + ` Secret) is applied once the target release is
@@ -506,63 +514,78 @@ type resetOutcome int
 
 const (
 	resetNone    resetOutcome = iota // no reset ran
-	resetDropped                     // the pre-reset table was dropped and the new one created
-	resetCreated                     // there was no events table (an earlier run dropped it): it was created, nothing dropped
-	resetAlready                     // ClickHouse already held the new table: nothing dropped or created
+	resetDropped                     // the pre-reset table was moved aside and the new one created
+	resetCreated                     // there was no events table (an earlier run moved it aside or dropped it): it was created
+	resetAlready                     // ClickHouse already held the new table: nothing moved or created
 )
+
+// resetResult is what a Docker storage reset did: its outcome, and the tables
+// a reset moved aside (events.events_pre_reset_…) that it dropped once the
+// new one was in place, or kept in ClickHouse (see settleAside).
+type resetResult struct {
+	outcome       resetOutcome
+	dropped, kept []string
+}
 
 // resetDockerEvents recreates a Docker project's events table with the schema
 // now in clickhouse-init.sql. ClickHouse is first brought up on the image the
 // project's compose file names now and waited for: a refreshed bundle moves it
 // to a newer server (24.8 → 25.3 for a project from before the reset), whose
 // JSON columns the new schema needs, and the old container would otherwise
-// still be the one running until the `up -d` after this.
+// still be the one running until the `up -d` after this. env is the compose
+// environment of the run (tagEnv(tag), and what it sets before .env does).
 //
 // What ClickHouse holds then decides, held against what it held when the run
-// made its decision (found, a probeLiveSchema generation): the table is
-// dropped only when ClickHouse says it is the pre-reset one (String payload
+// made its decision (found, a probeLiveSchema generation): the table is moved
+// aside only when ClickHouse says it is the pre-reset one (String payload
 // columns) and the run asked to drop it (found "string"); the schema is
 // applied to that or to no table, unless the run found the new one (it then
-// only checks); the new table is left alone. Nothing is dropped or applied
-// unless clickhouse-init.sql is the new schema. The reset counts as done
-// only once ClickHouse reports the new table: the bundle's init service exits
-// 0 even when a statement fails.
-func resetDockerEvents(dir, envPath, tag, found string) (resetOutcome, error) {
-	env := []string{"DP_IMAGE_TAG=" + tag}
+// only checks); the new table is left alone. Nothing is moved or applied
+// unless clickhouse-init.sql is the new schema. Moved aside is RENAME TABLE
+// events.events TO events.events_pre_reset_<unix time>, not DROP: the reset
+// counts as done only once ClickHouse reports the new table (the bundle's
+// init service exits 0 even when a statement fails), and only then is the
+// table moved aside dropped, while it is the pre-reset one (settleAside).
+// discard says the operator agreed to discard the pre-reset table (this run
+// asked, or the run that began the reset did), which drops what an earlier
+// run moved aside too.
+func resetDockerEvents(dir, envPath, tag, found string, env []string, discard bool) (resetResult, error) {
 	compose := func(args ...string) (string, error) {
 		return dockerRun(env, "docker", append([]string{"compose", "--project-directory", dir, "--env-file", envPath}, args...)...)
 	}
+	ch := clickhouseConn{dir: dir, envPath: envPath, env: env}
+	none := resetResult{}
 	// Every failure leaves the reset recorded in .env, and a rerun finishes it.
 	rerun := "rerun `" + upgradeCommand(tag) + "`: the unfinished reset is recorded in .env (" + resetPendingVar + ") and is finished before anything else."
 	sp := ui.Start("Starting ClickHouse")
 	if out, err := compose("up", "-d", "clickhouse"); err != nil {
 		sp.Fail("Could not start ClickHouse")
-		return resetNone, fail("ClickHouse did not start, so the events table was not reset yet.", outputHint(out)+"Fix the cause, then "+rerun)
+		return none, fail("ClickHouse did not start, so the events table was not reset yet.", outputHint(out)+"Fix the cause, then "+rerun)
 	}
-	if out, ok := waitClickHouse(dir, envPath, env); !ok {
+	if out, ok := ch.wait(); !ok {
 		sp.Fail("ClickHouse did not answer within %s", clickhouseReadyTimeout)
-		return resetNone, fail("ClickHouse is not accepting queries, so the events table was not reset yet.",
+		return none, fail("ClickHouse is not accepting queries, so the events table was not reset yet.",
 			outputHint(out)+"Check: docker compose --project-directory "+dir+" --env-file "+envPath+" logs clickhouse\nOnce it answers, "+rerun)
 	}
 	sp.Success("ClickHouse is up")
 
 	sp = ui.Start("Checking the events table")
-	live := probeLiveSchema(dir, envPath, env)
+	live := ch.probe()
 	switch {
 	case live.gen == "json":
-		sp.Success("ClickHouse already holds the new events table (%s payload columns): nothing to drop", live.typ)
-		return resetAlready, nil
+		sp.Success("ClickHouse already holds the new events table (%s payload columns): nothing to move aside", live.typ)
+		return settleAside(dir, envPath, compose, ch, resetResult{outcome: resetAlready}, "", discard), nil
 	case live.gen == "":
 		sp.Fail("ClickHouse did not say which events table it holds")
-		return resetNone, fail("Could not read which events table ClickHouse holds, so nothing was dropped.", outputHint(live.out)+"Once it answers, "+rerun)
+		return none, fail("Could not read which events table ClickHouse holds, so nothing was dropped.", outputHint(live.out)+"Once it answers, "+rerun)
 	case live.gen == liveOther:
 		sp.Fail("Unexpected events table")
-		return resetNone, fail(fmt.Sprintf("ClickHouse's %s has payload columns of type %s, neither the pre-reset (String) nor the new (JSON) schema, so the reset did not drop it.", eventsTable, live.typ),
+		return none, fail(fmt.Sprintf("ClickHouse's %s has payload columns of type %s, neither the pre-reset (String) nor the new (JSON) schema, so the reset did not drop it.", eventsTable, live.typ),
 			"Check what created it. To recreate it with the new schema, drop it yourself:\n"+
 				"  docker compose --project-directory "+dir+" --env-file "+envPath+" exec clickhouse sh -c '"+strings.ReplaceAll(clickhouseDropEvents, " IF EXISTS", "")+"'\nthen "+rerun)
 	case (live.gen == "string" && found != "string") || (live.gen == liveMissing && found == "json"):
 		sp.Fail("ClickHouse holds %s", live.describe())
-		return resetNone, fail("ClickHouse holds "+live.describe()+", although it held "+liveSchema{gen: found}.describe()+" when this run began, so this run changed nothing in it.",
+		return none, fail("ClickHouse holds "+live.describe()+", although it held "+liveSchema{gen: found}.describe()+" when this run began, so this run changed nothing in it.",
 			"Rerun `"+upgradeCommand(tag)+"`: it asks again, before it drops anything.")
 	case live.gen == "string":
 		sp.Success("ClickHouse holds the pre-reset events table (String payload columns)")
@@ -570,41 +593,126 @@ func resetDockerEvents(dir, envPath, tag, found string) (resetOutcome, error) {
 		sp.Success("ClickHouse has no events table")
 	}
 	// The init service applies the project's clickhouse-init.sql: it must be
-	// the schema the reset moves to before anything is dropped.
+	// the schema the reset moves to before anything is moved or created.
 	if sql, err := os.ReadFile(filepath.Join(dir, "clickhouse-init.sql")); err != nil || schemaGeneration(string(sql)) != "json" {
 		sp.Fail("clickhouse-init.sql is not the new schema")
-		return resetNone, fail("clickhouse-init.sql in "+dir+" is not the new ClickHouse schema (native JSON payload columns), so nothing was dropped or created.",
+		return none, fail("clickhouse-init.sql in "+dir+" is not the new ClickHouse schema (native JSON payload columns), so nothing was dropped or created.",
 			"Put the "+tag+" schema there (`"+upgradeCommand(tag)+"` takes your control plane's current one), then "+rerun)
 	}
 
 	sp = ui.Start("Creating the events table with the new schema")
-	outcome, did, done := resetCreated, "The new schema", "Events table created"
+	outcome, did, done, aside, kept := resetCreated, "The new schema", "Events table created", "", ""
 	if live.gen == "string" {
-		sp.Suffix("the pre-reset one is dropped first")
-		if out, err := compose("exec", "-T", "clickhouse", "sh", "-c", clickhouseDropEvents); err != nil {
-			sp.Fail("Could not drop the old events table")
-			return resetNone, fail("The old events table could not be dropped.", outputHint(out)+"Fix the cause, then "+rerun)
+		aside = asideName(ch)
+		sp.Suffix("the pre-reset one is moved aside first, as events.%s", aside)
+		if out, err := compose("exec", "-T", "clickhouse", "sh", "-c", clickhouseMoveEventsAside(aside)); err != nil {
+			sp.Fail("Could not move the old events table aside")
+			return none, fail("The old events table could not be moved aside (renamed to events."+aside+"), so nothing was changed in ClickHouse.", outputHint(out)+"Fix the cause, then "+rerun)
 		}
-		outcome, did, done = resetDropped, "The old events table was dropped, but the new schema", "Events table recreated"
+		outcome, did, done = resetDropped, "The old events table was moved aside, but the new schema", "Events table recreated"
+		kept = "The pre-reset events table is events." + aside + " now, its data still there: the next run drops it once the new table is in place.\n"
 	}
 	out, err := compose("run", "--rm", "--no-deps", "clickhouse-init")
 	if err != nil {
 		sp.Fail("Schema init failed")
-		return resetNone, fail(did+" could not be applied.", outputHint(out)+"Fix the cause, then "+rerun)
+		return none, fail(did+" could not be applied.", kept+outputHint(out)+"Fix the cause, then "+rerun)
 	}
-	switch got := probeLiveSchema(dir, envPath, env); got.gen {
+	switch got := ch.probe(); got.gen {
 	case "json":
 	case "":
 		sp.Fail("Could not confirm the new events table")
-		return resetNone, fail("The schema was applied, but ClickHouse could not be asked whether "+eventsTable+" is the new table now.", outputHint(got.out)+"Once it answers, "+rerun)
+		return none, fail("The schema was applied, but ClickHouse could not be asked whether "+eventsTable+" is the new table now.", kept+outputHint(got.out)+"Once it answers, "+rerun)
 	default:
 		sp.Fail("The events table is not the new one")
 		have := map[string]string{"string": "still the pre-reset one (String payload columns)", liveMissing: "missing", liveOther: "of type " + got.typ}[got.gen]
-		return resetNone, fail("The schema was applied, but ClickHouse's "+eventsTable+" is "+have+" afterwards.",
-			outputHint(out)+"The schema's output is above. Fix the cause (docker compose --project-directory "+dir+" --env-file "+envPath+" logs clickhouse), then "+rerun)
+		return none, fail("The schema was applied, but ClickHouse's "+eventsTable+" is "+have+" afterwards.",
+			kept+outputHint(out)+"The schema's output is above. Fix the cause (docker compose --project-directory "+dir+" --env-file "+envPath+" logs clickhouse), then "+rerun)
 	}
 	sp.Success("%s", done)
-	return outcome, nil
+	return settleAside(dir, envPath, compose, ch, resetResult{outcome: outcome}, aside, discard || aside != ""), nil
+}
+
+// asideName is the name the reset moves the pre-reset events table to,
+// events_pre_reset_<unix time>, one no table moved aside before has.
+func asideName(ch clickhouseConn) string {
+	taken := map[string]bool{}
+	if out, err := ch.exec(clickhouseAsideTables); err == nil {
+		for name := range asideTables(out) {
+			taken[name] = true
+		}
+	}
+	for n := time.Now().Unix(); ; n++ {
+		if name := fmt.Sprintf("%s%d", eventsAsidePrefix, n); !taken[name] {
+			return name
+		}
+	}
+}
+
+// asideTables reads clickhouseAsideTables' answer: name → payload type.
+func asideTables(out string) map[string]string {
+	tables := map[string]string{}
+	for _, l := range strings.Split(out, "\n") {
+		f := strings.Split(strings.TrimSpace(l), "\t")
+		if len(f) == 3 && f[2] == eventsAsideMark && reAsideTable.MatchString(f[0]) {
+			tables[f[0]] = f[1]
+		}
+	}
+	return tables
+}
+
+// settleAside ends a storage reset once ClickHouse holds the new events
+// table. Each table a reset moved aside, this run (moved) or an earlier one
+// that stopped before it got this far, is dropped when it is the pre-reset
+// one (String payload columns) and the operator agreed to discard it
+// (discard), and kept otherwise: one with the new (JSON) columns means the
+// events table changed between the check and the move, and is kept with how
+// to put it back. A table that cannot be checked or dropped is kept too.
+func settleAside(dir, envPath string, compose func(...string) (string, error), ch clickhouseConn, r resetResult, moved string, discard bool) resetResult {
+	run := "docker compose --project-directory " + dir + " --env-file " + envPath + " exec clickhouse sh -c '"
+	out, err := ch.exec(clickhouseAsideTables)
+	if err != nil {
+		if moved != "" {
+			r.kept = append(r.kept, moved)
+			ui.Warn("Could not check events.%s, where the pre-reset events table was moved, so it was not dropped (%s). Drop it yourself once you no longer need its data:", moved, orDash(lastLines(out, 1)))
+			ui.Detail("%s", run+clickhouseDropAside(moved)+"'")
+		}
+		return r
+	}
+	tables := asideTables(out)
+	if _, ok := tables[moved]; moved != "" && !ok {
+		r.kept = append(r.kept, moved)
+		ui.Warn("ClickHouse no longer lists events.%s, where the pre-reset events table was moved: nothing was dropped.", moved)
+	}
+	names := slices.Sorted(maps.Keys(tables))
+	for _, name := range names {
+		typ := tables[name]
+		switch {
+		case strings.HasPrefix(typ, "String") && discard:
+			sp := ui.Start("Dropping events.%s, the pre-reset events table moved aside", name)
+			if out, err := compose("exec", "-T", "clickhouse", "sh", "-c", clickhouseDropAside(name)); err != nil {
+				r.kept = append(r.kept, name)
+				sp.Warn("Could not drop events.%s (%s); it is kept, with the pre-reset event history. Drop it yourself once you no longer need it:", name, orDash(lastLines(out, 1)))
+				ui.Detail("%s", run+clickhouseDropAside(name)+"'")
+				continue
+			}
+			r.dropped = append(r.dropped, name)
+			sp.Success("Dropped events.%s, the pre-reset events table", name)
+		case strings.HasPrefix(typ, "String"):
+			r.kept = append(r.kept, name)
+			ui.Warn("events.%s holds a pre-reset events table an earlier upgrade moved aside; it is kept. Drop it yourself once you no longer need its data:", name)
+			ui.Detail("%s", run+clickhouseDropAside(name)+"'")
+		case strings.HasPrefix(typ, "JSON"):
+			r.kept = append(r.kept, name)
+			ui.Warn("events.%s, which a storage reset moved aside, has the new (JSON) payload columns: %s changed between the check and the move. It is kept, with its data; the %s in its place is new. To put it back (the new one then goes by events.%s, to drop):", name, eventsTable, eventsTable, name)
+			ui.Detail("%s", run+clickhouseRestoreAside(name)+"'")
+			ui.Detail("%s", run+clickhouseDropAside(name)+"'")
+		default:
+			r.kept = append(r.kept, name)
+			ui.Warn("events.%s, which a storage reset moved aside, has payload columns of type %s; it is kept. Drop it yourself once you no longer need it:", name, typ)
+			ui.Detail("%s", run+clickhouseDropAside(name)+"'")
+		}
+	}
+	return r
 }
 
 // clearResetRecord removes resetPendingVar once the reset is done and the
@@ -619,13 +727,13 @@ func clearResetRecord(envPath, tag string) error {
 
 // restartMounts restarts the services that bind-mount bundle files (svcs)
 // after `up -d`, run in the project at dir (compose's own arguments, e.g. the
-// project directory and env file, in args), and reports whether every one
-// restarted.
-func restartMounts(svcs []string, args ...string) bool {
+// project directory and env file, in args; its environment in env), and
+// reports whether every one restarted.
+func restartMounts(env, svcs []string, args ...string) bool {
 	ok := true
 	for _, svc := range svcs {
 		sp := ui.Start("Restarting %s for its new config file", svc)
-		if _, err := dockerRun(nil, "docker", append(append([]string{"compose"}, args...), "restart", svc)...); err != nil {
+		if _, err := dockerRun(env, "docker", append(append([]string{"compose"}, args...), "restart", svc)...); err != nil {
 			sp.Warn("Could not restart %s; run: docker compose %s restart %s", svc, strings.Join(args, " "), svc)
 			ok = false
 		} else {
@@ -636,16 +744,20 @@ func restartMounts(svcs []string, args ...string) bool {
 }
 
 // resetSummary is the summary box's account of a Docker storage reset.
-func resetSummary(o resetOutcome) string {
-	switch o {
-	case resetDropped:
+func resetSummary(r resetResult) string {
+	switch {
+	case r.outcome == resetNone:
+		return ui.Green("Named volumes (your data) were not touched.")
+	case len(r.kept) > 0:
+		return ui.Yellow("Storage reset finished: the events table is the new one. Kept in ClickHouse, not dropped (see above): events." + strings.Join(r.kept, ", events.") + ".")
+	case r.outcome == resetDropped:
 		return ui.Yellow("Event history was discarded (storage reset); profiles, traits, segments and journeys were kept.")
-	case resetCreated:
+	case r.outcome == resetCreated:
 		return ui.Yellow("Storage reset finished: the events table was created with the new schema (the event history from before the reset is gone); profiles, traits, segments and journeys were kept.")
-	case resetAlready:
-		return ui.Green("Storage reset finished: ClickHouse already held the new events table, so nothing was dropped.")
+	case len(r.dropped) > 0:
+		return ui.Yellow("Storage reset finished: ClickHouse already held the new events table; the pre-reset one an earlier run had moved aside was dropped.")
 	}
-	return ui.Green("Named volumes (your data) were not touched.")
+	return ui.Green("Storage reset finished: ClickHouse already held the new events table, so nothing was dropped.")
 }
 
 // outputHint is the tail of a failed command's output as the first lines of a
@@ -677,6 +789,9 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 		return lockFail(err, "Nothing has been changed.")
 	}
 	defer unlock()
+	// Ctrl-C, SIGTERM or SIGHUP end the run without leaving the lock or a
+	// bundle download behind.
+	defer exitOnSignal()()
 	installedTag := readEnvVar(envPath, "DP_IMAGE_TAG")
 	// The bundle download of an upgrade interrupted before its swap.
 	if stale := removeStaleBundleDirs(dir); len(stale) > 0 {
@@ -708,6 +823,7 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	case installedTag == dockerEdgeTag && targetSemver:
 		ui.Warn("Moving from the moving %s images to release %s may be a downgrade; pass --channel edge to stay on %s.", installedTag, tag, installedTag)
 	}
+	dockerTagNotes(envPath, tag)
 
 	// Storage reset. What the running ClickHouse holds decides, never the
 	// project's clickhouse-init.sql or the tags (dockerResetAction): the
@@ -768,8 +884,10 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// secrets locally on first use (the KEK is never regenerated afterwards —
 	// per-workspace LLM keys are encrypted under it) and points portal-agent
 	// at the engine; disabling drops the profile and that pointer, keeping the
-	// secrets so a later re-enable finds the same KEK. Written to .env once the
-	// checks below pass, before the pull (which pulls the profiles' images).
+	// secrets so a later re-enable finds the same KEK. Until the commit point
+	// below they are given to docker compose in its environment (runEnv),
+	// over .env, so the new compose file is validated and the profiles'
+	// images pulled with them; .env takes them only once the run is through.
 	profiles := composeProfiles(envPath)
 	aiVars := map[string]string{}
 	switch {
@@ -787,6 +905,13 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	if enableAI || disableAI {
 		aiVars["COMPOSE_PROFILES"] = strings.Join(profiles, ",")
 	}
+	// Every docker compose command before the commit point runs with this,
+	// and so does the `up -d` after it: .env holds the same values by then,
+	// and a COMPOSE_PROFILES the shell exports cannot undo the toggle.
+	runEnv := tagEnv(tag)
+	for _, k := range slices.Sorted(maps.Keys(aiVars)) {
+		runEnv = append(runEnv, k+"="+aiVars[k])
+	}
 	ui.KV("Directory", dir)
 	ui.KV("Image tag", tag)
 	ui.KV("Profiles", orDash(strings.Join(profiles, ",")))
@@ -795,7 +920,14 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// too, and only the control plane has them (bundle.go). They are
 	// refreshed when it serves the bundle for exactly this tag, and only the
 	// files nobody edited here.
-	refresh, bundleSkipped := planBundleRefresh(dir, envPath, base, tag, installedTag, bundle, reset)
+	refresh, bundleSkipped := planBundleRefresh(dir, envPath, base, tag, installedTag, runEnv, bundle, reset)
+	// The download goes with the run, however it ends (a prompt or a signal
+	// that ends the CLI removes it too: prepareBundleRefresh).
+	defer func() {
+		if refresh != nil {
+			refresh.cleanup()
+		}
+	}()
 	// abort drops the prepared refresh (its download directory) on the way out.
 	abort := func(err error) error {
 		if refresh != nil {
@@ -879,34 +1011,32 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 			return abort(fail("Cancelled.", "Nothing has been changed."))
 		}
 	case create && pending != "":
-		ui.Step("An earlier upgrade to %s began the storage reset and did not finish it (%s in .env). ClickHouse has no events table now, so nothing is dropped: this run creates it with the new schema before %s starts.", pending, resetPendingVar, tag)
+		ui.Step("An earlier upgrade to %s began the storage reset and did not finish it (%s in .env). ClickHouse has no events table now: this run creates it with the new schema before %s starts (a pre-reset table the earlier run moved aside is dropped once it is in place).", pending, resetPendingVar, tag)
 	case create:
 		ui.Step("ClickHouse has no events table (an earlier upgrade can have dropped it without creating the new one): this run creates it with the new schema before %s starts; nothing is dropped.", tag)
 	case finish:
-		ui.Step("An earlier upgrade to %s recorded an unfinished storage reset (%s in .env), but ClickHouse already holds the new events table (%s payload columns): nothing is dropped, and the record is cleared once the services are up.", pending, resetPendingVar, live.typ)
+		ui.Step("An earlier upgrade to %s recorded an unfinished storage reset (%s in .env), but ClickHouse already holds the new events table (%s payload columns): it is kept, and the record is cleared once the services are up.", pending, resetPendingVar, live.typ)
 	case live.gen == "json" && schemaGeneration(string(keptSQL)) == "string":
 		// The file here is the pre-reset schema while ClickHouse is across.
 		// Harmless on this volume (its tables exist), wrong on a new one.
 		ui.Warn("clickhouse-init.sql here is the pre-reset schema (String payload columns), while ClickHouse already holds the new events table: nothing is dropped. A new, empty volume would get the wrong schema from it; replace it with the %s version before ever recreating that volume.", tag)
 	}
 
-	for k, v := range aiVars {
-		if err := setEnvVar(envPath, k, v); err != nil {
-			return abort(fail("Could not update .env.", err.Error()))
-		}
-	}
-
 	// Pull BEFORE touching the project: a tag that does not exist for one of
 	// the services (or a registry outage) must leave .env and the bundle files
 	// — and therefore every later `docker compose up` — on the release that is
 	// actually running. The process environment wins over the env file in
-	// compose interpolation, so the pull sees the candidate tag without
-	// writing it, and a refreshed compose file is pulled with from where it
-	// was downloaded, so images of services it adds come too.
+	// compose interpolation, so the pull sees the candidate tag and AI toggle
+	// (runEnv) without writing them, and a refreshed compose file is pulled
+	// with from where it was downloaded, so images of services it adds come
+	// too. Nothing in the project has been written up to here.
 	sp := ui.Start("Pulling %s images", tag)
-	if out, err := pullImages(dir, envPath, tag, refresh); err != nil {
+	if out, err := pullImages(dir, envPath, runEnv, refresh); err != nil {
 		sp.Fail("docker compose pull failed")
 		if refresh != nil {
+			if slices.Contains(refresh.kept(), "docker-compose.yml") {
+				ui.Step("Your edited docker-compose.yml is what was pulled with: when it is what fails, --replace-bundle takes the %s one (yours is backed up next to it).", tag)
+			}
 			refresh.cleanup()
 			ui.Step("Bundle files left as they were.")
 		}
@@ -922,8 +1052,8 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 		}
 	}
 	if refresh != nil {
-		if err := refresh.apply(); err != nil {
-			if rerr := refresh.rollback(); rerr != nil {
+		if err, rerr := refresh.swapIn(); err != nil {
+			if rerr != nil {
 				return fail("Could not swap in the new bundle files, nor put the previous ones back.",
 					err.Error()+"\n"+rerr.Error()+"\nThe backups are next to them in "+dir+" (*.bak-*).")
 			}
@@ -936,6 +1066,7 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 					err.Error()+"\nFix the cause and rerun `"+upgradeCommand(tag)+"`.")
 			}
 			ui.Warn("Bundle files left as-is: could not swap them in (%v)", err)
+			refresh.cleanup()
 			refresh, bundleSkipped = nil, "swap failed"
 		}
 	}
@@ -960,7 +1091,7 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// fetched above, written now) to a ClickHouse that holds the old table or
 	// none, before the services roll. A recorded reset ClickHouse had already
 	// finished is checked the same way, and nothing is dropped or applied.
-	outcome := resetNone
+	var outcome resetResult
 	var schemaWrite *resetSchemaWrite
 	if reset || finish {
 		if fetchedSQL != nil {
@@ -977,15 +1108,24 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 			}
 		}
 		var err error
-		if outcome, err = resetDockerEvents(dir, envPath, tag, live.gen); err != nil {
+		// The operator agreed to discard the pre-reset table in this run
+		// (drop), or in the one that began the reset.
+		if outcome, err = resetDockerEvents(dir, envPath, tag, live.gen, runEnv, drop || pending != ""); err != nil {
 			return err
 		}
 	}
 
-	// Only now does .env name the new release: until here every `docker
-	// compose up`, and the next upgrade, still see the one that runs.
-	if err := setEnvVar(envPath, "DP_IMAGE_TAG", tag); err != nil {
-		return fail("Could not update .env.", err.Error())
+	// The commit point: the pull and, across the storage reset, the reset
+	// went through. Only now does .env name the new release, and take the AI
+	// toggle: until here every `docker compose up`, and the next upgrade,
+	// still see what runs, and a run that failed or was refused before here
+	// left .env byte for byte as it was, but for the reset record.
+	commit := map[string]string{"DP_IMAGE_TAG": tag}
+	maps.Copy(commit, aiVars)
+	for _, k := range slices.Sorted(maps.Keys(commit)) {
+		if err := setEnvVar(envPath, k, commit[k]); err != nil {
+			return fail("Could not update .env.", err.Error())
+		}
 	}
 	notes, err := backfillDockerEnv(dir, envPath, base)
 	for _, n := range notes {
@@ -1012,7 +1152,7 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// --remove-orphans stops containers of profiles that were just turned off
 	// (compose otherwise leaves them running); named volumes are untouched.
 	sp = ui.Start("Restarting services")
-	if out, err := dockerRun(nil, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "up", "-d", "--remove-orphans"); err != nil {
+	if out, err := dockerRun(runEnv, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "up", "-d", "--remove-orphans"); err != nil {
 		sp.Fail("docker compose up failed")
 		return diagnoseDocker(out, "rerun `"+upgradeCommand(tag)+"`")
 	}
@@ -1029,11 +1169,16 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 			}
 		}
 	}
-	restarted := restartMounts(restarts, "--project-directory", dir, "--env-file", envPath)
+	restarted := restartMounts(tagEnv(tag), restarts, "--project-directory", dir, "--env-file", envPath)
 	// Whatever this run did or did not do to it, it succeeds only when the
-	// events table the services now run on is the one the release writes.
-	if got, why := eventsTableProblem(dir, envPath, tag); why != "" {
+	// events table the services now run on is the one the release writes,
+	// and the images that run are the release's.
+	got, why := eventsTableProblem(dir, envPath, tag)
+	if why != "" {
 		return eventsTableFail(dir, envPath, tag, got, why)
+	}
+	if why := runningImagesProblem(dir, envPath, tag, got.gen); why != "" {
+		return runningImagesFail(dir, envPath, tag, why)
 	}
 	if reset || finish {
 		if !restarted {
@@ -1088,8 +1233,39 @@ func eventsTableFail(dir, envPath, tag string, got liveSchema, why string) error
 		return fail(headline, "Events are accepted and then dropped at insert. Move to a release that writes it: `origamy upgrade --version "+minImageForJSONSchema+"` or newer.")
 	case "string":
 		return fail(headline, "Events are accepted and then dropped at insert. Move to a release that writes it (before "+minImageForJSONSchema+"), or to "+minImageForJSONSchema+" or newer, which resets the table (asking first).")
+	case liveMissing:
+		// Not a release that writes the new schema (dockerResetAction):
+		// nothing this CLI creates is known to be the table its images write.
+		if releaseSchemaGeneration(tag) == "unknown" {
+			return fail(headline, "The :"+tag+" images are not a numbered release, so which schema generation they write is not known, and this run cannot create the table for them. Move to a numbered release: `origamy upgrade --version "+helmVersion+"` creates the new events table (nothing is dropped).")
+		}
+		return fail(headline, "Release "+tag+" writes the pre-reset (String) table, which the bundle's clickhouse-init service creates at every `up -d`: check its output (docker compose --project-directory "+dir+" --env-file "+envPath+" logs clickhouse-init) and clickhouse-init.sql, then "+rerun+". Or move to "+minImageForJSONSchema+" or newer (`origamy upgrade --version "+helmVersion+"`), which creates the new table.")
 	}
 	return fail(headline, "Check what created it, and drop it yourself if it should be recreated with the new schema; then "+rerun+".")
+}
+
+// runningImagesFail fails an upgrade or a deploy whose check after the last
+// `up -d` found containers that do not run what release tag does (why, from
+// runningImagesProblem), with what can cause it.
+func runningImagesFail(dir, envPath, tag, why string) error {
+	return fail("The "+tag+" services are up, but "+why+".",
+		"Until they do, what runs may not write the events table ClickHouse holds. What can cause it:\n"+
+			strings.Join(runningImagesCauses(dir, envPath, tag), "\n")+
+			"\nFix that, then rerun `"+upgradeCommand(tag)+"`, which starts the "+tag+" images and checks again.")
+}
+
+// dockerTagNotes says what makes a plain `docker compose` in the project start
+// another release than tag, which the CLI's own commands are not subject to
+// (tagEnv): a DP_IMAGE_TAG exported in the shell, which compose takes over
+// .env, and several DP_IMAGE_TAG lines in .env, of which compose takes the
+// last (and so does the CLI).
+func dockerTagNotes(envPath, tag string) {
+	if v := os.Getenv("DP_IMAGE_TAG"); v != "" && v != tag {
+		ui.Warn("DP_IMAGE_TAG=%s is exported in your shell, and docker compose takes it over .env. This run gives docker compose %s itself, but a `docker compose up` from this shell would start %s: unset it (unset DP_IMAGE_TAG).", v, tag, v)
+	}
+	if n := envKeyCount(envPath, "DP_IMAGE_TAG"); n > 1 {
+		ui.Step(".env has %d DP_IMAGE_TAG lines; docker compose takes the last (%s), and so does this run, which leaves one when it writes the release.", n, readEnvVar(envPath, "DP_IMAGE_TAG"))
+	}
 }
 
 // resetComposeProblem says why the storage reset cannot run on the ClickHouse
@@ -1135,6 +1311,10 @@ func resetComposeProblem(dir, envPath, tag string, r *bundleRefresh) (why string
 func resetComposeRefusal(dir, tag string, r *bundleRefresh, skipped, why string, culprit []string, cfgErr error) (headline, hint string) {
 	rerun := "rerun `" + upgradeCommand(tag) + "`. Nothing has been changed."
 	switch {
+	case cfgErr != nil && r != nil && slices.Contains(r.kept(), "docker-compose.yml"):
+		// The edited compose file the refresh keeps is what does not render.
+		return "The storage reset needs to know which ClickHouse this project runs, and docker compose could not render its configuration with your edited docker-compose.yml, which the refresh keeps.",
+			cfgErr.Error() + "\nPass --replace-bundle to take the " + tag + " compose file (yours is backed up next to it) and re-apply your edits afterwards,\nor fix the compose files or .env (`docker compose --project-directory " + dir + " config` shows the error), then " + rerun
 	case cfgErr != nil:
 		return "The storage reset needs to know which ClickHouse this project runs, and docker compose could not render its configuration.",
 			cfgErr.Error() + "\nFix the compose files or .env (`docker compose --project-directory " + dir + " config` shows the error), then " + rerun

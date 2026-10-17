@@ -85,20 +85,50 @@ disturb the core.
   pins the images to a release. The two diverged in the 2026-08 storage reset
   (payload columns became native JSON): releases up to 0.1.17 cannot write the
   current schema, so `deploy` refuses that pairing instead of bringing up a
-  plane that looks Connected and drops every event at insert. For a plane
-  that already runs, what its ClickHouse holds decides (see the storage
+  plane that looks Connected and drops every event at insert, also in place
+  over a plane whose events table that release does write (`deploy
+  --version 0.1.17` over the String table with a control plane serving the
+  JSON schema), since the served schema is what the deploy installs. For a
+  plane that already runs, what its ClickHouse holds decides (see the storage
   reset below), and after `up -d` both `deploy` and `upgrade` check that
-  `events.events` exists and is the generation the release writes; when it
-  is not, the run fails instead of reporting success.
+  `events.events` exists and is the generation the release writes, and that
+  the containers that run are the release's: every data-plane service on the
+  release's tag (`docker compose ps`), and ClickHouse 25.3 or newer under the
+  JSON table (as its image tag says, or the server itself when the tag names
+  no version). When either is not so, the run fails instead of reporting
+  success, and says what can cause it.
+- **The release `docker compose` runs (Docker).** Every `docker compose`
+  command the CLI runs in a project gets `DP_IMAGE_TAG=<the release it is
+  for>` in its environment: compose takes a `DP_IMAGE_TAG` exported in the
+  shell over `.env`, so one left there by `set -a; . ./.env` cannot start
+  another release (the CLI warns that a plain `docker compose up` from that
+  shell would). `.env` is read as compose reads it, the last of several
+  `KEY=` lines winning, and setting a key leaves one line, the others kept as
+  they were. `.env` is replaced in one step (a file next to it renamed over
+  it), never left half-written.
 - **In-place deploy (Docker).** Re-running `deploy` in a project downloads
   the bundle into a directory next to it, runs every check (and the
   questions) and redeems the token first, and only then swaps the files in,
   each one it replaces backed up as `<file>.bak-<release>`. A refused deploy,
   or one whose enrollment fails, leaves the project byte for byte as it was.
-- **One run at a time (Docker).** `upgrade` and `deploy` hold
-  `.origamy.lock` in the project directory (created exclusively; it records
-  the pid, host and start time). Another run is refused with what holds it;
-  a lock left by a process on this host that is gone is taken over.
+  A project whose `docker-compose.yml` (or `.env`) no longer parses, an edit
+  gone wrong, has its ClickHouse asked through the container compose made
+  (found by its `com.docker.compose.project`/`service` labels; a stopped one
+  is started as it was) instead of the run stopping there: `deploy` and
+  `upgrade --replace-bundle` replace a compose file that does not parse with
+  the release's validated one.
+- **One run at a time (Docker).** `upgrade`, `deploy` and `uninstall` hold
+  the operating system's advisory lock on `.origamy.lock` in the project
+  directory (`flock`; `LockFileEx` on Windows), which the file's pid, host,
+  start time and command name for the message another run is refused with.
+  The lock goes with the process that holds it, however that ends, so a run
+  that was killed leaves no stale lock (at most the file, which the next run
+  simply locks again, and removes when it is done, refused or not; what such
+  a file says is not checked). Ctrl-C, SIGTERM and SIGHUP end an `upgrade` or a
+  `deploy` with exit code 130 once the step under way (a write of `.env`,
+  the swap of the bundle files, the reset's write of `clickhouse-init.sql`)
+  is through, removing the bundle download (also one still downloading) and
+  the lock file.
 
 ## What a deploy does with secrets
 
@@ -186,7 +216,7 @@ Two release boundaries the CLI knows about:
   events table is recreated with native JSON columns, which discards the
   event history collected so far (profiles, traits, segments and journeys
   are kept). `origamy upgrade` explains this, asks for a typed `yes`
-  (`--yes` skips it), then drops and recreates the table itself. On Docker
+  (`--yes` skips it), then recreates the table itself. On Docker
   the running ClickHouse decides, never the tags or `clickhouse-init.sql`
   (projects deployed by CLI v0.1.15–v0.1.18 run `DP_IMAGE_TAG=main`, and an
   earlier upgrade or deploy can have moved the files on): for a release that
@@ -198,11 +228,24 @@ Two release boundaries the CLI knows about:
   (stopped, hung, no container) is started with `up -d clickhouse` on the
   release and compose files the project runs now and asked again; when it
   still cannot be asked, the upgrade is refused rather than guessing. The
-  reset asks ClickHouse again once it is up on the new bundle and drops the
-  table only if it is the String one, and only when `clickhouse-init.sql` is
-  the new schema (a served schema of neither generation is refused before
-  anything is dropped). It is done only once ClickHouse reports the JSON
-  table (the bundle's init service exits 0 even when a statement fails).
+  reset asks ClickHouse again once it is up on the new bundle and moves the
+  table aside only if it is the String one, and only when
+  `clickhouse-init.sql` is the new schema (a served schema of neither
+  generation is refused before anything is touched). Moving aside is
+  `RENAME TABLE events.events TO events.events_pre_reset_<unix time>`, never
+  a `DROP` of `events.events`: the init then creates the new table, and only
+  once ClickHouse reports it with the JSON columns (the bundle's init service
+  exits 0 even when a statement fails) is the renamed table dropped, and only
+  while it has the String columns. One that turns out to have the JSON
+  columns (the table changed between the check and the move) is kept, with
+  the `EXCHANGE TABLES` that puts it back; one that cannot be dropped (over
+  ClickHouse's `max_table_size_to_drop`, say) is kept, with the `DROP` to run.
+  A reset that fails after the move keeps the old data in the renamed table
+  and says so; the next run creates the new table without moving anything
+  again and then drops what the failed run moved aside (the operator agreed
+  then; it never drops a renamed JSON table). `RENAME TABLE` was checked on
+  the bundle's `ReplacingMergeTree` events table on ClickHouse 24.8 and on
+  25.3 (the 24.8 volume under 25.3, as the reset finds it).
   The reset needs ClickHouse 25.3, so it only runs when the compose
   configuration the project would run (override files and `COMPOSE_FILE`
   included, as `docker compose config` renders it) has `clickhouse-server`
@@ -211,17 +254,28 @@ Two release boundaries the CLI knows about:
   another served release) the control plane's current schema is written to
   `clickhouse-init.sql`, which is backed up first and never written through a
   symlink. The reset is recorded in `.env` as `ORIGAMY_RESET_PENDING=<release>`
-  before anything is dropped, and `DP_IMAGE_TAG` moves only once it is
+  before anything is moved, and `DP_IMAGE_TAG` moves only once it is
   through: a reset that fails half-way is finished by the next
   `origamy upgrade` (or in-place `origamy deploy`) with a release that writes
-  the JSON schema, which asks again when it drops or creates the table and
+  the JSON schema, which asks again when it moves the table aside and
   never reports the data as untouched. When ClickHouse already holds the JSON
-  table, the record is cleared without dropping or asking anything. Either
+  table, the record is cleared without asking anything. Either
   way `clickhouse` (and `caddy` with the ingress profile) are restarted, since
   the run that began the reset may have replaced the files they mount.
   Every upgrade, reset or not, ends with the check after `up -d`: a missing
   or String table under a release that writes JSON fails the run and is
   recorded as `ORIGAMY_RESET_PENDING`, so the next run finishes it.
+  The commit point of a Docker upgrade is the pull and, across the reset,
+  the reset itself: until both went through, `.env` is left byte for byte as
+  it was but for that record, and `DP_IMAGE_TAG` and the `--enable-ai` /
+  `--disable-ai` toggle (`COMPOSE_PROFILES`, the AI engine's secrets) reach
+  `docker compose` through its environment only; `.env` takes them once the
+  run is through. The bundle files the reset itself needs (the compose file
+  with ClickHouse 25.3, the new schema) are swapped in after the pull and
+  the record, each one replaced backed up as `<file>.bak-<release>`, and a
+  reset that fails after that keeps them with the record: putting the 24.8
+  compose file back over a volume ClickHouse 25.3 has opened is not safe to
+  start, and the next run finishes the reset with them.
 
 ### Docker bundle refresh
 
@@ -245,9 +299,18 @@ plane, another `--version`, `--channel edge`) it says so and only moves
   written as `<file>.new` (removed again once the file itself is the served
   version); `--replace-bundle` replaces it anyway (backed up, and named in the
   output), `--keep-bundle` skips the refresh.
-- A control plane whose bundle for the target release carries the
-  pre-reset (String) schema is refused, also when that file is already the
-  project's, as the CLI did before the refresh existed.
+- The served `clickhouse-init.sql` must be one the target release writes.
+  When the bundle for a release that writes the JSON schema carries the
+  pre-reset (String) one and the refresh takes it (writes it, or finds it
+  already identical in the project), the upgrade is refused before anything
+  is touched; a JSON schema in the bundle of a release before 0.1.18 is not
+  taken either (the refresh fails validation and the files are left as they
+  are, or, when the project already holds that file, the upgrade is
+  refused). A `clickhouse-init.sql` you edited and the refresh keeps is not
+  refused on this ground: what ClickHouse holds decides, and a pre-reset
+  file kept over a plane that already holds the JSON table is warned about.
+  Across the storage reset the schema the reset applies (served or fetched)
+  must be the JSON one, or nothing is touched.
 - The new compose file must pass `docker compose config -q` against your
   `.env` first, and the images are pulled with it (new services' too) before
   any file is replaced, so a failed pull leaves the project as it was. A

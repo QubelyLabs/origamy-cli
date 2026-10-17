@@ -353,11 +353,50 @@ const eventsTable = "events.events"
 // datastore auth is off, which clickhouse-client accepts).
 const clickhouseDropEvents = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "DROP TABLE IF EXISTS ` + eventsTable + `"`
 
+// The Docker storage reset never drops events.events itself: it renames the
+// pre-reset table to events.<eventsAsidePrefix><unix time>, creates the new
+// one, and drops the renamed one only once the new one is in place, and only
+// while it is the String one. RENAME TABLE is a metadata change for the
+// bundle's ReplacingMergeTree table on ClickHouse 24.8 and 25.3 alike, and
+// not bounded by max_table_size_to_drop as DROP is.
+const eventsAsidePrefix = "events_pre_reset_"
+
+// reAsideTable is a table the reset moved aside, as the CLI names them.
+var reAsideTable = regexp.MustCompile(`^` + eventsAsidePrefix + `[0-9]+$`)
+
+// eventsAsideMark ends each row clickhouseAsideTables prints, so they are
+// told from compose's own output.
+const eventsAsideMark = "events.pre_reset"
+
+// clickhouseAsideTables prints, for each table the reset moved aside, its
+// name, the type of its payload column and eventsAsideMark, tab-separated.
+const clickhouseAsideTables = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT table, type, '` + eventsAsideMark + `' FROM system.columns WHERE database = 'events' AND startsWith(table, '` + eventsAsidePrefix + `') AND name = 'properties' ORDER BY table"`
+
+// clickhouseMoveEventsAside renames the events table to events.<aside>.
+func clickhouseMoveEventsAside(aside string) string {
+	return `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "RENAME TABLE ` + eventsTable + ` TO events.` + aside + `"`
+}
+
+// clickhouseDropAside drops events.<aside>, a table the reset moved aside.
+func clickhouseDropAside(aside string) string {
+	return `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "DROP TABLE events.` + aside + `"`
+}
+
+// clickhouseRestoreAside puts events.<aside> back as the events table, the
+// one in its place (new, and empty) taking its name.
+func clickhouseRestoreAside(aside string) string {
+	return `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "EXCHANGE TABLES ` + eventsTable + ` AND events.` + aside + `"`
+}
+
 // clickhouseInitStdin applies the schema fed on stdin inside the container.
 const clickhouseInitStdin = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --multiquery`
 
 // clickhousePing succeeds once the server inside the container answers.
 const clickhousePing = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT 1"`
+
+// clickhouseServerVersion prints the version of the server inside the
+// container (25.3.14.14).
+const clickhouseServerVersion = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT version()"`
 
 // isDesktopContext reports whether a kubectl context names a local desktop
 // distribution (Docker Desktop, kind, minikube, OrbStack, Rancher Desktop,

@@ -256,7 +256,9 @@ func TestEffectiveCompose(t *testing.T) {
 // project runs now (its own files, the release in .env), never the target,
 // and asked again; gen stays "" when it still cannot be asked.
 func TestAskClickHouse(t *testing.T) {
+	t.Setenv("COMPOSE_PROJECT_NAME", "")
 	dc := "DP_IMAGE_TAG=0.1.16 docker compose --project-directory /dp --env-file /dp/.env "
+	lookup := "docker ps -a --filter label=com.docker.compose.project=dp --filter label=com.docker.compose.service=clickhouse --format {{.ID}} {{.State}}"
 	for _, tc := range []struct {
 		name  string
 		setup func(*fakeCompose)
@@ -284,11 +286,89 @@ func TestAskClickHouse(t *testing.T) {
 				t.Fatalf("calls:\n%s", strings.Join(f.calls, "\n"))
 			}
 			for _, c := range f.calls {
-				if !strings.HasPrefix(c, dc) || strings.Contains(c, " -f ") {
+				if (!strings.HasPrefix(c, dc) || strings.Contains(c, " -f ")) && c != lookup {
 					t.Fatalf("not on what the project runs now: %q", c)
 				}
 			}
 		})
+	}
+
+	// No release in .env: compose takes the compose file's default, never
+	// one the shell exports.
+	f := newFakeCompose(t)
+	f.live = liveJSONRow
+	captureStdout(t, func() { askClickHouse("/dp", "/dp/.env", "") })
+	if len(f.calls) != 1 || !strings.HasPrefix(f.calls[0], "DP_IMAGE_TAG docker compose") {
+		t.Fatalf("calls: %v", f.calls)
+	}
+}
+
+// TestAskClickHouseComposeBroken: when compose cannot load the project (its
+// compose file does not parse), ClickHouse is asked through its container,
+// found by compose's labels, and a stopped one is started as it was; only
+// without such a container does it stay unasked.
+func TestAskClickHouseComposeBroken(t *testing.T) {
+	t.Setenv("COMPOSE_PROJECT_NAME", "")
+	dir := filepath.Join(t.TempDir(), "Origamy-DP.dp-1")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "docker-compose.yml"), compose253+brokenCompose)
+	env := filepath.Join(dir, ".env")
+	writeFile(t, env, "DP_IMAGE_TAG=0.1.19\n")
+	const id = "0123456789ab"
+	for _, tc := range []struct {
+		name              string
+		container, live   string
+		stopped           bool
+		want              string
+		started, asDirect bool
+	}{
+		{"running", id, liveJSONRow, false, "json", false, true},
+		{"stopped", id, liveStringRow, true, "string", true, true},
+		{"no container", "", liveJSONRow, false, "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeCompose(t)
+			f.container, f.live, f.stopped = tc.container, tc.live, tc.stopped
+			var got liveSchema
+			out := captureStdout(t, func() { got = askClickHouse(dir, env, "0.1.19") })
+			if got.gen != tc.want || (callIndex(f.calls, "docker start "+id) >= 0) != tc.started ||
+				(callIndex(f.calls, "docker exec "+id+" sh -c "+clickhouseEventsPropertiesType) >= 0) != tc.asDirect {
+				t.Fatalf("gen %q, calls:\n%s\n%s", got.gen, strings.Join(f.calls, "\n"), out)
+			}
+			// Found by the project's name as compose normalises it.
+			if callIndex(f.calls, "label=com.docker.compose.project=origamy-dpdp-1 ") < 0 {
+				t.Fatalf("calls:\n%s", strings.Join(f.calls, "\n"))
+			}
+			if tc.name == "running" && !strings.Contains(out, "Asked ClickHouse through its container ("+id+")") {
+				t.Fatalf("output:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestComposeProjectName(t *testing.T) {
+	t.Setenv("COMPOSE_PROJECT_NAME", "")
+	dir := filepath.Join(t.TempDir(), "_My.Plane-1")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := filepath.Join(dir, ".env")
+	if got := composeProjectName(dir, env); got != "myplane-1" {
+		t.Fatalf("from the directory: %q", got)
+	}
+	writeFile(t, filepath.Join(dir, "docker-compose.yml"), "name: \"Byod\"\nservices: {}\n")
+	if got := composeProjectName(dir, env); got != "byod" {
+		t.Fatalf("from the compose file: %q", got)
+	}
+	writeFile(t, env, "COMPOSE_PROJECT_NAME=first\nCOMPOSE_PROJECT_NAME=dp_one\n")
+	if got := composeProjectName(dir, env); got != "dp_one" {
+		t.Fatalf("from .env: %q", got)
+	}
+	t.Setenv("COMPOSE_PROJECT_NAME", "Shell")
+	if got := composeProjectName(dir, env); got != "shell" {
+		t.Fatalf("from the shell: %q", got)
 	}
 }
 
@@ -338,5 +418,95 @@ func TestEventsTableProblem(t *testing.T) {
 				t.Fatalf("stopped asking while the init ran (%d)", ps)
 			}
 		})
+	}
+}
+
+// TestRunningImagesProblem: what runs is read from `docker compose ps` (its
+// warnings first), a container listed by its image's ID is asked what it was
+// created from, and every data-plane service must run the release, with
+// ClickHouse 25.3 or newer under the new events table.
+func TestRunningImagesProblem(t *testing.T) {
+	const warn = "time=x level=warning msg=\"The \\\"WRITE_KEYS\\\" variable is not set.\"\n"
+	row := func(id, svc, image string) string {
+		return `{"ID":"` + id + `","Service":"` + svc + `","Image":"` + image + `","State":"running","Status":"Up 1 second"}` + "\n"
+	}
+	gw := func(tag string) string {
+		return row("a1", "ingestion-gateway", "ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:"+tag)
+	}
+	ch := func(v string) string { return row("c1", "clickhouse", "clickhouse/clickhouse-server:"+v) }
+	const id = "sha256:5f0d3c4a1b2e5f0d3c4a1b2e5f0d3c4a1b2e5f0d3c4a1b2e5f0d3c4a1b2e5f0d"
+	// A ClickHouse image whose tag names no version: the server says.
+	custom := row("c1", "clickhouse", "registry.example.com/clickhouse-server:prod")
+	for _, tc := range []struct {
+		name, ps, gen, inspect, want string
+		psFails                      bool
+		server                       string // what SELECT version() prints ("" = no answer)
+	}{
+		{"the release", warn + gw("0.1.20") + ch("25.3") + row("r1", "redis", "redis:7-alpine"), "json", "", "", false, ""},
+		{"another tag", gw("0.1.17") + ch("25.3"), "json", "", "ingestion-gateway runs ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.17", false, ""},
+		{"a digest-pinned release", row("a1", "ingestion-gateway", "ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.20@sha256:00") + ch("25.3"), "json", "", "", false, ""},
+		{"listed by its image's ID, created from the release", row("a1", "ingestion-gateway", id) + ch("25.3"), "json", "ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.20", "", false, ""},
+		{"listed by its image's ID, created from another", row("a1", "ingestion-gateway", id) + ch("25.3"), "json", "ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.19", "runs ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.19", false, ""},
+		{"no data-plane service", ch("25.3"), "json", "", "no data-plane service is running", false, ""},
+		{"an older ClickHouse under the new table", gw("0.1.20") + ch("24.8"), "json", "", "clickhouse runs clickhouse/clickhouse-server:24.8", false, ""},
+		{"an older ClickHouse under the pre-reset table", gw("0.1.20") + ch("24.8"), "string", "", "", false, ""},
+		{"no ClickHouse under the new table", gw("0.1.20"), "json", "", "ClickHouse is not among the containers that run", false, ""},
+		{"a ClickHouse tag without a version, the server new enough", gw("0.1.20") + custom, "json", "", "", false, warn + "25.3.14.14\n"},
+		{"a ClickHouse tag without a version, the server older", gw("0.1.20") + custom, "json", "", "clickhouse runs registry.example.com/clickhouse-server:prod (ClickHouse 24.8)", false, "24.8.14.39\n"},
+		{"a ClickHouse tag without a version, no answer", gw("0.1.20") + custom, "json", "", "whose version neither its tag nor the server", false, ""},
+		{"a ClickHouse tag without a version under the pre-reset table", gw("0.1.20") + custom, "string", "", "", false, ""},
+		{"compose cannot list them", "", "json", "", "docker compose could not list the containers that run", true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			stubDocker(t, func(env []string, name string, args ...string) (string, error) {
+				calls = append(calls, strings.Join(append(append([]string{}, env...), args...), " "))
+				if args[0] == "inspect" {
+					return tc.inspect + "\n", nil
+				}
+				if args[len(args)-1] == clickhouseServerVersion {
+					if tc.server == "" {
+						return "Code: 210. DB::NetException: Connection refused", errors.New("exit status 210")
+					}
+					return tc.server, nil
+				}
+				if tc.psFails {
+					return "yaml: line 3: did not find expected key", errors.New("exit status 15")
+				}
+				return tc.ps, nil
+			})
+			var why string
+			captureStdout(t, func() { why = runningImagesProblem("/dp", "/dp/.env", "0.1.20", tc.gen) })
+			if (why == "") != (tc.want == "") || !strings.Contains(why, tc.want) {
+				t.Fatalf("why %q", why)
+			}
+			if calls[0] != "DP_IMAGE_TAG=0.1.20 compose --project-directory /dp --env-file /dp/.env ps --format json" {
+				t.Fatalf("calls %v", calls)
+			}
+		})
+	}
+
+	// What can cause it: the shell, and an .env naming the release twice.
+	t.Setenv("DP_IMAGE_TAG", "0.1.16")
+	env := filepath.Join(t.TempDir(), ".env")
+	writeFile(t, env, "DP_IMAGE_TAG=0.1.20\nDP_IMAGE_TAG=0.1.17\n")
+	causes := strings.Join(runningImagesCauses("/dp", env, "0.1.20"), "\n")
+	for _, want := range []string{"DP_IMAGE_TAG=0.1.16 is exported in your shell", ".env has 2 DP_IMAGE_TAG lines, and docker compose takes the last (0.1.17)", "config --images"} {
+		if !strings.Contains(causes, want) {
+			t.Errorf("causes lack %q:\n%s", want, causes)
+		}
+	}
+}
+
+func TestImageTag(t *testing.T) {
+	for ref, want := range map[string]string{
+		"ghcr.io/qubelylabs/origamy-data-plane/portal-agent:0.1.20":          "0.1.20",
+		"ghcr.io/qubelylabs/origamy-data-plane/portal-agent:0.1.20@sha256:0": "0.1.20",
+		"localhost:5000/origamy-data-plane/portal-agent":                     "",
+		"localhost:5000/origamy-data-plane/portal-agent:staging":             "staging",
+	} {
+		if got := imageTag(ref); got != want {
+			t.Errorf("imageTag(%q) = %q, want %q", ref, got, want)
+		}
 	}
 }
