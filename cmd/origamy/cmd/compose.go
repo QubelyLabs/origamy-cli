@@ -311,6 +311,12 @@ func (c clickhouseConn) probe() liveSchema {
 	if err != nil {
 		return liveSchema{out: out}
 	}
+	return parseLiveSchema(out)
+}
+
+// parseLiveSchema reads the answer of clickhouseEventsPropertiesType (or of
+// the same query run elsewhere) that ClickHouse gave.
+func parseLiveSchema(out string) liveSchema {
 	// The output is combined: compose's warnings about variables an older
 	// .env lacks come before the answer, which is the column's type and
 	// eventsColumnMark (a bare type is taken too when it is one of ours).
@@ -858,10 +864,14 @@ func runningImagesCauses(dir, envPath, tag, why string) []string {
 // neither generation is told from compose's own output.
 const eventsColumnMark = "events.events.properties"
 
+// eventsPropertiesQuery selects the type of the events table's payload
+// column and eventsColumnMark; no row when the table does not exist.
+const eventsPropertiesQuery = `SELECT type, '` + eventsColumnMark + `' FROM system.columns WHERE database = 'events' AND table = 'events' AND name = 'properties'`
+
 // clickhouseEventsPropertiesType prints the type of the events table's
 // payload column and eventsColumnMark, tab-separated; nothing when the table
 // does not exist.
-const clickhouseEventsPropertiesType = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "SELECT type, '` + eventsColumnMark + `' FROM system.columns WHERE database = 'events' AND table = 'events' AND name = 'properties'"`
+const clickhouseEventsPropertiesType = `clickhouse-client --password "$CH_DEFAULT_PASSWORD" --query "` + eventsPropertiesQuery + `"`
 
 // composeConfig is what the CLI reads of `docker compose config --format
 // json`: the project's effective configuration.

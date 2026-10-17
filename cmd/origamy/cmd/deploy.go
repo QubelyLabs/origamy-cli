@@ -119,7 +119,18 @@ Every docker compose command the CLI runs pins the project's name
 (COMPOSE_PROJECT_NAME in .env, else the top-level name: of
 docker-compose.yml, else the directory's name) and ignores
 COMPOSE_PROJECT_NAME, COMPOSE_FILE and COMPOSE_PROFILES exported in the
-shell; .env is where they belong.`,
+shell; .env is where they belong.
+
+On Kubernetes a deploy over a release that is already installed is refused
+before the token is spent when an upgrade's storage reset is unfinished, or
+when the deploy takes the images across the storage reset and the release
+cannot write the events table its ClickHouse holds (move it with 'origamy
+upgrade', which resets the table); only such a deploy asks ClickHouse (create
+on pods/exec in origamy-dp) and holds the lease on the events table. Every
+Kubernetes install then asks ClickHouse once, without holding the install
+up: a missing table, or one the images cannot write, fails the deploy after
+the endpoint and summary are printed; a ClickHouse that cannot be asked is
+reported as not verified.`,
 	Example: `  origamy deploy --token dpe_xxx
   origamy deploy --token dpe_xxx --enable-ai
   origamy deploy --token dpe_xxx --datastore-auth
@@ -216,6 +227,9 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth, requireSigned
 	}
 	if kp != nil {
 		kp.requireSigned = requireSigned
+		if kp.close != nil {
+			defer kp.close()
+		}
 	} else {
 		dp.requireSigned = requireSigned
 	}
@@ -291,6 +305,9 @@ type k8sPlan struct {
 	clickhouse *externalClickHouse
 	// requireSigned turns on config-signing strict mode (already gated).
 	requireSigned bool
+	// close gives up the lease on the events table a deploy that can touch it
+	// holds (nil: it holds none).
+	close func()
 }
 
 // planKubernetes runs the preflight checks and asks every question for a
@@ -327,8 +344,32 @@ func planKubernetes(chartVer string, enableAI, aiSet, datastoreAuth, dockerToo b
 	} else if warn != "" {
 		ui.Warn("%s", warn)
 	}
-
+	// A release already here moves to chartVer without the storage reset
+	// (kube_reset.go), so before any question: refused while an upgrade's
+	// reset is unfinished, or when the deploy takes the images across the
+	// storage reset and ClickHouse holds a table chartVer cannot write. Such a
+	// deploy holds the lease on the events table until it is over (close).
 	p := &k8sPlan{chartVer: chartVer, datastoreAuth: datastoreAuth}
+	if releaseInstalled() {
+		headline, hint, giveUp := kubeDeployProblem(chartVer)
+		if headline != "" {
+			return nil, fail(headline, hint)
+		}
+		if giveUp != nil {
+			// Ctrl-C, SIGTERM or SIGHUP end the deploy through close too.
+			stopSignals := exitOnSignal()
+			p.close = onExit(func() {
+				giveUp()
+				stopSignals()
+			})
+		}
+	}
+	planned := false
+	defer func() {
+		if !planned && p.close != nil {
+			p.close()
+		}
+	}()
 
 	// — Deployment tier ——————————————————————————————————————————————————
 	ui.Title("Deployment size")
@@ -384,6 +425,7 @@ func planKubernetes(chartVer string, enableAI, aiSet, datastoreAuth, dockerToo b
 		ui.Step("HTTPS needs a TLS Secret in the %s namespace holding the certificate for %s (e.g. from cert-manager).", namespace, p.ingressHost)
 		p.ingressTLSSecret = promptString("TLS Secret name (leave empty to serve plain HTTP for now)")
 	}
+	planned = true
 	return p, nil
 }
 
@@ -446,7 +488,7 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 			return diagnose(out)
 		}
 		sp.Success("Config signing key stored")
-	} else if out, err := runCaptured("kubectl", "delete", "secret", configSigningSecret, "-n", namespace, "--ignore-not-found"); err != nil {
+	} else if out, err := kubeRun("kubectl", "delete", "secret", configSigningSecret, "-n", namespace, "--ignore-not-found"); err != nil {
 		return diagnose(out)
 	}
 
@@ -516,7 +558,7 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 	}
 
 	sp = ui.Start("Installing data plane (%s) via Helm", p.preset.label)
-	if out, err := runCaptured("helm", helmArgs...); err != nil {
+	if out, err := kubeRun("helm", helmArgs...); err != nil {
 		sp.Fail("Helm install failed")
 		return diagnose(out)
 	}
@@ -535,6 +577,22 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 		for comp, reason := range issues {
 			ui.Detail("%s — %s", ui.Bold(comp), ui.DiagnosePod(reason))
 		}
+	}
+
+	// ClickHouse is asked once, without holding the install up (a fresh
+	// install touches no existing table, so it needs no permission to run
+	// commands in the ClickHouse pod): a table that is missing or that the
+	// images cannot write fails the install, one that could not be asked is
+	// said to be unverified. Either way the endpoint and summary below are
+	// printed: the install itself went through, and the token is spent.
+	chk := kubeEventsCheck(checkSoft, p.clickhouse != nil, "")
+	recorded := false
+	if chk.why != "" && !chk.images && chk.live.gen == liveMissing && p.clickhouse == nil {
+		// The rerun that creates the table is an upgrade, which only a recorded
+		// reset makes ask ClickHouse. Not on an external ClickHouse: the CLI
+		// never creates the table there (the failure says how to by hand), and
+		// the record would only hold rollbacks and deploys up.
+		recorded = writeResetMarker(kubeMarker{present: true, version: p.chartVer, channel: "stable", action: markerCreate}) == nil
 	}
 
 	// — Resolve the SDK event endpoint ————————————————————————————————————
@@ -580,9 +638,15 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 	if eventURL != "" {
 		lines = append(lines, ui.Gray("Send events ")+ui.Bold(eventURL+"/v1/identify"))
 	}
-	if allReady {
+	switch {
+	case chk.why != "":
+		lines = append(lines, "", ui.Red("The events table check FAILED: events may not be stored. Details below."))
+	case chk.unverified != "":
+		lines = append(lines, "", ui.Yellow("The events table was not verified (see above)."))
+	}
+	if allReady && chk.why == "" {
 		lines = append(lines, "", ui.Green("Your dashboard will show it as Connected shortly."))
-	} else {
+	} else if !allReady {
 		lines = append(lines,
 			"",
 			ui.Gray("Check progress:"),
@@ -605,7 +669,13 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 	if !p.aiEnabled {
 		lines = append(lines, "", ui.Gray("Add the AI engine later:"), "  origamy upgrade --enable-ai")
 	}
+	if chk.unverified != "" {
+		warnUnverified(chk)
+	}
 	ui.Box("Deployed", lines)
+	if chk.why != "" {
+		return kubeCheckFail("The data plane is installed", kubeUpgradeCommand(p.chartVer, "stable"), chk, p.clickhouse != nil, recorded)
+	}
 	return nil
 }
 
@@ -620,7 +690,7 @@ func waitForGatewayLB(ns string) string {
 	svc := release + "-ingestion-gateway"
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
-		out, err := runCaptured("kubectl", "get", "svc", svc, "-n", ns,
+		out, err := kubeRun("kubectl", "get", "svc", svc, "-n", ns,
 			"-o", "jsonpath={.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}")
 		if addr := strings.TrimSpace(out); err == nil && addr != "" {
 			return addr
@@ -690,7 +760,7 @@ type podInfo struct {
 }
 
 func snapshotPods(ns string) ([]podInfo, error) {
-	out, err := runCaptured("kubectl", "get", "pods", "-n", ns, "-o", "json")
+	out, err := kubeRun("kubectl", "get", "pods", "-n", ns, "-o", "json")
 	if err != nil {
 		return nil, err
 	}
