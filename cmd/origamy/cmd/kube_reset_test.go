@@ -22,7 +22,8 @@ func TestUpgradeKubernetesResetsAStringTable(t *testing.T) {
 	lease, rec, up, mv, del := f.at("kubectl create -f -"), f.at(markerWrite), f.at(helmUpgrade), f.asideCall(), f.at(markerDelete)
 	check := slices.IndexFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, "kubectl get deployments,statefulsets,pods") })
 	gave := f.at("kubectl delete configmap " + kubeLeaseConfigMap)
-	if lease < 0 || !(lease < rec && rec < up && up < mv && mv < check && check < del && del < gave) {
+	inOrder := lease < rec && rec < up && up < mv && mv < check && check < del && del < gave
+	if lease < 0 || !inOrder {
 		t.Fatalf("want lease < record < helm upgrade < RENAME < check < record deleted < lease given up, got %d %d %d %d %d %d %d:\n%s", lease, rec, up, mv, check, del, gave, strings.Join(f.calls, "\n"))
 	}
 	if f.marker != nil || f.lease != nil {
@@ -354,7 +355,7 @@ func TestUpgradeKubernetesChecksWhatRuns(t *testing.T) {
 			t.Fatalf("want the check to fail on the 0.1.17 pods, got err=%v:\n%s", err, out)
 		}
 		// The reset itself went through; it stays recorded until the check passes.
-		if f.live != "JSON" || f.marker == nil || !strings.Contains(out, "finishes it and checks again") {
+		if f.live != "JSON" || f.marker == nil || !strings.Contains(out, "finishes the work on the events table left recorded in ConfigMap "+resetMarkerConfigMap) {
 			t.Fatalf("live=%q marker=%v:\n%s", f.live, f.marker, out)
 		}
 	})

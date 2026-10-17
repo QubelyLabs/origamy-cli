@@ -570,9 +570,11 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 	// printed: the install itself went through, and the token is spent.
 	chk := kubeEventsCheck(checkSoft, p.clickhouse != nil, "")
 	recorded := false
-	if chk.why != "" && !chk.images && chk.live.gen == liveMissing {
+	if chk.why != "" && !chk.images && chk.live.gen == liveMissing && p.clickhouse == nil {
 		// The rerun that creates the table is an upgrade, which only a recorded
-		// reset makes ask ClickHouse.
+		// reset makes ask ClickHouse. Not on an external ClickHouse: the CLI
+		// never creates the table there (the failure says how to by hand), and
+		// the record would only hold rollbacks and deploys up.
 		recorded = writeResetMarker(kubeMarker{present: true, version: p.chartVer, channel: "stable", action: markerCreate}) == nil
 	}
 

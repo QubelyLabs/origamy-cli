@@ -148,7 +148,34 @@ func readResetMarker() (kubeMarker, error) {
 	if err := json.Unmarshal([]byte(out), &cm); err != nil {
 		return kubeMarker{}, &kubeReadError{msg: fmt.Sprintf("could not read the ConfigMap %s in %s: %v", resetMarkerConfigMap, namespace, err)}
 	}
-	return kubeMarker{present: true, version: cm.Data["version"], channel: cm.Data["channel"], action: cm.Data["action"], aside: cm.Data["aside"]}, nil
+	m := kubeMarker{present: true, version: cm.Data["version"], channel: cm.Data["channel"], action: cm.Data["action"], aside: cm.Data["aside"]}
+	if why := m.problem(); why != "" {
+		return kubeMarker{}, &kubeReadError{msg: fmt.Sprintf("the ConfigMap %s in %s is not a record this CLI wrote: %s. Look at it (kubectl get configmap %s -n %s -o yaml) and delete it if no upgrade left a reset unfinished (kubectl delete configmap %s -n %s)", resetMarkerConfigMap, namespace, why, resetMarkerConfigMap, namespace, resetMarkerConfigMap, namespace)}
+	}
+	return m, nil
+}
+
+// reMarkerVersion is a chart version a record may name: it is printed back
+// as part of a command to run.
+var reMarkerVersion = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$`)
+
+// problem says what in a record read from the cluster is not what this CLI
+// writes, "" when nothing. Anyone who may write ConfigMaps in the namespace
+// can write the record, and its aside name goes into the statement the reset
+// runs in the ClickHouse pod (kubectl exec ... sh -c), its version and
+// channel into a command it prints.
+func (m kubeMarker) problem() string {
+	switch {
+	case m.aside != "" && !reAsideTable.MatchString(m.aside):
+		return fmt.Sprintf("its aside table %q is not one the reset names", m.aside)
+	case m.version != "" && !reMarkerVersion.MatchString(m.version):
+		return fmt.Sprintf("its version %q is not a chart version", m.version)
+	case m.channel != "" && m.channel != "stable" && m.channel != "edge":
+		return fmt.Sprintf("its channel %q is neither stable nor edge", m.channel)
+	case m.action != "" && m.action != markerReset && m.action != markerCreate:
+		return fmt.Sprintf("its action %q is neither %s nor %s", m.action, markerReset, markerCreate)
+	}
+	return ""
 }
 
 // writeResetMarker records a reset (kubectl apply of the ConfigMap).
@@ -1063,7 +1090,7 @@ func kubeCheckFail(done, recheck string, c kubeCheck, external, recorded bool) e
 	headline := done + ", but " + c.why + "."
 	again := "`" + recheck + "` checks again."
 	if recorded {
-		again = "The unfinished work on the events table stays recorded (ConfigMap " + resetMarkerConfigMap + " in " + namespace + "): `" + recheck + "` finishes it and checks again."
+		again = "`" + recheck + "` finishes the work on the events table left recorded in ConfigMap " + resetMarkerConfigMap + " (namespace " + namespace + ") and checks again."
 	}
 	pins := "Check what pins those images: a per-service image.tag in the release values (helm get values " + release + " -n " + namespace + ") stays until you replace it (`origamy upgrade --set <service>.image.tag=<release>`), an image.digest wins over any tag (clear it with `--set <service>.image.digest=`), and the rollouts (kubectl get pods -n " + namespace + ")."
 	switch {

