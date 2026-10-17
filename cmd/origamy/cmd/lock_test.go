@@ -274,7 +274,8 @@ func TestUninstallDockerLocked(t *testing.T) {
 	abs, _ := filepath.Abs("origamy-dp-dp-1")
 	down := strings.Join(composeCmd(abs, filepath.Join(abs, ".env"), "down", "-v", "--remove-orphans"), " ")
 	out = captureStdout(t, func() { err = uninstallDocker("dp-1", true) })
-	if err != nil || len(calls) != 2 || !strings.HasPrefix(calls[0], "ps -a ") || calls[1] != down {
+	// The plane's containers are looked for, and, with none, its volumes.
+	if err != nil || len(calls) != 3 || !strings.HasPrefix(calls[0], "ps -a ") || !strings.HasPrefix(calls[1], "volume ls ") || calls[2] != down {
 		t.Fatalf("%v, calls %v\n%s", err, calls, out)
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
@@ -327,7 +328,9 @@ func TestUninstallDockerOwnProjectOnly(t *testing.T) {
 			down := dcCall(readEnvVar(filepath.Join(dir, ".env"), "DP_IMAGE_TAG"), dir, filepath.Join(dir, ".env")) + "down -v --remove-orphans"
 			out := captureStdout(t, func() { err = uninstallDocker("dp-1", true) })
 			if tc.says == "" {
-				if err != nil || len(calls) != 2 || calls[1] != down || !strings.Contains(down, " -p origamy-dp-dp-1 ") {
+				// With no container of its own under the name, its volumes are looked for too.
+				n := map[bool]int{true: 3, false: 2}[tc.owners == ""]
+				if err != nil || len(calls) != n || calls[n-1] != down || !strings.Contains(down, " -p origamy-dp-dp-1 ") {
 					t.Fatalf("%v, calls %v\n%s", err, calls, out)
 				}
 				return

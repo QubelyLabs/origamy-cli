@@ -54,27 +54,47 @@ table with String columns is moved aside (renamed) and dropped once the new
 one is in place (asking first), and a missing one created (nothing to ask);
 one that already has the JSON columns is never dropped, and moving it to a
 release before ` + minImageForJSONSchema + `, or an events table of any other type, is refused.
-A ClickHouse that does not answer is started on the release and files the
-project runs now and asked again; when it still cannot be asked, the upgrade
-is refused. The reset runs only on ClickHouse 25.3 or newer (as the
-project's compose configuration, overrides included, names it) with your
-control plane's new schema, and one that fails half-way is recorded in .env
+The reset runs only on ClickHouse 25.3 or newer (as the project's compose
+configuration, overrides included, names it) with your control plane's new
+schema, and one that fails half-way is recorded in .env
 (` + resetPendingVar + `): the next upgrade finishes it before anything else.
-Once the services are up again, the upgrade checks that ClickHouse holds
-the events table the release writes, and that the containers run the
-release's images (every docker compose command gets the release in
-DP_IMAGE_TAG, whatever the shell exports), and fails when they do not
-(recording the reset still to do). Every data-plane service the profiles
-that are on run is checked by name, an image a compose override takes from
-a registry mirror too: it must be the release's very image (the same image
-ID as the release's own, which is pulled to compare, or a version label
-naming the release). What the services will start from is checked the same
-way before anything is changed. A --version that is not a numbered release
-(main, production, sha-…) is refused: which events table its images write
-is not known, so the upgrade could not check it. Every docker compose
-command pins the project's name (COMPOSE_PROJECT_NAME in .env, else the
-directory's name) and takes COMPOSE_FILE and COMPOSE_PROFILES from .env,
-never from the shell. One upgrade, in-place deploy or uninstall works on a
+
+How much the upgrade checks depends on the move. One that can touch the
+events table (it crosses the storage reset, up or down; a reset is recorded
+in .env; the release the plane runs, or the target, is not a numbered one,
+such as main; or ClickHouse, peeked at, holds another table than the target
+writes) gets every check: a ClickHouse that does not answer is started on the
+release and files the project runs now and asked again, and when it still
+cannot be asked the upgrade is refused; what the services will start from is
+compared with the release before anything is changed (every data-plane
+service of the profiles that are on, also one an override file adds, and one
+pinned by digest, which the digest decides, not the tag next to it; a
+service scaled to 0 starts nowhere and is reported); the containers of
+data-plane services whose profile is off are removed (compose keeps them,
+on whatever release they run); and once the services are up, the upgrade
+checks that ClickHouse holds the events table the release writes, and that
+EVERY container of the compose project that runs a data-plane image runs the
+release's (the same image, by ID, as the release's own reference names: it is
+pulled to compare when the host does not have it, so a registry mirror needs
+ghcr.io reachable, or the release's image on the host under its ghcr.io
+reference, by docker load, or docker tag once you have checked the mirror's
+image), failing when they do not (recording the reset still to do). Every
+docker compose command gets the release in DP_IMAGE_TAG, whatever the shell
+exports. Any other move (0.1.19 to 0.1.20, a rollback within a generation)
+runs like CLI v0.1.20 did: ClickHouse is asked only if it already answers
+and never started, nothing is pulled to compare, and what is found is a
+warning, but for an image of the other events table's generation (an
+override pinning 0.1.17), which is refused. A --version that is not a
+numbered release (main, production, sha-…) is refused: which events table
+its images write is not known, so the upgrade could not check it. Every
+docker compose command pins the project's name (COMPOSE_PROJECT_NAME in .env,
+else the top-level name: of docker-compose.yml, else the directory's name)
+and takes COMPOSE_FILE and COMPOSE_PROFILES from .env, never from the shell;
+a plane none of whose containers exist while its data volumes do, under
+another name (a COMPOSE_PROJECT_NAME that was exported when it ran), is
+refused rather than started anew, empty, beside them. .env is read as
+compose reads it (quotes, inline comments), and COMPOSE_PROFILES keeps every
+profile the CLI does not manage (logs, loki). One upgrade, in-place deploy or uninstall works on a
 project at a time (an operating system lock on ` + projectLockFile + ` in it, gone
 with its process; on a file system without advisory locks, such as NFS
 without a lock manager, the file itself, which a run on this host that
@@ -807,7 +827,7 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// Ctrl-C, SIGTERM or SIGHUP end the run without leaving the lock or a
 	// bundle download behind.
 	defer exitOnSignal()()
-	installedTag := readEnvVar(envPath, "DP_IMAGE_TAG")
+	installedTag := dotenvValue(envPath, "DP_IMAGE_TAG")
 	// The bundle download of an upgrade interrupted before its swap.
 	if stale := removeStaleBundleDirs(dir); len(stale) > 0 {
 		ui.Step("Removed the bundle download an interrupted upgrade left behind (%s).", strings.Join(stale, ", "))
@@ -865,8 +885,21 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 		return err
 	}
 	rerun := "rerun `" + upgradeCommand(tag) + "`. Nothing has been changed."
-	live := askClickHouse(dir, envPath, installedTag)
+	// Only a move that can touch the events table gets the heavy checks (what
+	// ClickHouse holds, asked and, if need be, started; the images that start
+	// and that run, all compared with the release's). Any other behaves like
+	// v0.1.20: ClickHouse is only peeked at, never started, and an answer of
+	// another generation than the release writes makes the move a strict one.
+	strict := canTouchEventsTable(installedTag, tag, pending)
+	var live liveSchema
+	if strict {
+		live = askClickHouse(dir, envPath, installedTag)
+	} else if live = peekClickHouse(dir, envPath, installedTag); live.gen != "" && live.gen != targetGen {
+		strict = true
+	}
 	switch {
+	case live.gen == "" && !strict:
+		ui.Warn("ClickHouse did not answer, so which events table it holds was not checked: moving %s → %s does not change which table the images write.", cmp.Or(installedTag, "this plane"), tag)
 	case live.gen == "":
 		return fail("ClickHouse could not be asked which events table it holds, so this upgrade cannot tell what it would do with it.",
 			outputHint(live.out)+"Check: "+composeHint(dir, envPath)+" logs clickhouse\nOnce it answers, rerun `"+upgradeCommand(tag)+"`. No file of the project has been changed.")
@@ -1067,12 +1100,21 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 		return diagnoseDocker(out, "rerun `"+upgradeCommand(tag)+"`")
 	}
 	sp.Success("Images pulled")
-	// What the data-plane services will start from must be the release's,
-	// mirrors included (rule: the run reports success only on what the
+	// On a move that can touch the events table, what the data-plane services
+	// will start from must be the release's, mirrors, digest pins and services
+	// an override adds included (the run reports success only on what the
 	// images that run write), and it is checked before anything is touched.
-	if why := plannedImagesProblem(dir, envPath, tag, runEnv, refresh); why != "" {
-		return abort(fail("The compose configuration this upgrade would start does not run the "+tag+" release: "+why+".",
-			strings.Join(runningImagesCauses(dir, envPath, tag), "\n")+"\nFix that, then rerun `"+upgradeCommand(tag)+"`. Nothing has been changed."))
+	if strict {
+		if why := plannedImagesProblem(dir, envPath, tag, runEnv, refresh); why != "" {
+			return abort(fail("The compose configuration this upgrade would start does not run the "+tag+" release: "+why+".",
+				strings.Join(runningImagesCauses(dir, envPath, tag, why), "\n")+"\nFix that, then rerun `"+upgradeCommand(tag)+"`. Nothing has been changed."))
+		}
+	} else if why := plannedGenerationProblem(dir, envPath, tag, runEnv, refresh); why != "" {
+		// A move that cannot touch the events table is not otherwise judged by
+		// its images, but one that would start the other generation's writer
+		// against the table is refused like any other.
+		return abort(fail("The compose configuration this upgrade would start runs images that write another events table than the "+tag+" release does: "+why+".",
+			"Set the image to the "+tag+" release, or take the pin out of the compose file or override that names it, then rerun `"+upgradeCommand(tag)+"`. Nothing has been changed."))
 	}
 	// From here on the reset is under way. It is recorded before any file is
 	// replaced or anything dropped, so whatever fails next, the next run
@@ -1185,6 +1227,9 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// --remove-orphans removes those of services the new compose file no
 	// longer has. Named volumes are untouched.
 	stopTurnedOff(dir, envPath, runEnv, before, profiles)
+	if strict {
+		removeInactiveDataPlane(dir, envPath, runEnv, profiles)
+	}
 	sp = ui.Start("Restarting services")
 	if out, err := dockerRun(runEnv, "docker", composeCmd(dir, envPath, "up", "-d", "--remove-orphans")...); err != nil {
 		sp.Fail("docker compose up failed")
@@ -1207,12 +1252,8 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	// Whatever this run did or did not do to it, it succeeds only when the
 	// events table the services now run on is the one the release writes,
 	// and the images that run are the release's.
-	got, why := eventsTableProblem(dir, envPath, tag)
-	if why != "" {
-		return eventsTableFail(dir, envPath, tag, got, why)
-	}
-	if why := runningImagesProblem(dir, envPath, tag, got.gen); why != "" {
-		return runningImagesFail(dir, envPath, tag, why)
+	if err := checkAfterUp(dir, envPath, tag, strict); err != nil {
+		return err
 	}
 	if reset || finish {
 		if !restarted {
@@ -1287,7 +1328,7 @@ func eventsTableFail(dir, envPath, tag string, got liveSchema, why string) error
 func runningImagesFail(dir, envPath, tag, why string) error {
 	return fail("The "+tag+" services are up, but "+why+".",
 		"Until they do, what runs may not write the events table ClickHouse holds. What can cause it:\n"+
-			strings.Join(runningImagesCauses(dir, envPath, tag), "\n")+
+			strings.Join(runningImagesCauses(dir, envPath, tag, why), "\n")+
 			"\nFix that, then rerun `"+upgradeCommand(tag)+"`, which starts the "+tag+" images and checks again.")
 }
 
@@ -1315,12 +1356,12 @@ func dockerTagNotes(envPath, tag string) {
 		ui.Warn("DP_IMAGE_TAG=%s is exported in your shell, and docker compose takes it over .env. This run gives docker compose %s itself, but a `docker compose up` from this shell would start %s: unset it (unset DP_IMAGE_TAG).", v, tag, v)
 	}
 	for _, k := range []string{"COMPOSE_PROJECT_NAME", "COMPOSE_FILE", "COMPOSE_PROFILES"} {
-		if v, set := os.LookupEnv(k); set && v != unquoteEnv(readEnvVar(envPath, k)) {
+		if v, set := os.LookupEnv(k); set && v != dotenvValue(envPath, k) {
 			ui.Warn("%s=%s is exported in your shell, and docker compose takes it over .env. This run ignores it and uses .env, but a plain `docker compose` from this shell would not: unset it (unset %s).", k, v, k)
 		}
 	}
 	if n := envKeyCount(envPath, "DP_IMAGE_TAG"); n > 1 {
-		ui.Step(".env has %d DP_IMAGE_TAG lines; docker compose takes the last (%s), and so does this run, which leaves one when it writes the release.", n, readEnvVar(envPath, "DP_IMAGE_TAG"))
+		ui.Step(".env has %d DP_IMAGE_TAG lines; docker compose takes the last (%s), and so does this run, which leaves one when it writes the release.", n, dotenvValue(envPath, "DP_IMAGE_TAG"))
 	}
 }
 

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -397,9 +399,14 @@ func writeEnvFile(path string, data []byte, mode os.FileMode) error {
 }
 
 // writeInPlace sets mode on the file at path (when this user owns it) and
-// writes data over it, its inode kept (owner, group, other hard links), then
-// flushes it to disk. Not in one step as writeEnvFile's rename is: only for
-// what that cannot do.
+// writes data over it, its inode kept (owner, group, other hard links). Not
+// in one step as writeEnvFile's rename is, and so not atomic: only for what
+// that cannot do. The new text is written first, padded with blank lines to
+// the length of the old file (inPlaceImage), and flushed; only then is the
+// file cut to size and flushed again. A run killed or a machine lost after
+// the first write leaves the new text, then blank lines, never a key of the
+// old file behind it, but one lost during that write can leave a mix of the
+// two, which nothing here can prevent.
 func writeInPlace(path string, data []byte, mode os.FileMode) error {
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
@@ -409,7 +416,13 @@ func writeInPlace(path string, data []byte, mode os.FileMode) error {
 		err = nil
 	}
 	if err == nil {
-		_, err = f.WriteAt(data, 0)
+		var fi os.FileInfo
+		if fi, err = f.Stat(); err == nil {
+			_, err = f.WriteAt(inPlaceImage(data, fi.Size()), 0)
+		}
+	}
+	if err == nil {
+		err = f.Sync()
 	}
 	if err == nil {
 		err = f.Truncate(int64(len(data)))
@@ -421,6 +434,17 @@ func writeInPlace(path string, data []byte, mode os.FileMode) error {
 		err = cerr
 	}
 	return err
+}
+
+// inPlaceImage is what writeInPlace first writes over a file of size old
+// bytes: data, then blank lines up to old, so that a file that shrinks never
+// keeps the end of its old text (a stale KEY= line would win over the new
+// one, compose reading the last) before it is cut to len(data).
+func inPlaceImage(data []byte, old int64) []byte {
+	if n := old - int64(len(data)); n > 0 {
+		return append(slices.Clone(data), bytes.Repeat([]byte("\n"), int(n))...)
+	}
+	return data
 }
 
 // envKeyCount is how many KEY= lines a dotenv file has.
@@ -556,10 +580,11 @@ func existingOrRandomKEK(path, key string) string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-// composeProfiles reads COMPOSE_PROFILES from a dotenv file as a list.
+// composeProfiles reads COMPOSE_PROFILES from a dotenv file as a list, as
+// compose reads it (quotes and an inline comment are not part of a profile).
 func composeProfiles(envPath string) []string {
 	var out []string
-	for _, p := range strings.Split(readEnvVar(envPath, "COMPOSE_PROFILES"), ",") {
+	for _, p := range strings.Split(dotenvValue(envPath, "COMPOSE_PROFILES"), ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
@@ -578,6 +603,31 @@ func withProfile(profiles []string, name string, on bool) []string {
 	}
 	if on {
 		out = append(out, name)
+	}
+	return out
+}
+
+// cliProfiles are the compose profiles `origamy deploy` and `origamy upgrade`
+// turn on and off, in the order they are written. Every other profile of the
+// bundle (logs, loki) or of the operator's own files is theirs: a run keeps it
+// in COMPOSE_PROFILES as it finds it.
+var cliProfiles = []string{"full", "agentic", "ingress"}
+
+// deployProfiles are the profiles an in-place deploy writes to .env: the
+// ones the answers turn on (cliProfiles), then every profile before (the
+// COMPOSE_PROFILES the plane had) that the CLI does not manage, in the order
+// it had them.
+func deployProfiles(before []string, full, agentic, ingress bool) []string {
+	var out []string
+	for _, p := range cliProfiles {
+		if (p == "full" && full) || (p == "agentic" && agentic) || (p == "ingress" && ingress) {
+			out = append(out, p)
+		}
+	}
+	for _, p := range before {
+		if !slices.Contains(cliProfiles, p) && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
 	}
 	return out
 }

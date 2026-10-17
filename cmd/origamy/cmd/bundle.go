@@ -180,10 +180,10 @@ func writeResetSchema(dir string, sql []byte, installedTag string) (resetSchemaW
 // the config endpoint under it in the dashboard's snippet). fromConfigURL
 // reports that fallback; base is "" when neither holds an http(s) URL.
 func controlPlaneHTTPBase(envPath string) (base string, fromConfigURL bool) {
-	if v := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONTROL_PLANE_HTTP_URL")), "/"); v != "" {
+	if v := strings.TrimRight(dotenvValue(envPath, "CONTROL_PLANE_HTTP_URL"), "/"); v != "" {
 		return v, false
 	}
-	v := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONFIG_URL")), "/")
+	v := strings.TrimRight(dotenvValue(envPath, "CONFIG_URL"), "/")
 	v = strings.TrimRight(strings.TrimSuffix(v, configPath), "/")
 	if u, err := url.Parse(v); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return "", false
@@ -224,12 +224,12 @@ func backfillDockerEnv(dir, envPath, base string) ([]string, error) {
 		notes = append(notes, note)
 		return nil
 	}
-	if readEnvVar(envPath, "CONTROL_PLANE_HTTP_URL") == "" {
+	if dotenvValue(envPath, "CONTROL_PLANE_HTTP_URL") == "" {
 		if err := set("CONTROL_PLANE_HTTP_URL", base, "Recorded CONTROL_PLANE_HTTP_URL="+base+" in .env."); err != nil {
 			return notes, err
 		}
 	}
-	switch cfg := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONFIG_URL")), "/"); {
+	switch cfg := strings.TrimRight(dotenvValue(envPath, "CONFIG_URL"), "/"); {
 	case !reads("CONFIG_URL"):
 	case cfg == "":
 		if err := set("CONFIG_URL", base+configPath, "Recorded CONFIG_URL="+base+configPath+" in .env."); err != nil {
@@ -252,14 +252,6 @@ func backfillDockerEnv(dir, envPath, base string) ([]string, error) {
 func isBareURL(v string) bool {
 	u, err := url.Parse(v)
 	return err == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Host != "" && strings.Trim(u.Path, "/") == "" && u.RawQuery == ""
-}
-
-// unquoteEnv strips the quotes compose's dotenv parser would.
-func unquoteEnv(v string) string {
-	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
-		return v[1 : len(v)-1]
-	}
-	return v
 }
 
 // reBundleVersion is what /byod/VERSION may hold: one release name.
@@ -628,8 +620,8 @@ func (r *bundleRefresh) composeArgs(envPath string) []string {
 func composeFileArgs(dir, envPath, compose string) []string {
 	own := filepath.Join(dir, "docker-compose.yml")
 	var files []string
-	if list := unquoteEnv(readEnvVar(envPath, "COMPOSE_FILE")); list != "" {
-		sep := cmp.Or(unquoteEnv(readEnvVar(envPath, "COMPOSE_PATH_SEPARATOR")), string(os.PathListSeparator))
+	if list := dotenvValue(envPath, "COMPOSE_FILE"); list != "" {
+		sep := cmp.Or(dotenvValue(envPath, "COMPOSE_PATH_SEPARATOR"), string(os.PathListSeparator))
 		for _, f := range strings.Split(list, sep) {
 			if f = strings.TrimSpace(f); f != "" {
 				if !filepath.IsAbs(f) {

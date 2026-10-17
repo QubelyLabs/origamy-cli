@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"cmp"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -78,10 +79,24 @@ type fakeCompose struct {
 	ids, versions                      map[string]string
 	missing                            map[string]bool
 	owners                             string
+	// states: the state of a service's container when it is not running;
+	// digests: the RepoDigests of an image; images: other images on this host;
+	// volumes: rows of project, key and name for `docker volume ls`.
+	states         map[string]string
+	containerImage map[string]string // service → the ID of the image its container was made from, when it is not its reference's
+	digests        map[string][]string
+	images         []string
+	volumes        [][3]string
+	volumesFail    bool
+	dockerVolumeLS int
 }
 
 // brokenCompose makes a compose file that does not parse.
 const brokenCompose = "\nservices:\n  gateway: [\n"
+
+// reTestProfilesEnv is the COMPOSE_PROFILES a call gives compose on top of
+// composeEnv, before the docker command.
+var reTestProfilesEnv = regexp.MustCompile(` COMPOSE_PROFILES=\S* docker `)
 
 var reTestRename = regexp.MustCompile(`RENAME TABLE events\.events TO events\.(\w+)`)
 var reTestDropAside = regexp.MustCompile(`DROP TABLE events\.(` + eventsAsidePrefix + `\w+)`)
@@ -138,7 +153,7 @@ func (f *fakeCompose) imageID(ref string) string {
 func (f *fakeCompose) up(env, args []string, named ...string) {
 	svcs := renderServices(env, args)
 	for name, s := range svcs {
-		if !s.on || (len(named) > 0 && !slices.Contains(named, name)) {
+		if !s.on || s.scaled || (len(named) > 0 && !slices.Contains(named, name)) {
 			continue
 		}
 		image := s.image
@@ -163,9 +178,10 @@ func (f *fakeCompose) up(env, args []string, named ...string) {
 func newFakeCompose(t *testing.T) *fakeCompose {
 	t.Helper()
 	f := &fakeCompose{afterInit: liveJSONRow, aside: map[string]string{}, running: map[string]string{},
-		ids: map[string]string{}, versions: map[string]string{}, missing: map[string]bool{}}
-	prevTimeout, prevPoll := clickhouseReadyTimeout, clickhouseReadyPoll
-	clickhouseReadyTimeout, clickhouseReadyPoll = 100*time.Millisecond, time.Millisecond
+		ids: map[string]string{}, versions: map[string]string{}, missing: map[string]bool{},
+		states: map[string]string{}, digests: map[string][]string{}, containerImage: map[string]string{}}
+	prevTimeout, prevPoll, prevAdvisory := clickhouseReadyTimeout, clickhouseReadyPoll, advisoryWait
+	clickhouseReadyTimeout, clickhouseReadyPoll, advisoryWait = 100*time.Millisecond, time.Millisecond, 100*time.Millisecond
 	prevSettle, prevWait, prevPoll2 := composeSettle, composeWait, composePoll
 	composeSettle, composeWait, composePoll = 0, 100*time.Millisecond, time.Millisecond
 	stubDocker(t, func(env []string, name string, args ...string) (string, error) {
@@ -180,11 +196,37 @@ func newFakeCompose(t *testing.T) *fakeCompose {
 		switch last := args[len(args)-1]; {
 		case args[0] == "ps" && slices.Contains(args, "label=com.docker.compose.project"):
 			return f.owners, nil
-		case args[0] == "ps":
+		case args[0] == "ps" && slices.Contains(args, "label=com.docker.compose.service=clickhouse"):
 			if f.container == "" {
 				return "", nil
 			}
 			return f.container + " " + map[bool]string{true: "exited", false: "running"}[f.stopped] + "\n", nil
+		case args[0] == "ps":
+			// Every container of the project, with its service, state and image.
+			if f.psFails {
+				return "Cannot connect to the Docker daemon", errors.New("exit status 1")
+			}
+			var rows []string
+			for _, svc := range slices.Sorted(maps.Keys(f.running)) {
+				rows = append(rows, testContainerID(svc)+"\t"+svc+"\t"+cmp.Or(f.states[svc], "running")+"\t"+f.running[svc])
+			}
+			return strings.Join(rows, "\n") + "\n", nil
+		case args[0] == "image" && args[1] == "ls":
+			var rows []string
+			for _, image := range slices.Concat(slices.Collect(maps.Values(f.running)), f.images) {
+				rows = append(rows, f.imageID(image)+"\t"+imageRepo(image))
+			}
+			return strings.Join(rows, "\n") + "\n", nil
+		case args[0] == "volume" && args[1] == "ls":
+			f.dockerVolumeLS++
+			if f.volumesFail {
+				return "Cannot connect to the Docker daemon", errors.New("exit status 1")
+			}
+			var rows []string
+			for _, v := range f.volumes {
+				rows = append(rows, v[2]+"\t"+v[0]+"\t"+v[1])
+			}
+			return strings.Join(rows, "\n") + "\n", nil
 		case args[0] == "start":
 			f.stopped = false
 		case args[0] == "inspect":
@@ -192,7 +234,7 @@ func newFakeCompose(t *testing.T) *fakeCompose {
 			for _, id := range args[3:] {
 				for svc, image := range f.running {
 					if testContainerID(svc) == id {
-						rows = append(rows, id+"\t"+image+"\t"+f.imageID(image)+"\t"+f.labels(image))
+						rows = append(rows, id+"\t"+image+"\t"+cmp.Or(f.containerImage[svc], f.imageID(image))+"\t"+f.labels(image))
 					}
 				}
 			}
@@ -201,7 +243,12 @@ func newFakeCompose(t *testing.T) *fakeCompose {
 			if f.missing[last] {
 				return "error: no such image: " + last, errors.New("exit status 1")
 			}
-			return f.imageID(last) + "\t" + f.labels(last) + "\n", nil
+			digests := "null"
+			if d := f.digests[last]; len(d) > 0 {
+				b, _ := json.Marshal(d)
+				digests = string(b)
+			}
+			return f.imageID(last) + "\t" + digests + "\t" + f.labels(last) + "\n", nil
 		case args[0] == "pull":
 			if f.pullFails {
 				return "Error response from daemon: manifest unknown", errors.New("exit status 1")
@@ -298,7 +345,7 @@ func newFakeCompose(t *testing.T) *fakeCompose {
 		return "", nil
 	})
 	t.Cleanup(func() {
-		clickhouseReadyTimeout, clickhouseReadyPoll = prevTimeout, prevPoll
+		clickhouseReadyTimeout, clickhouseReadyPoll, advisoryWait = prevTimeout, prevPoll, prevAdvisory
 		composeSettle, composeWait, composePoll = prevSettle, prevWait, prevPoll2
 	})
 	return f
@@ -307,8 +354,9 @@ func newFakeCompose(t *testing.T) *fakeCompose {
 // renderedService is a service as the fake compose renders it: its image
 // and whether the profiles that are on run it.
 type renderedService struct {
-	image string
-	on    bool
+	image  string
+	on     bool
+	scaled bool // scale: 0 or deploy.replicas: 0
 }
 
 // envFileArg is the --env-file a compose call names.
@@ -359,16 +407,20 @@ func renderServices(env, args []string) map[string]renderedService {
 			case svc != "" && strings.HasPrefix(l, "    image: "):
 				image := strings.TrimPrefix(l, "    image: ")
 				image = strings.NewReplacer("${DP_IMAGE_TAG:-main}", tag, "${DP_IMAGE_TAG}", tag).Replace(image)
-				svcs[svc] = renderedService{image: image}
+				svcs[svc] = renderedService{image: image, scaled: svcs[svc].scaled}
 			case svc != "" && strings.HasPrefix(l, "    profiles: "):
 				profiles[svc] = strings.Split(strings.Trim(strings.TrimPrefix(l, "    profiles: "), `[]" `), `", "`)
+			case svc != "" && (strings.TrimSpace(l) == "scale: 0" || strings.TrimSpace(l) == "replicas: 0"):
+				s := svcs[svc]
+				s.scaled = true
+				svcs[svc] = s
 			}
 		}
 	}
 	for name, s := range svcs {
 		s.on = len(profiles[name]) == 0
 		for _, p := range profiles[name] {
-			s.on = s.on || slices.Contains(on, p)
+			s.on = s.on || slices.Contains(on, p) || slices.Contains(on, "*")
 		}
 		svcs[name] = s
 	}
@@ -392,7 +444,11 @@ func renderComposeConfig(env, args []string) (string, error) {
 	}
 	var rendered []string
 	for _, n := range names {
-		rendered = append(rendered, fmt.Sprintf("%q: {\"image\": %q}", n, svcs[n].image))
+		scale := ""
+		if svcs[n].scaled {
+			scale = ", \"scale\": 0"
+		}
+		rendered = append(rendered, fmt.Sprintf("%q: {\"image\": %q%s}", n, svcs[n].image, scale))
 	}
 	return `time="2026-10-16T20:00:00Z" level=warning msg="The \"WRITE_KEYS\" variable is not set. Defaulting to a blank string."` + "\n" +
 		`{"name": "dp", "services": {` + strings.Join(rendered, ", ") + `}, "volumes": {"clickhouse-data": {"name": "dp_clickhouse-data"}}}` + "\n", nil
@@ -1407,7 +1463,7 @@ func TestUpgradeDockerRefusesBeforeAsking(t *testing.T) {
 // and tags, and nothing is touched.
 func TestUpgradeDockerProbeTimeout(t *testing.T) {
 	// It answers the second time: the upgrade goes on, on what it says.
-	p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("0.1.20"), nil)
+	p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("main"), nil)
 	f := newFakeCompose(t)
 	f.live, f.probeHangs = liveStringRow, 1
 	out, err := upgradeIn(t, p.dir, "0.1.20", bundleAuto)
@@ -1422,7 +1478,7 @@ func TestUpgradeDockerProbeTimeout(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			for _, schema := range []string{jsonSchemaSQL, stringSchemaSQL} {
-				p := newUpgradeProject(t, compose253, schema, envAt("0.1.20"), nil)
+				p := newUpgradeProject(t, compose253, schema, envAt("main"), nil)
 				f := newFakeCompose(t)
 				setup(f)
 				before := p.snapshot(t)
@@ -1435,7 +1491,7 @@ func TestUpgradeDockerProbeTimeout(t *testing.T) {
 						t.Fatalf("ran %q", c)
 					}
 				}
-				if callIndex(f.calls, dcCall("0.1.20", p.dir, p.env)+"up -d clickhouse") < 0 {
+				if callIndex(f.calls, dcCall("main", p.dir, p.env)+"up -d clickhouse") < 0 {
 					t.Fatalf("ClickHouse was not started to be asked:\n%s", strings.Join(f.calls, "\n"))
 				}
 				if after := p.snapshot(t); !mapsEqual(before, after) {
@@ -1544,22 +1600,27 @@ func TestUpgradeDockerChecksTheTableAfterUp(t *testing.T) {
 		ok                 bool
 		says               string
 		pending            string
+		from               string // the release .env names; "" = 0.1.20 (a move that cannot touch the table)
 	}{
-		{"the new table stays", liveJSONRow, "0.1.20", nil, true, notTouched, ""},
-		{"gone after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.live = "" }, false, "ClickHouse holds no events table", "0.1.20"},
-		{"the pre-reset one after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.live = liveStringRow }, false, "which the 0.1.20 images cannot write", "0.1.20"},
-		{"another type after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.live = "Nullable(String)\t" + eventsColumnMark + "\n" }, false, "neither the pre-reset (String) nor the new (JSON) schema", ""},
-		{"no answer after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.probeFails = true }, false, "did not say which events table it holds", ""},
+		{"the new table stays", liveJSONRow, "0.1.20", nil, true, notTouched, "", ""},
+		{"gone after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.live = "" }, false, "ClickHouse holds no events table", "0.1.20", ""},
+		{"the pre-reset one after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.live = liveStringRow }, false, "which the 0.1.20 images cannot write", "0.1.20", ""},
+		{"another type after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.live = "Nullable(String)\t" + eventsColumnMark + "\n" }, false, "neither the pre-reset (String) nor the new (JSON) schema", "", ""},
+		// No answer: a failure for a move that can touch the table; for one
+		// that cannot (the release the plane runs), a warning and the run
+		// goes on, as v0.1.20 did.
+		{"no answer after up, a move across the reset", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.probeFails = true }, false, "did not say which events table it holds", "", "main"},
+		{"no answer after up, a move that cannot touch it", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.probeFails = true }, true, "was not checked: this move does not change which table", "", ""},
 		// A release before the reset with no table: the init `up -d` runs
 		// creates it, or the run fails.
-		{"before the reset, created by up", "", "0.1.17", func(f *fakeCompose) { f.live = liveStringRow }, true, notTouched, ""},
-		{"before the reset, not created", "", "0.1.17", nil, false, "ClickHouse holds no events table", ""},
+		{"before the reset, created by up", "", "0.1.17", func(f *fakeCompose) { f.live = liveStringRow }, true, notTouched, "", ""},
+		{"before the reset, not created", "", "0.1.17", nil, false, "ClickHouse holds no events table", "", ""},
 		// The edge channel writes the new schema (a tag no run can check is
 		// refused before it starts: TestUpgradeDockerRefusesAMovingTag).
-		{"edge, the new table", liveJSONRow, dockerEdgeTag, nil, true, notTouched, ""},
+		{"edge, the new table", liveJSONRow, dockerEdgeTag, nil, true, notTouched, "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("0.1.20"), map[string]string{"VERSION": ""})
+			p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt(cmp.Or(tc.from, "0.1.20")), map[string]string{"VERSION": ""})
 			if releaseSchemaGeneration(tc.target) != "json" {
 				p = newUpgradeProject(t, compose248, stringSchemaSQL, envAt("0.1.16"), map[string]string{"VERSION": ""})
 			}
@@ -1784,6 +1845,9 @@ func TestUpgradeDockerPinsTheRelease(t *testing.T) {
 	calls := composeCalls(f.calls)
 	pull := callIndex(calls, " pull")
 	for i, c := range calls {
+		// What a call gives compose besides the release (the profiles it
+		// loads) comes after composeEnv.
+		c = reTestProfilesEnv.ReplaceAllString(c, " docker ")
 		want := dcCall("0.1.20", p.dir, p.env)
 		if i < pull && strings.HasPrefix(c, dcCall("0.1.16", p.dir, p.env)) && strings.Contains(c, " exec ") {
 			continue // ClickHouse asked on the release it runs now
@@ -1792,10 +1856,15 @@ func TestUpgradeDockerPinsTheRelease(t *testing.T) {
 			t.Fatalf("call %d not given the target release: %q", i, c)
 		}
 	}
-	for _, step := range []string{"up -d clickhouse", "run --rm --no-deps clickhouse-init", "up -d --remove-orphans", "restart clickhouse", "restart caddy", "ps -a --format json"} {
+	for _, step := range []string{"up -d clickhouse", "run --rm --no-deps clickhouse-init", "up -d --remove-orphans", "restart clickhouse", "restart caddy"} {
 		if callIndex(calls, step) < 0 {
 			t.Fatalf("no %q:\n%s", step, strings.Join(calls, "\n"))
 		}
+	}
+	// The containers that run are listed by the project's label, under the
+	// name the CLI pins.
+	if callIndex(f.calls, "docker ps -a --filter label=com.docker.compose.project="+composeProjectName(p.dir, p.env)+" ") < 0 {
+		t.Fatalf("the project's containers were not listed:\n%s", strings.Join(f.calls, "\n"))
 	}
 	if f.ranTag != "0.1.20" {
 		t.Fatalf("the services were started on %q", f.ranTag)
@@ -1819,7 +1888,7 @@ func TestUpgradeDockerChecksTheRunningImages(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("DP_IMAGE_TAG", "0.1.17")
-			p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("0.1.19"), nil)
+			p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("main"), nil)
 			f := newFakeCompose(t)
 			f.live = liveJSONRow
 			tc.setup(f)
@@ -2117,7 +2186,7 @@ func TestUpgradeDockerPlannedImages(t *testing.T) {
 		}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("0.1.19"), nil)
+			p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("main"), nil)
 			writeFile(t, filepath.Join(p.dir, "docker-compose.override.yml"), tc.override)
 			f := newFakeCompose(t)
 			f.live = liveJSONRow

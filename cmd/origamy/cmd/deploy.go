@@ -99,17 +99,27 @@ in place, keeping its generated passwords and data. The bundle is downloaded
 into a directory inside the project and swapped in only once every check
 passed and the token was redeemed (each file it replaces backed up as
 <file>.bak-<release>), so a refused deploy leaves the project as it was.
-What the plane's ClickHouse holds is asked first, as in 'origamy upgrade' (it
-is started when it does not answer; the deploy is refused when it still
-cannot be asked), and once the services are up, deploy checks that
-ClickHouse holds the events table the release writes and that the containers
-run the release's images. The services only a profile the answers turn off
-ran (journeys, the AI engine) are stopped and removed. A --version that is
-not a numbered release (main, sha-…) is refused: which events table its
-images write is not known. Every docker compose command the CLI runs pins
-the project's name (COMPOSE_PROJECT_NAME in .env, else the directory's
-name) and ignores COMPOSE_PROJECT_NAME, COMPOSE_FILE and COMPOSE_PROFILES
-exported in the shell; .env is where they belong.`,
+As in 'origamy upgrade', how much is checked depends on the move: over a
+plane whose release writes another events table than the one deployed (or
+that runs :main, or has a storage reset recorded), what the plane's
+ClickHouse holds is asked first (it is started when it does not answer; the
+deploy is refused when it still cannot be asked), and once the services are
+up, deploy checks that ClickHouse holds the events table the release writes
+and that every container of the compose project that runs a data-plane image
+runs the release's. Over a plane of the same generation ClickHouse is only
+peeked at, never started, and for a new plane it is not asked before the
+services start; what is found after they are up is a warning, but for a table
+of another generation or none, and a data-plane image of the other
+generation, which fail the deploy. The
+services only a profile the answers turn off ran (journeys, the AI engine)
+are stopped and removed; every other profile in COMPOSE_PROFILES (the log
+stack: logs, loki) stays as it is. A --version that is not a numbered release
+(main, sha-…) is refused: which events table its images write is not known.
+Every docker compose command the CLI runs pins the project's name
+(COMPOSE_PROJECT_NAME in .env, else the top-level name: of
+docker-compose.yml, else the directory's name) and ignores
+COMPOSE_PROJECT_NAME, COMPOSE_FILE and COMPOSE_PROFILES exported in the
+shell; .env is where they belong.`,
 	Example: `  origamy deploy --token dpe_xxx
   origamy deploy --token dpe_xxx --enable-ai
   origamy deploy --token dpe_xxx --datastore-auth
@@ -819,6 +829,11 @@ type dockerPlan struct {
 	// table, here or in the upgrade that began the reset (resetDockerEvents).
 	resetPending, resetFound string
 	resetDiscard             bool
+	// strict is a deploy over a plane that can touch the events table
+	// (canTouchEventsTable, or ClickHouse held another table than the
+	// release writes): it gets the heavy checks. A deploy of a new plane, or
+	// over one that stays on its generation, does not.
+	strict bool
 	// close removes what the plan put in the project — the download, the
 	// lock, a directory it created and nothing filled — once the deploy is
 	// over, whatever its outcome (or when a prompt ends the CLI).
@@ -926,7 +941,7 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 	}
 	sp := ui.Start("Downloading the deploy bundle")
 	served, _ := servedBundleVersion(base)
-	r, err := prepareBundleRefresh(p.dir, base, served, readEnvVar(envPath, "DP_IMAGE_TAG"), true, nil)
+	r, err := prepareBundleRefresh(p.dir, base, served, dotenvValue(envPath, "DP_IMAGE_TAG"), true, nil)
 	if err != nil {
 		name := "the deploy bundle"
 		if fe := (*bundleFileError)(nil); errors.As(err, &fe) {
@@ -954,8 +969,22 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 	dockerTagNotes(envPath, imageTag)
 	live := liveSchema{}
 	if p.existingID != "" {
-		live = askClickHouse(p.dir, envPath, readEnvVar(envPath, "DP_IMAGE_TAG"))
+		// As in the upgrade, only a move that can touch the events table gets
+		// the heavy checks: ClickHouse asked, started if need be, and the
+		// images compared with the release's. Any other (the release the plane
+		// runs, or one of its generation) only peeks at ClickHouse, and
+		// becomes a strict move when it holds another table than the release
+		// writes.
+		installed := dotenvValue(envPath, "DP_IMAGE_TAG")
+		p.strict = canTouchEventsTable(installed, imageTag, readEnvVar(envPath, resetPendingVar))
+		if p.strict {
+			live = askClickHouse(p.dir, envPath, installed)
+		} else if live = peekClickHouse(p.dir, envPath, installed); live.gen != "" && live.gen != releaseSchemaGeneration(imageTag) {
+			p.strict = true
+		}
 		switch {
+		case live.gen == "" && !p.strict:
+			ui.Warn("ClickHouse did not answer, so which events table it holds was not checked: deploying %s over %s does not change which table the images write.", imageTag, orDash(installed))
 		case live.gen == "":
 			return refuse(fail("ClickHouse could not be asked which events table this plane holds, so what deploying over it does to the table cannot be checked.",
 				outputHint(live.out)+"Check: "+composeHint(p.dir, envPath)+" logs clickhouse\nOnce it answers, rerun deploy with the same token. "+nothing))
@@ -995,7 +1024,7 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 	if p.existingID != "" {
 		profiles := composeProfiles(envPath)
 		fullDefault = hasProfile(profiles, "full")
-		ingestDefault = readEnvVar(envPath, "INGEST_DOMAIN")
+		ingestDefault = dotenvValue(envPath, "INGEST_DOMAIN")
 		if !aiSet {
 			enableAI = hasProfile(profiles, "agentic")
 		}
@@ -1179,16 +1208,10 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 		dbPw = "origamy"
 		ui.Warn("Keeping the bundled Postgres on its original default password: it was initialised without one and cannot be rotated from here.")
 	}
-	var profiles []string
-	if p.fullProfile {
-		profiles = append(profiles, "full")
-	}
-	if p.aiEnabled {
-		profiles = append(profiles, "agentic")
-	}
-	if p.ingestDomain != "" {
-		profiles = append(profiles, "ingress")
-	}
+	// Only full, agentic and ingress follow the answers; any other profile the
+	// plane runs (logs, loki, the operator's own) stays in COMPOSE_PROFILES,
+	// so a re-deploy never stops its services.
+	profiles := deployProfiles(before, p.fullProfile, p.aiEnabled, p.ingestDomain != "")
 	env := renderDockerEnv(dockerEnvParams{
 		TunnelAddr:    tok.Addr,
 		HTTPURL:       tok.URL,
@@ -1265,6 +1288,9 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	// --remove-orphans removes those of services the bundle no longer has.
 	if p.existingID != "" {
 		stopTurnedOff(p.dir, envPath, tagged, before, profiles)
+		if p.strict {
+			removeInactiveDataPlane(p.dir, envPath, tagged, profiles)
+		}
 	}
 	sp := ui.Start("Starting services")
 	if out, err := dockerRun(tagged, "docker", composeCmd(p.dir, envPath, "up", "-d", "--remove-orphans")...); err != nil {
@@ -1292,12 +1318,8 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	// The deploy succeeds only when the events table the services now run on
 	// is the one the release writes, and the images that run are the
 	// release's.
-	got, why := eventsTableProblem(p.dir, envPath, p.imageTag)
-	if why != "" {
-		return eventsTableFail(p.dir, envPath, p.imageTag, got, why)
-	}
-	if why := runningImagesProblem(p.dir, envPath, p.imageTag, got.gen); why != "" {
-		return runningImagesFail(p.dir, envPath, p.imageTag, why)
+	if err := checkAfterUp(p.dir, envPath, p.imageTag, p.strict); err != nil {
+		return err
 	}
 	if p.resetPending != "" {
 		if restarted {

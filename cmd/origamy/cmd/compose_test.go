@@ -429,7 +429,7 @@ func TestEventsTableProblem(t *testing.T) {
 				return "", nil
 			})
 			var why string
-			out := captureStdout(t, func() { _, why = eventsTableProblem("/dp", "/dp/.env", tc.tag) })
+			out := captureStdout(t, func() { _, why = eventsTableProblem("/dp", "/dp/.env", tc.tag, true) })
 			if (why == "") != (tc.problem == "") || !strings.Contains(why, tc.problem) {
 				t.Fatalf("why %q\n%s", why, out)
 			}
@@ -479,13 +479,42 @@ func TestRunningImagesProblem(t *testing.T) {
 		{"another tag", "", with("ingestion-gateway", gw+"0.1.17"), "json", nil, "ingestion-gateway runs " + gw + "0.1.17"},
 		{"no container", "", with("ingestion-gateway", ""), "json", nil, "ingestion-gateway has no container"},
 		{"an override pins another tag", "services:\n  ingestion-gateway:\n    image: " + gw + "0.1.19\n", with("ingestion-gateway", gw+"0.1.19"), "json", nil, "ingestion-gateway runs " + gw + "0.1.19"},
-		{"a digest-pinned release", "services:\n  ingestion-gateway:\n    image: " + gw + "0.1.20@sha256:00\n", with("ingestion-gateway", gw+"0.1.20@sha256:00"), "json", nil, ""},
+		// A digest decides, not the tag text next to it.
+		{"a digest-pinned release", "services:\n  ingestion-gateway:\n    image: " + gw + "0.1.20@sha256:00\n", with("ingestion-gateway", gw+"0.1.20@sha256:00"), "json", func(f *fakeCompose) {
+			f.ids[gw+"0.1.20@sha256:00"] = f.imageID(gw + "0.1.20")
+		}, ""},
+		{"a digest-pinned older image under the release's tag", "services:\n  ingestion-gateway:\n    image: " + gw + "0.1.20@sha256:00\n", with("ingestion-gateway", gw+"0.1.20@sha256:00"), "json", nil,
+			"ingestion-gateway runs " + gw + "0.1.20@sha256:00"},
+		// A tag that names another image now than when the container was made.
+		{"a tag that moved", "", release, "json", func(f *fakeCompose) {
+			f.containerImage["ingestion-gateway"] = f.imageID(gw + "0.1.17")
+		}, "ingestion-gateway runs " + "sha256:" + sha256Hex([]byte(gw+"0.1.17")) + ", created from " + gw + "0.1.20 when that tag named another image than the release's " + gw + "0.1.20"},
 		// Compose before 2.15 names no image: docker inspect does.
 		{"ps without images", "", release, "json", func(f *fakeCompose) { f.psNoImage = true }, ""},
 		{"ps without images, another tag", "", with("ingestion-gateway", gw+"0.1.17"), "json", func(f *fakeCompose) { f.psNoImage = true }, "ingestion-gateway runs " + gw + "0.1.17"},
-		// A profile that is off: its container is not checked (stopTurnedOff
-		// stops it when a run turns the profile off).
-		{"a container of a profile that is off", "", with("orchestrator-engine", ai+"0.1.19"), "json", nil, ""},
+		// A container of a profile that is off still runs: one on an older
+		// release fails the run (removeInactiveDataPlane removes it before `up -d`
+		// on a move that can touch the events table); one on the release's does not.
+		{"an old container of a profile that is off", "", with("orchestrator-engine", ai+"0.1.19"), "json", nil,
+			"orchestrator-engine (not run by the configuration) runs " + ai + "0.1.19"},
+		{"a container of a profile that is off, on the release", "", with("orchestrator-engine", ai+"0.1.20"), "json", nil, ""},
+		// Every container of the project that runs a data-plane image: also
+		// one an override file adds, one under a service name the CLI does not
+		// know, whose image is, by ID, one of the data-plane images on this host.
+		{"an old writer an override adds", "services:\n  bulker-worker-2:\n    image: " + dpImage + "bulker-worker:0.1.16\n", with("bulker-worker-2", dpImage+"bulker-worker:0.1.16"), "json", nil,
+			"bulker-worker-2 runs " + dpImage + "bulker-worker:0.1.16"},
+		{"a writer an override adds, on the release", "services:\n  bulker-worker-2:\n    image: " + dpImage + "bulker-worker:0.1.20\n", with("bulker-worker-2", dpImage+"bulker-worker:0.1.20"), "json", nil, ""},
+		{"an old writer under a name nobody knows, from a mirror", "", with("shadow", "mirror.example.com/x/bw:1"), "json", func(f *fakeCompose) {
+			f.ids["mirror.example.com/x/bw:1"] = f.imageID(dpImage + "bulker-worker:0.1.16")
+			f.images = []string{dpImage + "bulker-worker:0.1.16"}
+		}, "shadow (not run by the configuration) runs mirror.example.com/x/bw:1, which is not the release's image " + dpImage + "bulker-worker:0.1.20"},
+		{"a stopped old container of an extra service", "", with("bulker-worker-2", dpImage+"bulker-worker:0.1.16"), "json", func(f *fakeCompose) { f.states["bulker-worker-2"] = "exited" }, ""},
+		{"an old writer, restarting", "", with("bulker-worker-2", dpImage+"bulker-worker:0.1.16"), "json", func(f *fakeCompose) { f.states["bulker-worker-2"] = "restarting" },
+			"bulker-worker-2 (not run by the configuration) runs " + dpImage + "bulker-worker:0.1.16"},
+		// scale: 0 and deploy.replicas: 0 run a service nowhere, on purpose.
+		{"scaled to 0", "services:\n  ingestion-gateway:\n    scale: 0\n", with("ingestion-gateway", ""), "json", nil, ""},
+		{"replicas 0", "services:\n  ingestion-gateway:\n    deploy:\n      replicas: 0\n", with("ingestion-gateway", ""), "json", nil, ""},
+		{"scaled to 0, but still running old", "services:\n  ingestion-gateway:\n    scale: 0\n", with("ingestion-gateway", gw+"0.1.17"), "json", nil, "ingestion-gateway runs " + gw + "0.1.17"},
 		// From a registry mirror: the release's image by ID, or by label.
 		{"a mirror of the release", mirrored, with("ingestion-gateway", mirror+"0.1.20"), "json", func(f *fakeCompose) { f.ids[mirror+"0.1.20"] = f.imageID(gw + "0.1.20") }, ""},
 		{"a mirror of the release, pulled to compare", mirrored, with("ingestion-gateway", mirror+"0.1.20"), "json", func(f *fakeCompose) {
@@ -504,7 +533,7 @@ func TestRunningImagesProblem(t *testing.T) {
 		{"a ClickHouse tag without a version, the server new enough", "", with("clickhouse", "registry.example.com/clickhouse-server:prod"), "json", func(f *fakeCompose) { f.server = "25.3.14.14\n" }, ""},
 		{"a ClickHouse tag without a version, the server older", "", with("clickhouse", "registry.example.com/clickhouse-server:prod"), "json", func(f *fakeCompose) { f.server = "24.8.14.39\n" }, "clickhouse runs registry.example.com/clickhouse-server:prod (ClickHouse 24.8)"},
 		{"a ClickHouse tag without a version, no answer", "", with("clickhouse", "registry.example.com/clickhouse-server:prod"), "json", nil, "whose version neither its tag nor the server"},
-		{"compose cannot list them", "", release, "json", func(f *fakeCompose) { f.psFails = true }, "docker compose could not list the containers that run"},
+		{"docker cannot list them", "", release, "json", func(f *fakeCompose) { f.psFails = true }, "docker could not list the containers of the compose project"},
 		// The bundle's compose file itself edited to take a data-plane image
 		// from a mirror: still a data-plane service, by its name.
 		{"an edited compose file with a mirror", "<edited>", with("ingestion-gateway", mirror+"0.1.20"), "json", nil, "which is not the release's image " + gw + "0.1.20"},
@@ -541,11 +570,15 @@ func TestRunningImagesProblem(t *testing.T) {
 	t.Setenv("DP_IMAGE_TAG", "0.1.16")
 	env := filepath.Join(t.TempDir(), ".env")
 	writeFile(t, env, "DP_IMAGE_TAG=0.1.20\nDP_IMAGE_TAG=0.1.17\n")
-	causes := strings.Join(runningImagesCauses("/dp", env, "0.1.20"), "\n")
-	for _, want := range []string{"DP_IMAGE_TAG=0.1.16 is exported in your shell", ".env has 2 DP_IMAGE_TAG lines, and docker compose takes the last (0.1.17)", "config --images", "registry mirror"} {
+	causes := strings.Join(runningImagesCauses("/dp", env, "0.1.20", "portal-agent runs x, which is not the release's image y"), "\n")
+	for _, want := range []string{"DP_IMAGE_TAG=0.1.16 is exported in your shell", ".env has 2 DP_IMAGE_TAG lines, and docker compose takes the last (0.1.17)", "config --images", "registry mirror", "docker save", "docker tag"} {
 		if !strings.Contains(causes, want) {
 			t.Errorf("causes lack %q:\n%s", want, causes)
 		}
+	}
+	// The advice on mirrors comes with a failure about comparing images only.
+	if causes := strings.Join(runningImagesCauses("/dp", env, "0.1.20", "portal-agent is set to y:0.1.19"), "\n"); strings.Contains(causes, "registry mirror") {
+		t.Errorf("a tag mismatch is advised about mirrors:\n%s", causes)
 	}
 }
 

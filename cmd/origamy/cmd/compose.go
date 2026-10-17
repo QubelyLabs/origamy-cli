@@ -31,7 +31,7 @@ func existingProjectID(dir string) string {
 	if !fileExists(filepath.Join(dir, "docker-compose.yml")) {
 		return ""
 	}
-	return readEnvVar(filepath.Join(dir, ".env"), "DATA_PLANE_ID")
+	return dotenvValue(filepath.Join(dir, ".env"), "DATA_PLANE_ID")
 }
 
 // composeProjectDir finds the Origamy compose project to operate on: the
@@ -333,8 +333,11 @@ func (c clickhouseConn) probe() liveSchema {
 
 // wait waits, up to clickhouseReadyTimeout, until ClickHouse answers a
 // query. out is what the last ping printed when it never did.
-func (c clickhouseConn) wait() (out string, ok bool) {
-	deadline := time.Now().Add(clickhouseReadyTimeout)
+func (c clickhouseConn) wait() (out string, ok bool) { return c.waitFor(clickhouseReadyTimeout) }
+
+// waitFor is wait for up to d.
+func (c clickhouseConn) waitFor(d time.Duration) (out string, ok bool) {
+	deadline := time.Now().Add(d)
 	for {
 		o, err := c.exec(clickhousePing)
 		if err == nil {
@@ -370,13 +373,6 @@ func (l liveSchema) describe() string {
 	return "an events table it did not say"
 }
 
-// waitClickHouse waits, up to clickhouseReadyTimeout, until the project's
-// ClickHouse answers a query. out is what the last ping printed when it never
-// did. env is the compose environment (composeEnv).
-func waitClickHouse(dir, envPath string, env []string) (out string, ok bool) {
-	return clickhouseConn{dir: dir, envPath: envPath, env: env}.wait()
-}
-
 var (
 	// reComposeName is a compose file's top-level name.
 	reComposeName = regexp.MustCompile(`(?m)^name:[ \t]*["']?([^"'\s#]+)`)
@@ -392,7 +388,7 @@ var (
 // name `origamy deploy` gave the project. A COMPOSE_PROJECT_NAME exported in
 // the shell is not taken (composeShellVars): it can name another project.
 func composeProjectName(dir, envPath string) string {
-	name := unquoteEnv(readEnvVar(envPath, "COMPOSE_PROJECT_NAME"))
+	name := dotenvValue(envPath, "COMPOSE_PROJECT_NAME")
 	if b, err := os.ReadFile(filepath.Join(dir, "docker-compose.yml")); name == "" && err == nil {
 		if m := reComposeName.FindSubmatch(b); m != nil {
 			name = string(m[1])
@@ -404,6 +400,12 @@ func composeProjectName(dir, envPath string) string {
 		}
 		name = filepath.Base(dir)
 	}
+	return normalizeProjectName(name)
+}
+
+// normalizeProjectName is a compose project name as compose spells it:
+// lowercased to the characters it keeps.
+func normalizeProjectName(name string) string {
 	keep := strings.Map(func(r rune) rune {
 		if r == '-' || r == '_' || ('a' <= r && r <= 'z') || ('0' <= r && r <= '9') {
 			return r
@@ -465,13 +467,20 @@ func composeOwners(dir, name string) (o projectOwners, out string, ok bool) {
 // CLI pins (composeOwners): `up -d` would start a second copy of the plane
 // next to the one that runs. It was started with a COMPOSE_PROJECT_NAME
 // exported in the shell, which the CLI no longer takes from there; .env is
-// where it belongs. Containers under both names are only warned about.
-// nil when the plane runs under the pinned name, or none of it runs.
+// where it belongs. Containers under both names are only warned about. A
+// plane none of whose containers exist (a `docker compose down`) while its
+// data volumes do, under another name, is refused too (strandedPlane):
+// going on would start a new, empty plane beside them.
+// nil when the plane runs under the pinned name, or it exists under no other.
 func otherProjectName(dir, envPath, nothing string) error {
 	name := composeProjectName(dir, envPath)
-	o, _, ok := composeOwners(dir, name)
+	o, rows, ok := composeOwners(dir, name)
 	switch {
-	case !ok || len(o.here) == 0:
+	case !ok:
+		return nil
+	case len(o.here) == 0 && !o.pinned && len(o.elsewhere) == 0:
+		return strandedPlane(dir, name, rows, nothing)
+	case len(o.here) == 0:
 		return nil
 	case o.pinned:
 		ui.Warn("Containers from %s also run under the compose project name %s; this run works on %s, the project's own name, and leaves them as they are.", dir, strings.Join(o.here, ", "), name)
@@ -479,6 +488,103 @@ func otherProjectName(dir, envPath, nothing string) error {
 	}
 	return fail(fmt.Sprintf("This data plane's containers run under the compose project name %s, not %s, the name every docker compose command of this CLI pins for %s (a COMPOSE_PROJECT_NAME exported in the shell when they were started; the CLI no longer takes it from there).", strings.Join(o.here, ", "), name, dir),
 		"Put the name they run under in "+envPath+" (COMPOSE_PROJECT_NAME="+o.here[0]+"), then rerun. "+nothing)
+}
+
+// composeVolume is a named volume compose made: its Docker name, the
+// compose project (com.docker.compose.project) and the key of the compose
+// file's volumes: (com.docker.compose.volume) it carries.
+type composeVolume struct{ name, project, key string }
+
+// planeVolumeKeys are the volumes: of the bundle that hold the plane's data.
+var planeVolumeKeys = []string{"clickhouse-data", "dp-redis-data", "nats-data", "dp-postgres-data"}
+
+// composeVolumes lists the volumes compose made on this Docker host; out is
+// what docker printed when ok is false.
+func composeVolumes() (vols []composeVolume, out string, ok bool) {
+	out, err := dockerRun(nil, "docker", "volume", "ls", "--filter", "label=com.docker.compose.project", "--format",
+		`{{.Name}}`+"\t"+`{{.Label "com.docker.compose.project"}}`+"\t"+`{{.Label "com.docker.compose.volume"}}`)
+	if err != nil {
+		return nil, out, false
+	}
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Split(strings.TrimRight(l, "\r"), "\t"); len(f) == 3 && f[0] != "" {
+			vols = append(vols, composeVolume{name: f[0], project: f[1], key: f[2]})
+		}
+	}
+	return vols, out, true
+}
+
+// planeVolumes sorts the data volumes compose made by project against the
+// plane in dir, pinned as name: mine are the ones under name, others the
+// ones of a plane like it under other project names, by name, that is not
+// running from another directory that still exists (rows: composeOwners'
+// containers). ok is false when Docker could not list them.
+func planeVolumes(dir, name, rows string) (mine []string, others map[string][]string, ok bool) {
+	vols, _, ok := composeVolumes()
+	if !ok {
+		return nil, nil, false
+	}
+	this, _ := os.Stat(dir)
+	alive := map[string]bool{}
+	for _, l := range strings.Split(rows, "\n") {
+		project, wd, row := strings.Cut(strings.TrimRight(l, "\r"), "\t")
+		if fi, err := os.Stat(wd); row && wd != "" && err == nil && !(this != nil && os.SameFile(this, fi)) {
+			alive[project] = true
+		}
+	}
+	others = map[string][]string{}
+	for _, v := range vols {
+		switch {
+		case v.project == name:
+			mine = append(mine, v.name)
+		case v.project != "" && slices.Contains(planeVolumeKeys, v.key) && !alive[v.project]:
+			others[v.project] = append(others[v.project], v.name)
+		}
+	}
+	return mine, others, true
+}
+
+// otherVolumesList writes the volumes of planeVolumes' others as
+// "volume, volume (project X)" for a message, the project the shell exports
+// first, and the project to suggest.
+func otherVolumesList(others map[string][]string) (list, suggest string) {
+	projects := slices.Sorted(maps.Keys(others))
+	shell := normalizeProjectName(os.Getenv("COMPOSE_PROJECT_NAME"))
+	slices.SortStableFunc(projects, func(a, b string) int {
+		return cmp.Compare(map[bool]int{true: 0, false: 1}[a == shell], map[bool]int{true: 0, false: 1}[b == shell])
+	})
+	var parts []string
+	for _, p := range projects {
+		slices.Sort(others[p])
+		parts = append(parts, strings.Join(others[p], ", ")+" (compose project "+p+")")
+	}
+	if len(projects) > 0 {
+		suggest = projects[0]
+	}
+	return strings.Join(parts, "; "), suggest
+}
+
+// strandedPlane refuses to go on with a plane that has no container and no
+// volume under the compose project name the CLI pins for it (name) while
+// the data volumes of a plane like it exist under another name: it ran with
+// a COMPOSE_PROJECT_NAME exported in the shell (or a -p), and was taken down.
+// `up -d` under the pinned name would create a new, empty plane (network,
+// volumes, a ClickHouse without the history) and report the upgrade as done.
+// Nothing has been created when it refuses. rows are composeOwners'
+// containers. nil when the plane has volumes of its own, or there are none to
+// mistake for them.
+func strandedPlane(dir, name, rows, nothing string) error {
+	mine, others, ok := planeVolumes(dir, name, rows)
+	if !ok || len(mine) > 0 || len(others) == 0 {
+		return nil
+	}
+	list, suggest := otherVolumesList(others)
+	shell := ""
+	if v := os.Getenv("COMPOSE_PROJECT_NAME"); v != "" && normalizeProjectName(v) != name {
+		shell = " Your shell exports COMPOSE_PROJECT_NAME=" + v + ", which this CLI ignores."
+	}
+	return fail(fmt.Sprintf("Nothing of this data plane exists under the compose project name %s, the name every docker compose command of this CLI pins for %s, but the data volumes of a plane like it do under another: %s.%s Going on would start a new, empty plane (a ClickHouse without the history) next to them.", name, dir, list, shell),
+		"If they are this plane's (it ran under that name, with COMPOSE_PROJECT_NAME exported in your shell or a -p), put the name in "+filepath.Join(dir, ".env")+" (COMPOSE_PROJECT_NAME="+suggest+"), then rerun. If the shell's variable names another project, unset it (unset COMPOSE_PROJECT_NAME), and if this plane has no data to keep, start it under its own name first (`docker compose -p "+name+" --project-directory "+dir+" up -d`), then rerun. "+nothing)
 }
 
 // clickhouseContainer finds the project's ClickHouse container by the labels
@@ -583,15 +689,29 @@ func initRunning(dir, envPath string, env []string) bool {
 // production, sha-…; see unknownRelease) never passes: a run whose images
 // may not write the table must not report success. A missing table is asked
 // about again while the init service `up -d` started is still at work.
-// runningImagesProblem checks that the images of tag are the ones that run.
-func eventsTableProblem(dir, envPath, tag string) (liveSchema, string) {
+// strict is a move that can touch the events table (canTouchEventsTable),
+// which waits clickhouseReadyTimeout for ClickHouse; any other waits
+// advisoryWait, and a ClickHouse that does not answer (gen "") is a warning
+// in the output rather than a failure of the spinner: the caller goes on.
+func eventsTableProblem(dir, envPath, tag string, strict bool) (liveSchema, string) {
 	env := composeEnv(tag)
-	sp := ui.Start("Checking the events table the %s images write to", tag)
-	if out, ok := waitClickHouse(dir, envPath, env); !ok {
-		sp.Fail("ClickHouse did not answer within %s", clickhouseReadyTimeout)
-		return liveSchema{out: out}, "ClickHouse did not answer, so whether " + eventsTable + " is there could not be checked"
+	wait := clickhouseReadyTimeout
+	if !strict {
+		wait = advisoryWait
 	}
-	deadline := time.Now().Add(clickhouseReadyTimeout)
+	sp := ui.Start("Checking the events table the %s images write to", tag)
+	unasked := func(live liveSchema, why string) (liveSchema, string) {
+		if strict {
+			sp.Fail("%s", why)
+		} else {
+			sp.Warn("%s", why)
+		}
+		return live, why
+	}
+	if out, ok := (clickhouseConn{dir: dir, envPath: envPath, env: env}).waitFor(wait); !ok {
+		return unasked(liveSchema{out: out}, "ClickHouse did not answer within "+wait.String()+", so whether "+eventsTable+" is there could not be checked")
+	}
+	deadline := time.Now().Add(wait)
 	var live liveSchema
 	for {
 		live = probeLiveSchema(dir, envPath, env)
@@ -605,7 +725,7 @@ func eventsTableProblem(dir, envPath, tag string) (liveSchema, string) {
 	why := ""
 	switch {
 	case live.gen == "":
-		why = "ClickHouse did not say which events table it holds"
+		return unasked(live, "ClickHouse did not say which events table it holds")
 	case !live.known():
 		why = "ClickHouse holds " + live.describe()
 	case want == "unknown":
@@ -621,333 +741,82 @@ func eventsTableProblem(dir, envPath, tag string) (liveSchema, string) {
 	return live, ""
 }
 
-// reImageID is an image's ID, which Docker shows for a container in place of
-// the reference it was created from once that tag names another image.
-var reImageID = regexp.MustCompile(`^(sha256:)?[0-9a-f]{12,64}$`)
+// advisoryWait is how long the check after `up -d` of a move that cannot
+// touch the events table waits for ClickHouse: the move changes nothing in
+// it, so the check is a courtesy, not a gate. A variable so tests need not
+// wait.
+var advisoryWait = 30 * time.Second
 
-// imageTag is the tag of an image reference ("" when it names none).
-func imageTag(ref string) string {
-	ref, _, _ = strings.Cut(ref, "@")
-	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
-		return ref[i+1:]
+// canTouchEventsTable reports whether moving a Docker project from the
+// release installed to tag can touch the events table: a storage reset is
+// recorded (pending), or the two releases write different events tables (a
+// move across the reset, up or down), or either is no numbered release, so
+// which table its images write is not known. Only such a move gets the heavy
+// checks (what ClickHouse holds, asked and started; the images that start and
+// the ones that run, every container of the project, compared with the
+// release's by ID). Any other move (0.1.19 → 0.1.20, a rollback within a
+// generation, an in-place deploy of the release a plane runs) behaves like
+// CLI v0.1.20 did, but for cheap checks that never refuse and never start
+// anything: it escalates to the heavy path when ClickHouse, peeked at,
+// turns out to hold another generation than the release writes.
+func canTouchEventsTable(installed, tag, pending string) bool {
+	if pending != "" {
+		return true
 	}
-	return ""
+	from, to := releaseSchemaGeneration(installed), releaseSchemaGeneration(tag)
+	return from == "unknown" || to == "unknown" || from != to
 }
 
-// imageRepo is the repository of an image reference: without its tag and
-// digest.
-func imageRepo(ref string) string {
-	ref, _, _ = strings.Cut(ref, "@")
-	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
-		return ref[:i]
+// peekClickHouse is askClickHouse without a side effect: it asks the
+// project's ClickHouse which events table it holds, through compose or, when
+// compose cannot load the project, through its container if that runs, and
+// starts nothing. gen stays "" when it could not be asked.
+func peekClickHouse(dir, envPath, tag string) liveSchema {
+	live := clickhouseConn{dir: dir, envPath: envPath, env: composeEnv(tag)}.probe()
+	if live.gen != "" {
+		return live
 	}
-	return ref
-}
-
-// dpService is a data-plane service as a project's compose configuration
-// runs it: image is the image compose starts it from (override files and
-// COMPOSE_FILE included), release the one the bundle's own compose file
-// names for it, an image of dataPlaneImageRepo.
-type dpService struct{ name, image, release string }
-
-// dataPlaneRegistry is where the release's data-plane images come from.
-const dataPlaneRegistry = "ghcr.io/qubelylabs/" + dataPlaneImageRepo
-
-// bundleDataPlaneServices are the data-plane services of every compose bundle
-// so far (0.1.16 to 0.1.20), each named like its image in dataPlaneRegistry:
-// one of them is a data-plane service whatever image a compose file the
-// operator edited gives it.
-var bundleDataPlaneServices = []string{
-	"ingestion-gateway", "transformer-engine", "identity-resolver", "segment-evaluator",
-	"bulker-worker", "config-sync", "portal-agent", "workflow-engine", "orchestrator-engine",
-}
-
-// dataPlaneServices are the data-plane services the compose configuration of
-// the project in dir runs with env (the release, tag, in DP_IMAGE_TAG; the
-// profiles that are on), main in place of its docker-compose.yml (the
-// refreshed one, before it is swapped in). They are told by name: every
-// service whose image the compose file itself (main alone) takes from
-// dataPlaneImageRepo, and every one of bundleDataPlaneServices. An override
-// file, COMPOSE_FILE or an edit can take that image from elsewhere (a
-// registry mirror) or pin another tag, and image is then what compose runs.
-// The services of a profile that is off are not among them.
-func dataPlaneServices(dir, envPath, tag string, env []string, main string) ([]dpService, error) {
-	files := composeFileArgs(dir, envPath, main)
-	full, err := effectiveCompose(dir, envPath, env, files)
-	if err != nil {
-		return nil, err
-	}
-	base := full
-	if !slices.Equal(files, []string{"-f", main}) {
-		if base, err = effectiveCompose(dir, envPath, env, []string{"-f", main}); err != nil {
-			return nil, err
+	if id, running := clickhouseContainer(dir, envPath); running {
+		if l := (clickhouseConn{id: id}).probe(); l.gen != "" {
+			ui.Step("Asked ClickHouse through its container (%s), which docker compose could not reach in this project (%s).", id, orDash(lastLines(live.out, 1)))
+			return l
 		}
 	}
-	var svcs []dpService
-	for _, name := range slices.Sorted(maps.Keys(base.Services)) {
-		s, on := full.Services[name]
-		release := base.Services[name].Image
-		if !strings.Contains(release, dataPlaneImageRepo) && slices.Contains(bundleDataPlaneServices, name) {
-			release = dataPlaneRegistry + name + ":" + tag
-		}
-		if on && strings.Contains(release, dataPlaneImageRepo) {
-			svcs = append(svcs, dpService{name: name, image: s.Image, release: release})
-		}
-	}
-	return svcs, nil
+	return live
 }
 
-// versionLabel is the org.opencontainers.image.version label in an image's
-// or a container's configuration, as `{{json .Config}}` prints it. (A
-// template that reads .Config.Labels itself fails on an image without
-// labels: docker inspect's templates refuse a missing key.)
-func versionLabel(config string) string {
-	var c struct {
-		Labels map[string]string `json:"Labels"`
-	}
-	_ = json.Unmarshal([]byte(config), &c)
-	return c.Labels["org.opencontainers.image.version"]
-}
-
-// imageInfo is a local image's ID and its org.opencontainers.image.version
-// label; ok is false when this host does not have it.
-func imageInfo(ref string) (id, version string, ok bool) {
-	out, err := dockerRun(nil, "docker", "image", "inspect", "--format", `{{.Id}}`+"\t"+`{{json .Config}}`, ref)
-	id, config, _ := strings.Cut(strings.TrimSpace(out), "\t")
-	if err != nil || !strings.HasPrefix(id, "sha256:") {
-		return "", "", false
-	}
-	return id, versionLabel(config), true
-}
-
-// releaseImages finds the image IDs of the release's own images, which a
-// data-plane image from another registry (a mirror) is compared with:
-// inspected, and pulled first when this host does not have one. Each is
-// looked up once per check.
-type releaseImages map[string]struct {
-	id  string
-	err error
-}
-
-func (r releaseImages) id(ref string) (string, error) {
-	if got, ok := r[ref]; ok {
-		return got.id, got.err
-	}
-	id, _, ok := imageInfo(ref)
-	var err error
-	if !ok {
-		if out, perr := dockerRun(nil, "docker", "pull", ref); perr != nil {
-			err = errors.New(orDash(lastLines(out, 1)))
-		} else if id, _, ok = imageInfo(ref); !ok {
-			err = errors.New("docker pull " + ref + " left no image")
-		}
-	}
-	r[ref] = struct {
-		id  string
-		err error
-	}{id, err}
-	return id, err
-}
-
-// mirrorProblem says why ref, an image of data-plane service s that comes
-// from another repository than the release's own (a registry mirror), with
-// image ID id and version label version ("" for none), is not the release's
-// image, "" when it is: its version label names tag, or it is the very image
-// (same ID) the release's own reference names.
-func (s dpService) mirrorProblem(tag, ref, id, version string, rel releaseImages) string {
-	if version == tag || version == "v"+tag {
-		return ""
-	}
-	rid, err := rel.id(s.release)
+// checkAfterUp is the check after the last `up -d` of an upgrade or an
+// in-place deploy to tag: the run succeeds only when the events table the
+// services now run on is the one the release writes, and, on a move that can
+// touch it (strict), the images that run are the release's. A table of
+// another generation, or none, fails any move (and is recorded as a storage
+// reset still to do: eventsTableFail). A ClickHouse that cannot be asked, and
+// the images, fail a strict move only; any other move, which cannot have
+// changed either, is told of it in a warning.
+func checkAfterUp(dir, envPath, tag string, strict bool) error {
+	got, why := eventsTableProblem(dir, envPath, tag, strict)
 	switch {
-	case err != nil:
-		return s.name + " runs " + ref + ", from another registry than the release's image " + s.release + ", which could not be pulled here to compare them (" + err.Error() + ")"
-	case id == "":
-		return s.name + " runs " + ref + ", from another registry than the release's image " + s.release + ", and which image it is could not be read"
-	case id != rid:
-		return s.name + " runs " + ref + ", which is not the release's image " + s.release + " (another image, by ID)"
+	case why == "":
+	case strict || got.gen != "":
+		return eventsTableFail(dir, envPath, tag, got, why)
+	default:
+		ui.Warn("Whether %s holds the table the %s images write was not checked: this move does not change which table they write.", eventsTable, tag)
+		ui.Detail("Check: %s", composeHint(dir, envPath)+" exec clickhouse sh -c '"+clickhouseEventsPropertiesType+"'")
 	}
-	return ""
-}
-
-// projectContainer is a container of the project and what it runs: the
-// image reference it was created from, the image it is (by ID) and that
-// image's org.opencontainers.image.version label.
-type projectContainer struct{ service, state, ref, image, version string }
-
-// inspectContainers asks Docker what each container `docker compose ps`
-// listed was created from: Compose before 2.15 lists no image, and one whose
-// tag names another image now is listed by the image's ID.
-func inspectContainers(listed []composeService) []projectContainer {
-	var ids []string
-	for _, s := range listed {
-		if s.ID != "" {
-			ids = append(ids, s.ID)
+	if strict {
+		if why := runningImagesProblem(dir, envPath, tag, got.gen); why != "" {
+			return runningImagesFail(dir, envPath, tag, why)
 		}
+		return nil
 	}
-	inspected := map[string][]string{}
-	if len(ids) > 0 {
-		// A container removed since the listing fails the command but not
-		// the others' lines.
-		out, _ := dockerRun(nil, "docker", append([]string{"inspect", "--format",
-			`{{.Id}}` + "\t" + `{{.Config.Image}}` + "\t" + `{{.Image}}` + "\t" + `{{json .Config}}`}, ids...)...)
-		for _, l := range strings.Split(out, "\n") {
-			if f := strings.Split(strings.TrimRight(l, "\r"), "\t"); len(f) == 4 && f[0] != "" {
-				inspected[f[0]] = f[1:]
-			}
-		}
+	notes, wrongGen := advisoryImageNotes(dir, envPath, tag)
+	if len(wrongGen) > 0 {
+		return runningImagesFail(dir, envPath, tag, "not every container runs what the "+tag+" release does: "+strings.Join(wrongGen, "; ")+" (a release that writes the other events table than ClickHouse holds)")
 	}
-	var cs []projectContainer
-	for _, s := range listed {
-		c := projectContainer{service: s.Service, state: strings.ToLower(s.State), ref: s.Image}
-		for id, f := range inspected {
-			if s.ID != "" && strings.HasPrefix(id, s.ID) {
-				c.ref, c.image, c.version = cmp.Or(f[0], s.Image), f[1], versionLabel(f[2])
-			}
-		}
-		cs = append(cs, c)
+	for _, n := range notes {
+		ui.Warn("%s, not the %s release; an override file or an edit of docker-compose.yml pins it. This move does not change which events table the images write, so the run goes on.", n, tag)
 	}
-	return cs
-}
-
-// runningImagesProblem is the rest of the check after the last `up -d`
-// (eventsTableProblem): the containers that run are the release's. Every
-// data-plane service the project's configuration runs (dataPlaneServices:
-// told by name, whatever registry an override takes its image from) has a
-// container, and each of its containers runs the image the configuration
-// names for it, on tag; one from another registry than the release's (a
-// mirror) must be the release's image itself (mirrorProblem). While
-// ClickHouse holds the new events table (gen), ClickHouse runs
-// minClickHouseForJSON or newer (as its image's tag says, or the server when
-// the tag names no version). The services of a profile that is off are not
-// checked: compose keeps their containers, which the run that turns the
-// profile off stops (stopTurnedOff). What a container runs is what docker
-// inspect says it was created from (inspectContainers). It returns why the
-// images are not the release's, "" when they are.
-func runningImagesProblem(dir, envPath, tag, gen string) string {
-	sp := ui.Start("Checking the images that run")
-	failed := func(why string) string {
-		sp.Fail("%s", why)
-		return why
-	}
-	env := composeEnv(tag)
-	svcs, err := dataPlaneServices(dir, envPath, tag, env, filepath.Join(dir, "docker-compose.yml"))
-	if err != nil {
-		return failed("the configuration the project runs could not be read (" + err.Error() + ")")
-	}
-	out, err := dockerRun(env, "docker", composeCmd(dir, envPath, "ps", "-a", "--format", "json")...)
-	listed, perr := parseComposePS(composeRows(out))
-	if err != nil || perr != nil {
-		return failed("docker compose could not list the containers that run (" + orDash(lastLines(out, 1)) + ")")
-	}
-	// Only what is checked: the data-plane services and ClickHouse.
-	listed = slices.DeleteFunc(listed, func(c composeService) bool {
-		return c.Service != "clickhouse" && !slices.ContainsFunc(svcs, func(s dpService) bool { return s.name == c.Service })
-	})
-	byService := map[string][]projectContainer{}
-	for _, c := range inspectContainers(listed) {
-		byService[c.service] = append(byService[c.service], c)
-	}
-	var wrong []string
-	if len(svcs) == 0 {
-		wrong = append(wrong, "the project's configuration runs no data-plane service")
-	}
-	rel := releaseImages{}
-	for _, s := range svcs {
-		if len(byService[s.name]) == 0 {
-			wrong = append(wrong, s.name+" has no container")
-		}
-		for _, c := range byService[s.name] {
-			switch {
-			case c.ref == "" || reImageID.MatchString(c.ref):
-				wrong = append(wrong, s.name+" runs image "+orDash(c.ref)+", whose reference could not be read")
-			case imageTag(c.ref) != tag:
-				wrong = append(wrong, s.name+" runs "+c.ref)
-			case imageRepo(c.ref) != imageRepo(s.image):
-				// Not recreated from what the configuration names now.
-				wrong = append(wrong, s.name+" runs "+c.ref+", and its configuration names "+s.image)
-			case imageRepo(c.ref) != imageRepo(s.release):
-				if why := s.mirrorProblem(tag, c.ref, c.image, c.version, rel); why != "" {
-					wrong = append(wrong, why)
-				}
-			}
-		}
-	}
-	clickhouse := ""
-	for _, c := range byService["clickhouse"] {
-		if c.state == "running" {
-			clickhouse = c.ref
-		}
-	}
-	if gen == "json" {
-		needs := ", and the new events table needs ClickHouse " + minClickHouseForJSON + " or newer"
-		switch v, ok := clickHouseImageVersion(clickhouse); {
-		case clickhouse == "":
-			wrong = append(wrong, "ClickHouse is not among the containers that run")
-		case !ok:
-			// A tag that names no version (latest, a registry's own name):
-			// the server itself says which it is.
-			out, err := clickhouseConn{dir: dir, envPath: envPath, env: env}.exec(clickhouseServerVersion)
-			if sv, ok := serverVersion(out); err != nil || !ok {
-				wrong = append(wrong, "clickhouse runs "+clickhouse+", whose version neither its tag nor the server ("+orDash(lastLines(out, 1))+") tells"+needs)
-			} else if versionLess(sv+".0", minClickHouseForJSON+".0") {
-				wrong = append(wrong, "clickhouse runs "+clickhouse+" (ClickHouse "+sv+")"+needs)
-			}
-		case versionLess(v+".0", minClickHouseForJSON+".0"):
-			wrong = append(wrong, "clickhouse runs "+clickhouse+needs)
-		}
-	}
-	if len(wrong) > 0 {
-		why := "not every container runs what the " + tag + " release does: " + strings.Join(wrong, "; ")
-		sp.Fail("Not every container runs the %s images", tag)
-		return why
-	}
-	sp.Success("Every data-plane service runs the %s images", tag)
-	return ""
-}
-
-// plannedImagesProblem is the first half of runningImagesProblem, made before
-// an upgrade's commit point: the data-plane services the project's
-// configuration starts once refresh r is in (its compose file in place of
-// docker-compose.yml when it replaces it), with the run's environment (env:
-// the release, the AI toggle's profiles), are on tag, and an image from
-// another registry than the release's (a mirror), which pullImages just
-// pulled, is the release's image itself (mirrorProblem). It returns why not,
-// "" when they are.
-func plannedImagesProblem(dir, envPath, tag string, env []string, r *bundleRefresh) string {
-	main := filepath.Join(dir, "docker-compose.yml")
-	if r != nil && r.changes("docker-compose.yml") {
-		main = filepath.Join(r.tmp, "docker-compose.yml")
-	}
-	sp := ui.Start("Checking the images the %s services start from", tag)
-	svcs, err := dataPlaneServices(dir, envPath, tag, env, main)
-	if err != nil {
-		why := "the configuration it would start could not be read (" + err.Error() + ")"
-		sp.Fail("%s", why)
-		return why
-	}
-	var wrong []string
-	rel := releaseImages{}
-	for _, s := range svcs {
-		switch {
-		case imageTag(s.image) != tag:
-			wrong = append(wrong, s.name+" is set to "+s.image)
-		case imageRepo(s.image) != imageRepo(s.release):
-			id, version, _ := imageInfo(s.image)
-			if why := s.mirrorProblem(tag, s.image, id, version, rel); why != "" {
-				wrong = append(wrong, why)
-			}
-		}
-	}
-	if len(svcs) == 0 {
-		wrong = append(wrong, "it runs no data-plane service")
-	}
-	if len(wrong) > 0 {
-		sp.Fail("Not every data-plane service would run the %s images", tag)
-		return strings.Join(wrong, "; ")
-	}
-	sp.Success("Every data-plane service starts from the %s images", tag)
-	return ""
+	return nil
 }
 
 // reServerVersion is the major and minor version at the start of what
@@ -966,16 +835,23 @@ func serverVersion(out string) (string, bool) {
 }
 
 // runningImagesCauses says what can make a project's containers run other
-// images than tag's, for the failure runningImagesProblem reports.
-func runningImagesCauses(dir, envPath, tag string) []string {
+// images than tag's, for the failure runningImagesProblem (or the planned
+// check) reports, why. The advice on registry mirrors and digests comes only
+// with a failure that is about comparing an image with the release's.
+func runningImagesCauses(dir, envPath, tag, why string) []string {
 	var causes []string
 	if v := os.Getenv("DP_IMAGE_TAG"); v != "" && v != tag {
 		causes = append(causes, "DP_IMAGE_TAG="+v+" is exported in your shell, and docker compose takes it over .env: a `docker compose up` run from this shell starts "+v+". Unset it (unset DP_IMAGE_TAG).")
 	}
 	if n := envKeyCount(envPath, "DP_IMAGE_TAG"); n > 1 {
-		causes = append(causes, fmt.Sprintf(".env has %d DP_IMAGE_TAG lines, and docker compose takes the last (%s): keep one.", n, readEnvVar(envPath, "DP_IMAGE_TAG")))
+		causes = append(causes, fmt.Sprintf(".env has %d DP_IMAGE_TAG lines, and docker compose takes the last (%s): keep one.", n, dotenvValue(envPath, "DP_IMAGE_TAG")))
 	}
-	return append(causes, "A compose file can pin another image: docker-compose.yml, an override file or one COMPOSE_FILE in .env names (`"+composeHint(dir, envPath)+" config --images` lists what compose starts). An image from a registry mirror must be the release's very image: `docker pull` its "+dataPlaneRegistry+" reference on this host so the two can be compared.")
+	causes = append(causes, "A compose file can pin another image, or add a service that runs one: docker-compose.yml, an override file or one COMPOSE_FILE in .env names (`"+composeHint(dir, envPath)+" config --images` lists what compose starts, `docker ps -a --filter label=com.docker.compose.project="+composeProjectName(dir, envPath)+"` the containers of the project). Every data-plane image must be the release's: on its tag, or pinned by the digest of the release's image.")
+	if !strings.Contains(why, "release's image") && !strings.Contains(why, "pinned by digest") {
+		return causes
+	}
+	return append(causes,
+		"An image from a registry mirror is accepted only when it is the release's very image, which the CLI checks against "+dataPlaneRegistry+"<service>:"+tag+" on this host (pulling that reference when the host does not have it). A host that cannot reach ghcr.io cannot make the comparison, and the move is refused before anything is changed. Put the release's image on this host under its ghcr.io reference: `docker pull` it where ghcr.io is reachable and carry it here (`docker save` | `docker load`), or, once you have checked that the mirror's image is the release's (its digest is the one ghcr.io has for "+tag+"), `docker tag <the mirror's image> "+dataPlaneRegistry+"<service>:"+tag+"`. Then rerun.")
 }
 
 // eventsColumnMark follows the type on the probe's answer, so a type of
@@ -990,9 +866,26 @@ const clickhouseEventsPropertiesType = `clickhouse-client --password "$CH_DEFAUL
 // composeConfig is what the CLI reads of `docker compose config --format
 // json`: the project's effective configuration.
 type composeConfig struct {
-	Services map[string]struct {
-		Image string `json:"image"`
-	} `json:"services"`
+	Services map[string]composeServiceConfig `json:"services"`
+	Volumes  map[string]json.RawMessage      `json:"volumes"`
+}
+
+// composeServiceConfig is a service of composeConfig: its image and how many
+// containers the configuration runs (scale, deploy.replicas; nil for the
+// default, one).
+type composeServiceConfig struct {
+	Image  string `json:"image"`
+	Scale  *int   `json:"scale"`
+	Deploy struct {
+		Replicas *int `json:"replicas"`
+	} `json:"deploy"`
+}
+
+// scaledDown reports whether the configuration runs the service nowhere
+// (scale: 0, or deploy.replicas: 0): it has no container, on purpose.
+func (s composeServiceConfig) scaledDown() bool {
+	n := cmp.Or(s.Scale, s.Deploy.Replicas)
+	return n != nil && *n == 0
 }
 
 // effectiveCompose renders the configuration `docker compose up` would run in
@@ -1103,4 +996,54 @@ func stopTurnedOff(dir, envPath string, env, before, after []string) {
 		return
 	}
 	sp.Success("Stopped and removed %s", strings.Join(gone, ", "))
+}
+
+// removeInactiveDataPlane removes the containers of the data-plane services
+// whose compose profiles are all off (active: the profiles that are on),
+// before the `up -d` of a move that can touch the events table. compose
+// leaves them be: `up -d --remove-orphans` keeps the containers of a
+// profile that is off, on whatever release they were started with, whoever
+// turned the profile off (a hand edit of COMPOSE_PROFILES, an earlier run
+// whose own removal failed, a fresh deploy over an old plane's containers).
+// A leftover writer on an older release would run beside the new one and
+// against the new events table; the check after `up -d` would fail the run
+// on it, and a run must not report every service on the release while one is
+// not. The services of the profiles that are on are untouched, and so are
+// the volumes. A failure is a warning, with the command: the check after
+// `up -d` finds what is left. env is the run's compose environment
+// (composeEnv).
+func removeInactiveDataPlane(dir, envPath string, env, active []string) {
+	all := append(slices.Clone(env), "COMPOSE_PROFILES=*")
+	every, err := effectiveCompose(dir, envPath, all, nil)
+	var on composeConfig
+	if err == nil {
+		on, err = effectiveCompose(dir, envPath, append(slices.Clone(env), "COMPOSE_PROFILES="+strings.Join(active, ",")), nil)
+	}
+	var listed []composeService
+	if err == nil {
+		listed, _, err = projectContainers(composeProjectName(dir, envPath))
+	}
+	if err != nil {
+		ui.Warn("Could not tell whether containers of data-plane services whose profile is off are left over (%v); the check after the restart finds any that run.", err)
+		return
+	}
+	var left []string
+	for _, c := range listed {
+		s, known := every.Services[c.Service]
+		_, isOn := on.Services[c.Service]
+		if known && !isOn && dataPlaneImageName(c.Service, s.Image, "") != "" && !slices.Contains(left, c.Service) {
+			left = append(left, c.Service)
+		}
+	}
+	if len(left) == 0 {
+		return
+	}
+	slices.Sort(left)
+	sp := ui.Start("Removing %s (left over from a profile that is off)", strings.Join(left, ", "))
+	args := append([]string{"rm", "--stop", "--force"}, left...)
+	if out, err := dockerRun(all, "docker", composeCmd(dir, envPath, args...)...); err != nil {
+		sp.Warn("Could not remove %s (%s); they keep running on the release they were started with. Remove them yourself: COMPOSE_PROFILES='*' %s rm --stop --force %s", strings.Join(left, ", "), orDash(lastLines(out, 1)), composeHint(dir, envPath), strings.Join(left, " "))
+		return
+	}
+	sp.Success("Removed %s (their profile is off; they would have kept running on the release they were started with)", strings.Join(left, ", "))
 }
