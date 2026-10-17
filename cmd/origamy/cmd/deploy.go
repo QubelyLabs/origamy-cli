@@ -102,7 +102,15 @@ so a refused deploy leaves the project as it was. What the plane's ClickHouse
 holds is asked first, as in 'origamy upgrade' (it is started when it does
 not answer; the deploy is refused when it still cannot be asked), and once
 the services are up, deploy checks that ClickHouse holds the events table
-the release writes and that the containers run the release's images.`,
+the release writes and that the containers run the release's images.
+
+On Kubernetes a deploy over a release that is already installed asks its
+ClickHouse first too, and is refused before the token is spent when the
+release cannot write the events table it holds (move it with 'origamy
+upgrade', which resets the table across the storage reset) or an upgrade's
+storage reset is unfinished. Every Kubernetes install ends with the same
+check as an upgrade: ClickHouse holds the events table that every
+data-plane image the release runs writes.`,
 	Example: `  origamy deploy --token dpe_xxx
   origamy deploy --token dpe_xxx --enable-ai
   origamy deploy --token dpe_xxx --datastore-auth
@@ -309,6 +317,14 @@ func planKubernetes(chartVer string, enableAI, aiSet, datastoreAuth, dockerToo b
 		ui.Warn("%s Desktop clusters run them under emulation (slower), so continuing.", block)
 	} else if warn != "" {
 		ui.Warn("%s", warn)
+	}
+	// A release already here moves to chartVer without the storage reset
+	// (kube_reset.go), so before any question: refused while an upgrade's
+	// reset is unfinished, or ClickHouse holds a table chartVer cannot write.
+	if releaseInstalled() {
+		if headline, hint := kubeDeployProblem(chartVer); headline != "" {
+			return nil, fail(headline, hint)
+		}
 	}
 
 	p := &k8sPlan{chartVer: chartVer, datastoreAuth: datastoreAuth}
@@ -518,6 +534,12 @@ func applyKubernetes(tok *token.Enrollment, keyPEM []byte, p *k8sPlan) error {
 		for comp, reason := range issues {
 			ui.Detail("%s — %s", ui.Bold(comp), ui.DiagnosePod(reason))
 		}
+	}
+
+	// The install succeeds only once ClickHouse holds the events table the
+	// images that run write (the chart's schema Job creates it).
+	if c := kubeEventsCheck(p.clickhouse != nil); c.why != "" {
+		return kubeCheckFail("The data plane is installed", kubeUpgradeCommand(p.chartVer, "stable"), c, p.clickhouse != nil, false)
 	}
 
 	// — Resolve the SDK event endpoint ————————————————————————————————————

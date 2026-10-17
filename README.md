@@ -42,7 +42,7 @@ Environment knobs, set before `sh -c`:
 |---|---|
 | `origamy deploy --token dpe_…` | Asks every question and runs every check first, then enrols the data plane (generating an mTLS identity locally when the control plane has a CA) and installs it. Kubernetes → Helm chart `oci://ghcr.io/qubelylabs/charts/origamy-data-plane`; Docker → compose bundle in `./origamy-dp-<id>/` (re-run inside that directory to re-deploy in place). |
 | `origamy upgrade` | Moves the install to a newer release. `--enable-ai` / `--disable-ai` toggle the AI engine; `--enable-predictor` / `--disable-predictor` toggle the predictor (Kubernetes). On Docker it also refreshes the compose bundle (see [Docker bundle refresh](#docker-bundle-refresh)). |
-| `origamy rollback [--to N]` | Rolls a Kubernetes install back to a previous Helm revision. |
+| `origamy rollback [--to N]` | Rolls a Kubernetes install back to a previous Helm revision (not across the storage reset). |
 | `origamy status` | Installed version, whether a newer one is published (Kubernetes), service health. |
 | `origamy uninstall [id]` | Tears the data plane down (Helm release + namespace, or compose project + volumes). |
 | `origamy version` | Prints the CLI version. |
@@ -276,6 +276,33 @@ Two release boundaries the CLI knows about:
   reset that fails after that keeps them with the record: putting the 24.8
   compose file back over a volume ClickHouse 25.3 has opened is not safe to
   start, and the next run finishes the reset with them.
+  On Kubernetes the release's ClickHouse decides the same way, never the
+  chart versions: it is asked in its pod (found by the chart's labels), or,
+  for an external ClickHouse, through a short-lived Job made from the chart's
+  own schema Job (its image, environment, password Secret and the labels the
+  chart's NetworkPolicy opens egress for). An upgrade, a rollback or an
+  in-place deploy to a chart that cannot write what ClickHouse holds is
+  refused before anything changes: a `--version` or a rollback below 0.1.18
+  over the JSON table, a rollback or a deploy onto the String table (only
+  `origamy upgrade` resets it). Across the reset, once the chart is on the
+  target and the ClickHouse StatefulSet's rollout is through on 25.3 or
+  newer, the upgrade records the reset in the release namespace (ConfigMap
+  `origamy-reset-pending`), moves a String table aside with the same
+  `RENAME TABLE`, applies the chart's schema from its ConfigMap in the
+  ClickHouse pod, checks for the JSON table and only then drops the renamed
+  one. A missing table is created and nothing is dropped, the JSON table is
+  never touched, and an external ClickHouse is never reset. While the record
+  is there the next `origamy upgrade` finishes the reset, even on the same
+  chart version (it no longer answers "Already on …" over a String table),
+  and `origamy rollback` and an in-place deploy are refused; it is removed
+  once the check after the upgrade passed. Every Kubernetes upgrade (one
+  with nothing to do included), rollback and install ends with that check:
+  ClickHouse holds the events table that every data-plane image of the
+  release writes, in the Deployments' and StatefulSets' specs and in the
+  pods that run (old pods are waited for while a rollout replaces them),
+  with ClickHouse 25.3 or newer under the JSON table. An image whose tag is
+  not a numbered release (`main`, a digest) fails it: what it writes is not
+  known.
 
 ### Docker bundle refresh
 

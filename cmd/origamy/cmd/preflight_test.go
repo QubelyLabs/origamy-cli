@@ -191,26 +191,6 @@ func TestPruneLegacyValues(t *testing.T) {
 	pruneLegacyValues(map[string]any{}) // no healthCheck: no panic
 }
 
-func TestCrossesSchemaReset(t *testing.T) {
-	for _, c := range []struct {
-		from, to string
-		want     bool
-	}{
-		{"0.1.17", "0.1.18", true},
-		{"0.1.15", "0.2.0", true},
-		{"0.1.18", "0.1.19", false},
-		{"0.1.16", "0.1.17", false},
-		{"0.1.18", "0.1.17", false}, // downgrade: not this guard's job
-		{"main", "0.1.18", false},
-		{"0.1.17", "staging", false},
-		{"", "0.1.18", false},
-	} {
-		if got := crossesSchemaReset(c.from, c.to); got != c.want {
-			t.Errorf("crossesSchemaReset(%q, %q) = %v, want %v", c.from, c.to, got, c.want)
-		}
-	}
-}
-
 func TestReleaseSchemaGeneration(t *testing.T) {
 	for tag, want := range map[string]string{
 		"0.1.15": "string", "0.1.17": "string",

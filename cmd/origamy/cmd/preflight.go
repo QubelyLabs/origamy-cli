@@ -251,21 +251,6 @@ func pruneLegacyValues(vals map[string]any) {
 	}
 }
 
-// crossesSchemaReset reports whether moving a data plane from release `from`
-// to release `to` crosses the ClickHouse storage reset: ClickHouse moves to
-// 25.3 and the events table must be recreated with native JSON columns, which
-// discards the event history collected so far (user_traits is altered in
-// place). Non-semver tags never cross.
-func crossesSchemaReset(from, to string) bool {
-	if _, ok := parseVersion(from); !ok {
-		return false
-	}
-	if _, ok := parseVersion(to); !ok {
-		return false
-	}
-	return versionLess(from, minImageForJSONSchema) && !versionLess(to, minImageForJSONSchema)
-}
-
 // releaseSchemaGeneration is the schema generation (see schemaGeneration) the
 // images of a release write: "string" before minImageForJSONSchema, "json"
 // from it on and for the edge channel's :staging images, "unknown" for any

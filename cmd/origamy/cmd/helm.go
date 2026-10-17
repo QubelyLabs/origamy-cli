@@ -116,7 +116,7 @@ func exportReleaseValues(targetVer string) (string, error) {
 // releaseValues returns the values the operator supplied to the release
 // (helm get values), as a map. An install with none yields an empty map.
 func releaseValues() (map[string]any, error) {
-	out, err := runCaptured("helm", "get", "values", release, "-n", namespace, "-o", "json")
+	out, err := kubeRun("helm", "get", "values", release, "-n", namespace, "-o", "json")
 	if err != nil {
 		return nil, fmt.Errorf("%s", out)
 	}
@@ -135,7 +135,8 @@ func releaseValues() (map[string]any, error) {
 
 // releaseInstalled reports whether the odp Helm release exists in the namespace.
 func releaseInstalled() bool {
-	return runQuiet("helm", "status", release, "-n", namespace) == nil
+	_, err := kubeRun("helm", "status", release, "-n", namespace)
+	return err == nil
 }
 
 type releaseInfo struct {
@@ -147,7 +148,7 @@ type releaseInfo struct {
 
 // installedRelease returns the currently-deployed chart, app version and revision.
 func installedRelease() (*releaseInfo, error) {
-	out, err := runCaptured("helm", "list", "-n", namespace, "-o", "json")
+	out, err := kubeRun("helm", "list", "-n", namespace, "-o", "json")
 	if err != nil {
 		return nil, fmt.Errorf("%s", out)
 	}
@@ -171,7 +172,7 @@ func installedRelease() (*releaseInfo, error) {
 
 // latestChartVersion queries the OCI registry for the newest published chart version.
 func latestChartVersion() (string, error) {
-	out, err := runCaptured("helm", "show", "chart", helmChart)
+	out, err := kubeRun("helm", "show", "chart", helmChart)
 	if err != nil {
 		return "", fmt.Errorf("%s", out)
 	}
@@ -198,7 +199,7 @@ const dataPlaneImageRepo = "origamy-data-plane/"
 // Best-effort: on any error it returns nil and the caller falls back to
 // global.imageTag alone. Datastore images are excluded by repository prefix.
 func serviceImageKeys() []string {
-	out, err := runCaptured("helm", "get", "values", release, "-n", namespace, "--all", "-o", "json")
+	out, err := kubeRun("helm", "get", "values", release, "-n", namespace, "--all", "-o", "json")
 	if err != nil {
 		return nil
 	}
