@@ -150,7 +150,7 @@ func readResetMarker() (kubeMarker, error) {
 	}
 	m := kubeMarker{present: true, version: cm.Data["version"], channel: cm.Data["channel"], action: cm.Data["action"], aside: cm.Data["aside"]}
 	if why := m.problem(); why != "" {
-		return kubeMarker{}, &kubeReadError{msg: fmt.Sprintf("the ConfigMap %s in %s is not a record this CLI wrote: %s. Look at it (kubectl get configmap %s -n %s -o yaml) and delete it if no upgrade left a reset unfinished (kubectl delete configmap %s -n %s)", resetMarkerConfigMap, namespace, why, resetMarkerConfigMap, namespace, resetMarkerConfigMap, namespace)}
+		return kubeMarker{}, &kubeReadError{msg: fmt.Sprintf("the ConfigMap %s in %s is not a record this CLI wrote: %s. Look at it (kubectl get configmap %s -n %s -o yaml) and delete it if no upgrade left a reset unfinished (kubectl delete configmap %s -n %s).", resetMarkerConfigMap, namespace, why, resetMarkerConfigMap, namespace, resetMarkerConfigMap, namespace)}
 	}
 	return m, nil
 }
@@ -1105,7 +1105,7 @@ func kubeCheckFail(done, recheck string, c kubeCheck, external, recorded bool) e
 	case c.live.gen == liveOther:
 		return fail(headline, "No release writes it, and the storage reset does not drop it. Check what created it, and drop it yourself if it should be recreated with the new schema. Then "+again)
 	case external && c.live.gen != "json":
-		return fail(headline, "The CLI does not reset or create the events table on an external ClickHouse beyond the chart's schema Job. On your server, rename (or drop) "+eventsTable+" if it is the pre-reset one, and apply the chart's schema:\n  kubectl get configmap "+release+"-clickhouse-init -n "+namespace+" -o jsonpath='{.data.init\\.sql}' | clickhouse-client --host … --port … --user … --password … [--secure] --multiquery\nThen "+again)
+		return fail(headline, "The CLI does not reset or create the events table on an external ClickHouse beyond the chart's schema Job. On your server, rename (or drop) "+eventsTable+" if it is the pre-reset one, and apply the chart's schema:\n  kubectl get configmap "+release+"-clickhouse-init -n "+namespace+" -o jsonpath='{.data.init\\.sql}' | clickhouse-client --host … --port … --user … --password … [--secure] --multiquery\nThe CLI does not look at an external ClickHouse's table again by itself (a rerun at this version only checks the images): once "+eventsTable+"'s properties column is JSON, the data plane writes to it.")
 	case c.live.gen == liveMissing:
 		return fail(headline, "The chart's schema Job creates it: check its output (kubectl logs -n "+namespace+" -l "+componentSelector("clickhouse-init")+" --tail=20). "+again)
 	}

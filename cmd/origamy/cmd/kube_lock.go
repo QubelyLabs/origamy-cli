@@ -40,7 +40,7 @@ func (e *kubeLeaseHeld) Error() string {
 	if e.unreadable != "" {
 		return "the lease " + kubeLeaseConfigMap + " exists and could not be read: " + e.unreadable
 	}
-	return fmt.Sprintf("%s holds the lease %s since %s (%s ago)", e.holder, kubeLeaseConfigMap, e.since.Format(time.RFC3339), time.Since(e.since).Round(time.Second))
+	return fmt.Sprintf("%q holds the lease %s since %s (%s ago)", e.holder, kubeLeaseConfigMap, e.since.Format(time.RFC3339), time.Since(e.since).Round(time.Second))
 }
 
 // kubeLease is the lease ConfigMap as it is in the cluster.

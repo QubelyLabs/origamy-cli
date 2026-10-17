@@ -871,7 +871,8 @@ func TestFreshInstallChecksWithoutHoldingTheInstallUp(t *testing.T) {
 		if err == nil || !strings.Contains(out, "Send events") || !strings.Contains(out, "apply the chart's schema") {
 			t.Fatalf("got err=%v:\n%s", err, out)
 		}
-		if f.marker != nil || strings.Contains(out, "Then The") || strings.Contains(out, "left recorded") {
+		// No rerun looks at an external table again: the failure must not promise one.
+		if f.marker != nil || strings.Contains(out, "Then The") || strings.Contains(out, "left recorded") || strings.Contains(out, "checks again") || !strings.Contains(out, "does not look at an external ClickHouse's table again") {
 			t.Fatalf("record %v:\n%s", f.marker, out)
 		}
 	})

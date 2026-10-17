@@ -439,7 +439,7 @@ Two release boundaries the CLI knows about:
   images says; an unnumbered image tag counts as "can't tell"), or one made
   while a reset is recorded as unfinished. Every other upgrade, rollback and
   deploy (0.1.19 → 0.1.20, 0.1.20 → 0.1.19, 0.1.16 → 0.1.17, `--enable-ai`,
-  a `--set`, a fresh install) behaves as before the reset existed: it needs
+  a `--set`) behaves as before the reset existed: it needs
   no more permissions than helm and reading the release's objects, never
   asks ClickHouse anything, and ends with a look at the images the
   Deployments, StatefulSets and pods run (services on both sides of the
