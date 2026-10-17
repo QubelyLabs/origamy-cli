@@ -20,10 +20,26 @@ const lockRangeHigh = 0x7fffffff
 func lockFile(f *os.File) error {
 	ol := windows.Overlapped{OffsetHigh: lockRangeHigh}
 	err := windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ol)
-	if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+	switch {
+	case errors.Is(err, windows.ERROR_LOCK_VIOLATION):
 		return errLockHeld
+	case errors.Is(err, windows.ERROR_NOT_SUPPORTED), errors.Is(err, windows.ERROR_INVALID_FUNCTION):
+		// No byte-range locks on this file system: lockExclusive.
+		return errLockUnsupported
 	}
 	return err
+}
+
+// pidAlive reports whether process pid runs on this host (one this user may
+// not query counts).
+func pidAlive(pid int) bool {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return errors.Is(err, windows.ERROR_ACCESS_DENIED)
+	}
+	defer func() { _ = windows.CloseHandle(h) }()
+	var code uint32
+	return windows.GetExitCodeProcess(h, &code) == nil && code == 259 // STILL_ACTIVE
 }
 
 func unlockFile(f *os.File) error {

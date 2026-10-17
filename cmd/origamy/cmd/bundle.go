@@ -180,10 +180,10 @@ func writeResetSchema(dir string, sql []byte, installedTag string) (resetSchemaW
 // the config endpoint under it in the dashboard's snippet). fromConfigURL
 // reports that fallback; base is "" when neither holds an http(s) URL.
 func controlPlaneHTTPBase(envPath string) (base string, fromConfigURL bool) {
-	if v := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONTROL_PLANE_HTTP_URL")), "/"); v != "" {
+	if v := strings.TrimRight(dotenvValue(envPath, "CONTROL_PLANE_HTTP_URL"), "/"); v != "" {
 		return v, false
 	}
-	v := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONFIG_URL")), "/")
+	v := strings.TrimRight(dotenvValue(envPath, "CONFIG_URL"), "/")
 	v = strings.TrimRight(strings.TrimSuffix(v, configPath), "/")
 	if u, err := url.Parse(v); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return "", false
@@ -224,12 +224,12 @@ func backfillDockerEnv(dir, envPath, base string) ([]string, error) {
 		notes = append(notes, note)
 		return nil
 	}
-	if readEnvVar(envPath, "CONTROL_PLANE_HTTP_URL") == "" {
+	if dotenvValue(envPath, "CONTROL_PLANE_HTTP_URL") == "" {
 		if err := set("CONTROL_PLANE_HTTP_URL", base, "Recorded CONTROL_PLANE_HTTP_URL="+base+" in .env."); err != nil {
 			return notes, err
 		}
 	}
-	switch cfg := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONFIG_URL")), "/"); {
+	switch cfg := strings.TrimRight(dotenvValue(envPath, "CONFIG_URL"), "/"); {
 	case !reads("CONFIG_URL"):
 	case cfg == "":
 		if err := set("CONFIG_URL", base+configPath, "Recorded CONFIG_URL="+base+configPath+" in .env."); err != nil {
@@ -252,14 +252,6 @@ func backfillDockerEnv(dir, envPath, base string) ([]string, error) {
 func isBareURL(v string) bool {
 	u, err := url.Parse(v)
 	return err == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Host != "" && strings.Trim(u.Path, "/") == "" && u.RawQuery == ""
-}
-
-// unquoteEnv strips the quotes compose's dotenv parser would.
-func unquoteEnv(v string) string {
-	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
-		return v[1 : len(v)-1]
-	}
-	return v
 }
 
 // reBundleVersion is what /byod/VERSION may hold: one release name.
@@ -620,16 +612,16 @@ func (r *bundleRefresh) composeArgs(envPath string) []string {
 	return composeFileArgs(r.dir, envPath, filepath.Join(r.tmp, "docker-compose.yml"))
 }
 
-// composeFileArgs is the -f list for the compose files a plain `docker
-// compose --project-directory dir --env-file envPath` loads, with dir's
-// docker-compose.yml replaced by compose: the files COMPOSE_FILE names (the
-// process environment over the .env), else docker-compose.yml and the first
+// composeFileArgs is the -f list for the compose files the CLI's own docker
+// compose commands in dir load (composeCmd), with dir's docker-compose.yml
+// replaced by compose: the files COMPOSE_FILE in .env names (the shell's is
+// not taken, see composeShellVars), else docker-compose.yml and the first
 // override file compose picks up next to it.
 func composeFileArgs(dir, envPath, compose string) []string {
 	own := filepath.Join(dir, "docker-compose.yml")
 	var files []string
-	if list := cmp.Or(os.Getenv("COMPOSE_FILE"), unquoteEnv(readEnvVar(envPath, "COMPOSE_FILE"))); list != "" {
-		sep := cmp.Or(os.Getenv("COMPOSE_PATH_SEPARATOR"), unquoteEnv(readEnvVar(envPath, "COMPOSE_PATH_SEPARATOR")), string(os.PathListSeparator))
+	if list := dotenvValue(envPath, "COMPOSE_FILE"); list != "" {
+		sep := cmp.Or(dotenvValue(envPath, "COMPOSE_PATH_SEPARATOR"), string(os.PathListSeparator))
 		for _, f := range strings.Split(list, sep) {
 			if f = strings.TrimSpace(f); f != "" {
 				if !filepath.IsAbs(f) {
@@ -664,8 +656,7 @@ func composeFileArgs(dir, envPath, compose string) []string {
 // plane down at `up`. And the new schema must be one tag can write.
 func (r *bundleRefresh) validate(envPath string, env []string, tag string) error {
 	if args := r.composeArgs(envPath); args != nil {
-		args = append(append([]string{"compose", "--project-directory", r.dir}, args...), "--env-file", envPath, "config", "-q")
-		if out, err := dockerRun(env, "docker", args...); err != nil {
+		if out, err := dockerRun(env, "docker", composeCmd(r.dir, envPath, append(args, "config", "-q")...)...); err != nil {
 			return fmt.Errorf("the new docker-compose.yml does not validate against your .env: %s", strings.ReplaceAll(lastLines(out, 3), "\n", " "))
 		}
 	}
@@ -927,15 +918,14 @@ func planBundleRefresh(dir, envPath, base, tag, installedTag string, env []strin
 	return r, ""
 }
 
-// pullImages pulls the images of the release env names (tagEnv, and what
+// pullImages pulls the images of the release env names (composeEnv, and what
 // else the run gives compose before .env holds it: the AI toggle's profile).
 // With a refresh that replaces the compose file it pulls with the new one
 // from the download directory, before anything in the project is touched,
 // so the images of services the new bundle adds come too and a failed or
 // interrupted pull leaves the project as it was.
 func pullImages(dir, envPath string, env []string, r *bundleRefresh) (string, error) {
-	args := append(append([]string{"compose", "--project-directory", dir}, r.composeArgs(envPath)...), "--env-file", envPath, "pull")
-	return dockerRun(env, "docker", args...)
+	return dockerRun(env, "docker", composeCmd(dir, envPath, append(r.composeArgs(envPath), "pull")...)...)
 }
 
 // bundleBoxLines summarises the refresh for the upgrade's final box, and

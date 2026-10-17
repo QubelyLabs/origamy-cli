@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -330,28 +332,62 @@ func unsetEnvVar(path, key string) error {
 	return writeEnvFile(path, []byte(strings.Join(kept, "\n")), mode)
 }
 
+// chown changes a file's owner and group; a variable so tests can stand in a
+// change of owner this user may not make.
+var chown = os.Chown
+
 // writeEnvFile replaces a dotenv file's contents in one step, a file written
 // next to it and renamed over it, so a run that stops half-way (killed,
 // interrupted) never leaves it cut short: it holds the datastores'
-// passwords. A symbolic link is written through, to the file it points at.
-// An interrupt waits until it is done (exitGate).
+// passwords. The new file gets mode, and keeps the owner and group of the
+// one it replaces (of the directory, for a new one): `sudo origamy upgrade`
+// must not leave .env to root, where the operator's own `docker compose`
+// could no longer read it. A file with other hard links is written in place
+// instead (writeInPlace), which keeps its links, and so is one whose owner
+// this user cannot give the new file; when this user may not write that
+// one either, it is replaced as before, by a file of this user's. A
+// symbolic link is written through, to the file it points at. An interrupt
+// waits until it is done (exitGate).
 func writeEnvFile(path string, data []byte, mode os.FileMode) error {
 	if target, err := filepath.EvalSymlinks(path); err == nil {
 		path = target
 	}
 	exitGate.Lock()
 	defer exitGate.Unlock()
+	cur, err := os.Stat(path)
+	exists := err == nil
+	if errors.Is(err, os.ErrNotExist) {
+		cur, err = os.Stat(filepath.Dir(path))
+	}
+	if err != nil {
+		return err
+	}
+	uid, gid, links, known := fileOwner(cur)
+	if exists && known && links > 1 {
+		return writeInPlace(path, data, mode)
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
 	_, err = tmp.Write(data)
+	if err == nil {
+		err = tmp.Sync()
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
 	if err == nil {
 		err = os.Chmod(name, mode)
+	}
+	if err == nil && known {
+		if cerr := chown(name, uid, gid); cerr != nil && exists {
+			if ierr := writeInPlace(path, data, mode); !errors.Is(ierr, os.ErrPermission) {
+				_ = os.Remove(name)
+				return ierr
+			}
+		}
 	}
 	if err == nil {
 		err = os.Rename(name, path)
@@ -360,6 +396,55 @@ func writeEnvFile(path string, data []byte, mode os.FileMode) error {
 		_ = os.Remove(name)
 	}
 	return err
+}
+
+// writeInPlace sets mode on the file at path (when this user owns it) and
+// writes data over it, its inode kept (owner, group, other hard links). Not
+// in one step as writeEnvFile's rename is, and so not atomic: only for what
+// that cannot do. The new text is written first, padded with blank lines to
+// the length of the old file (inPlaceImage), and flushed; only then is the
+// file cut to size and flushed again. A run killed or a machine lost after
+// the first write leaves the new text, then blank lines, never a key of the
+// old file behind it, but one lost during that write can leave a mix of the
+// two, which nothing here can prevent.
+func writeInPlace(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	if err = f.Chmod(mode); errors.Is(err, os.ErrPermission) {
+		err = nil
+	}
+	if err == nil {
+		var fi os.FileInfo
+		if fi, err = f.Stat(); err == nil {
+			_, err = f.WriteAt(inPlaceImage(data, fi.Size()), 0)
+		}
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if err == nil {
+		err = f.Truncate(int64(len(data)))
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// inPlaceImage is what writeInPlace first writes over a file of size old
+// bytes: data, then blank lines up to old, so that a file that shrinks never
+// keeps the end of its old text (a stale KEY= line would win over the new
+// one, compose reading the last) before it is cut to len(data).
+func inPlaceImage(data []byte, old int64) []byte {
+	if n := old - int64(len(data)); n > 0 {
+		return append(slices.Clone(data), bytes.Repeat([]byte("\n"), int(n))...)
+	}
+	return data
 }
 
 // envKeyCount is how many KEY= lines a dotenv file has.
@@ -495,10 +580,11 @@ func existingOrRandomKEK(path, key string) string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-// composeProfiles reads COMPOSE_PROFILES from a dotenv file as a list.
+// composeProfiles reads COMPOSE_PROFILES from a dotenv file as a list, as
+// compose reads it (quotes and an inline comment are not part of a profile).
 func composeProfiles(envPath string) []string {
 	var out []string
-	for _, p := range strings.Split(readEnvVar(envPath, "COMPOSE_PROFILES"), ",") {
+	for _, p := range strings.Split(dotenvValue(envPath, "COMPOSE_PROFILES"), ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
@@ -517,6 +603,31 @@ func withProfile(profiles []string, name string, on bool) []string {
 	}
 	if on {
 		out = append(out, name)
+	}
+	return out
+}
+
+// cliProfiles are the compose profiles `origamy deploy` and `origamy upgrade`
+// turn on and off, in the order they are written. Every other profile of the
+// bundle (logs, loki) or of the operator's own files is theirs: a run keeps it
+// in COMPOSE_PROFILES as it finds it.
+var cliProfiles = []string{"full", "agentic", "ingress"}
+
+// deployProfiles are the profiles an in-place deploy writes to .env: the
+// ones the answers turn on (cliProfiles), then every profile before (the
+// COMPOSE_PROFILES the plane had) that the CLI does not manage, in the order
+// it had them.
+func deployProfiles(before []string, full, agentic, ingress bool) []string {
+	var out []string
+	for _, p := range cliProfiles {
+		if (p == "full" && full) || (p == "agentic" && agentic) || (p == "ingress" && ingress) {
+			out = append(out, p)
+		}
+	}
+	for _, p := range before {
+		if !slices.Contains(cliProfiles, p) && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
 	}
 	return out
 }

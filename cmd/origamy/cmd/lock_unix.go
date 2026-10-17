@@ -19,9 +19,20 @@ func lockFile(f *os.File) error {
 			continue
 		case errors.Is(err, unix.EWOULDBLOCK):
 			return errLockHeld
+		case errors.Is(err, unix.ENOLCK), errors.Is(err, unix.EOPNOTSUPP), errors.Is(err, unix.ENOTSUP), errors.Is(err, unix.ENOSYS):
+			// No advisory locks on this file system (NFS without a lock
+			// manager, some SMB and FUSE mounts): lockExclusive.
+			return errLockUnsupported
 		}
 		return err
 	}
+}
+
+// pidAlive reports whether process pid runs on this host (one that runs as
+// another user counts).
+func pidAlive(pid int) bool {
+	err := unix.Kill(pid, 0)
+	return err == nil || errors.Is(err, unix.EPERM)
 }
 
 func unlockFile(f *os.File) error { return unix.Flock(int(f.Fd()), unix.LOCK_UN) }

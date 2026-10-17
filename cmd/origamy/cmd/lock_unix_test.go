@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // TestExitOnSignal: SIGINT, SIGTERM or SIGHUP end a run that holds the lock
@@ -32,5 +33,34 @@ func TestExitOnSignal(t *testing.T) {
 				t.Fatalf("left behind: %v", entries)
 			}
 		})
+	}
+}
+
+// TestExitOnSignalUnderNohup: a signal the CLI was started with ignored
+// (`nohup origamy upgrade` ignores SIGHUP) stays ignored, so the run outlives
+// the terminal that goes; the others still end it with exit code 130.
+func TestExitOnSignalUnderNohup(t *testing.T) {
+	dir := t.TempDir()
+	// trap '' ignores SIGHUP, as nohup does, for the helper exec'd next.
+	helper := startLockHelper(t, exec.Command("sh", "-c", `trap '' HUP; exec "$0" "$@"`, os.Args[0], "-test.run=^TestLockHelperProcess$", "-test.count=1"), dir, true)
+	if err := helper.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := helper.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("SIGHUP ended the run: %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
+		t.Fatalf("the helper holds %v", entries)
+	}
+	if err := helper.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	var exit *exec.ExitError
+	if err := helper.Wait(); !errors.As(err, &exit) || exit.ExitCode() != 130 {
+		t.Fatalf("exit: %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("left behind: %v", entries)
 	}
 }
