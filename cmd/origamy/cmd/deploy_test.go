@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -250,7 +251,7 @@ func TestPlanDockerTouchesNothing(t *testing.T) {
 					t.Fatalf("ran %q", c)
 				}
 				// Started, if at all, on the release and files it runs now.
-				if strings.Contains(c, "up -d clickhouse") && (!strings.HasPrefix(c, "DP_IMAGE_TAG=main docker compose --project-directory "+p.dir+" --env-file "+p.env+" up") || strings.Contains(c, " -f ")) {
+				if strings.Contains(c, "up -d clickhouse") && (!strings.HasPrefix(c, dcCall("main", p.dir, p.env)+"up") || strings.Contains(c, " -f ")) {
 					t.Fatalf("started ClickHouse with %q", c)
 				}
 			}
@@ -372,7 +373,7 @@ func TestApplyDockerPinsTheRelease(t *testing.T) {
 			n := len(f.calls)
 			out = captureStdout(t, func() { err = applyDocker(tok(p.base), nil, plan) })
 			for _, c := range composeCalls(f.since(n)) {
-				if !strings.HasPrefix(c, "DP_IMAGE_TAG=0.1.20 docker compose ") {
+				if !strings.HasPrefix(c, dcCall("0.1.20", plan.dir, filepath.Join(plan.dir, ".env"))) {
 					t.Fatalf("not given the release: %q", c)
 				}
 			}
@@ -405,5 +406,56 @@ func TestDeployRepairsABrokenComposeFile(t *testing.T) {
 	})
 	if err != nil || !strings.Contains(out, "Deployed") || p.read(t, "docker-compose.yml") != compose253 || !strings.Contains(p.read(t, "docker-compose.yml.bak-0.1.19"), brokenCompose) {
 		t.Fatalf("%v\n%s", err, out)
+	}
+}
+
+// TestApplyDockerTurnsAProfileOff: re-deploying in place and answering "no"
+// to journeys stops and removes workflow-engine and Postgres, which compose
+// keeps and `up -d --remove-orphans` leaves running on the old release, and
+// the deploy succeeds (only the services of the profiles that are on are
+// checked).
+func TestApplyDockerTurnsAProfileOff(t *testing.T) {
+	t.Setenv("COMPOSE_FILE", "")
+	p, parent := deployProject(t, compose253, jsonSchemaSQL, "0.1.19")
+	f := newFakeCompose(t)
+	f.live = liveJSONRow
+	for _, s := range []string{"config-sync", "portal-agent", "workflow-engine"} {
+		f.running[s] = dpImage + s + ":0.1.19"
+	}
+	f.running["dp-postgres"] = "postgres:16-alpine"
+	chdir(t, parent)
+	withAnswers(t, false, "n\n\n")
+	var plan *dockerPlan
+	var err error
+	out := captureStdout(t, func() { plan, err = planDocker("0.1.20", false, true, "dp-1", p.base) })
+	if err != nil || plan.fullProfile {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	defer plan.close()
+	out = captureStdout(t, func() {
+		err = applyDocker(&token.Enrollment{ID: "dp-1", Tok: "tok", Addr: "tunnel.example.com:443", URL: p.base}, nil, plan)
+	})
+	if err != nil || !strings.Contains(out, "Deployed") || !slices.Equal(f.removed, []string{"dp-postgres", "workflow-engine"}) || readEnvVar(p.env, "COMPOSE_PROFILES") != "" {
+		t.Fatalf("%v, removed %v\n%s", err, f.removed, out)
+	}
+	if rm, up := callIndex(f.calls, " rm --stop --force"), callIndex(f.calls, "up -d --remove-orphans"); rm < 0 || up < rm {
+		t.Fatalf("calls:\n%s", strings.Join(f.calls, "\n"))
+	}
+}
+
+// TestPlanDockerRefusesAMovingTag (cardinal rule 2): a deploy of a tag whose
+// images do not say which events table they write (main, sha-…) is refused
+// before anything is created or enrolled; :staging writes the new one.
+func TestPlanDockerRefusesAMovingTag(t *testing.T) {
+	for _, tag := range []string{"main", "production", "sha-881359f"} {
+		parent := t.TempDir()
+		f := newFakeCompose(t)
+		_, out, err := planIn(t, parent, tag, "https://cp.example.com")
+		if err == nil || !strings.Contains(out, tag+" is not a numbered release") || !strings.Contains(out, "Nothing has been enrolled or installed.") || len(f.calls) != 0 {
+			t.Fatalf("%s: %v, calls %v\n%s", tag, err, f.calls, out)
+		}
+		if entries, _ := os.ReadDir(parent); len(entries) != 0 {
+			t.Fatalf("%s: left %v", tag, entries)
+		}
 	}
 }

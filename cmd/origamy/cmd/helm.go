@@ -330,34 +330,95 @@ func unsetEnvVar(path, key string) error {
 	return writeEnvFile(path, []byte(strings.Join(kept, "\n")), mode)
 }
 
+// chown changes a file's owner and group; a variable so tests can stand in a
+// change of owner this user may not make.
+var chown = os.Chown
+
 // writeEnvFile replaces a dotenv file's contents in one step, a file written
 // next to it and renamed over it, so a run that stops half-way (killed,
 // interrupted) never leaves it cut short: it holds the datastores'
-// passwords. A symbolic link is written through, to the file it points at.
-// An interrupt waits until it is done (exitGate).
+// passwords. The new file gets mode, and keeps the owner and group of the
+// one it replaces (of the directory, for a new one): `sudo origamy upgrade`
+// must not leave .env to root, where the operator's own `docker compose`
+// could no longer read it. A file with other hard links is written in place
+// instead (writeInPlace), which keeps its links, and so is one whose owner
+// this user cannot give the new file; when this user may not write that
+// one either, it is replaced as before, by a file of this user's. A
+// symbolic link is written through, to the file it points at. An interrupt
+// waits until it is done (exitGate).
 func writeEnvFile(path string, data []byte, mode os.FileMode) error {
 	if target, err := filepath.EvalSymlinks(path); err == nil {
 		path = target
 	}
 	exitGate.Lock()
 	defer exitGate.Unlock()
+	cur, err := os.Stat(path)
+	exists := err == nil
+	if errors.Is(err, os.ErrNotExist) {
+		cur, err = os.Stat(filepath.Dir(path))
+	}
+	if err != nil {
+		return err
+	}
+	uid, gid, links, known := fileOwner(cur)
+	if exists && known && links > 1 {
+		return writeInPlace(path, data, mode)
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
 	_, err = tmp.Write(data)
+	if err == nil {
+		err = tmp.Sync()
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
 	if err == nil {
 		err = os.Chmod(name, mode)
 	}
+	if err == nil && known {
+		if cerr := chown(name, uid, gid); cerr != nil && exists {
+			if ierr := writeInPlace(path, data, mode); !errors.Is(ierr, os.ErrPermission) {
+				_ = os.Remove(name)
+				return ierr
+			}
+		}
+	}
 	if err == nil {
 		err = os.Rename(name, path)
 	}
 	if err != nil {
 		_ = os.Remove(name)
+	}
+	return err
+}
+
+// writeInPlace sets mode on the file at path (when this user owns it) and
+// writes data over it, its inode kept (owner, group, other hard links), then
+// flushes it to disk. Not in one step as writeEnvFile's rename is: only for
+// what that cannot do.
+func writeInPlace(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	if err = f.Chmod(mode); errors.Is(err, os.ErrPermission) {
+		err = nil
+	}
+	if err == nil {
+		_, err = f.WriteAt(data, 0)
+	}
+	if err == nil {
+		err = f.Truncate(int64(len(data)))
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
 	return err
 }

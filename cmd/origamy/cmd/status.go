@@ -74,8 +74,8 @@ func statusDocker() error {
 	ui.KV("Image tag", orDash(readEnvVar(filepath.Join(dir, ".env"), "DP_IMAGE_TAG")))
 	ui.KV("Profiles", orDash(readEnvVar(filepath.Join(dir, ".env"), "COMPOSE_PROFILES")))
 
-	out, err := runCaptured("docker", "compose", "--project-directory", dir,
-		"--env-file", filepath.Join(dir, ".env"), "ps")
+	envPath := filepath.Join(dir, ".env")
+	out, err := dockerRun(composeEnv(readEnvVar(envPath, "DP_IMAGE_TAG")), "docker", composeCmd(dir, envPath, "ps")...)
 	if err != nil {
 		return diagnoseDocker(out, "rerun `origamy status`")
 	}

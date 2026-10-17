@@ -96,13 +96,20 @@ start without the key.
 
 Re-running deploy inside an existing ./origamy-dp-<id>/ re-deploys that plane
 in place, keeping its generated passwords and data. The bundle is downloaded
-next to the project and swapped in only once every check passed and the
-token was redeemed (each file it replaces backed up as <file>.bak-<release>),
-so a refused deploy leaves the project as it was. What the plane's ClickHouse
-holds is asked first, as in 'origamy upgrade' (it is started when it does
-not answer; the deploy is refused when it still cannot be asked), and once
-the services are up, deploy checks that ClickHouse holds the events table
-the release writes and that the containers run the release's images.`,
+into a directory inside the project and swapped in only once every check
+passed and the token was redeemed (each file it replaces backed up as
+<file>.bak-<release>), so a refused deploy leaves the project as it was.
+What the plane's ClickHouse holds is asked first, as in 'origamy upgrade' (it
+is started when it does not answer; the deploy is refused when it still
+cannot be asked), and once the services are up, deploy checks that
+ClickHouse holds the events table the release writes and that the containers
+run the release's images. The services only a profile the answers turn off
+ran (journeys, the AI engine) are stopped and removed. A --version that is
+not a numbered release (main, sha-…) is refused: which events table its
+images write is not known. Every docker compose command the CLI runs pins
+the project's name (COMPOSE_PROJECT_NAME in .env, else the directory's
+name) and ignores COMPOSE_PROJECT_NAME, COMPOSE_FILE and COMPOSE_PROFILES
+exported in the shell; .env is where they belong.`,
 	Example: `  origamy deploy --token dpe_xxx
   origamy deploy --token dpe_xxx --enable-ai
   origamy deploy --token dpe_xxx --datastore-auth
@@ -826,6 +833,12 @@ type dockerPlan struct {
 func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*dockerPlan, error) {
 	ui.Title("Target")
 	ui.Success("Docker detected")
+	// Like the upgrade, a deploy reports success only once the images that
+	// run write the events table ClickHouse holds, which a moving tag other
+	// than :staging does not say.
+	if releaseSchemaGeneration(imageTag) == "unknown" {
+		return nil, unknownRelease(imageTag, "Nothing has been enrolled or installed.")
+	}
 	// The images only exist for amd64 (see preflight.go). Emulation works on
 	// Docker Desktop, so this is a warning, not a stop.
 	if warn := dockerArchWarning(dockerArch()); warn != "" {
@@ -889,6 +902,13 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 		return nil, err
 	}
 	nothing := "Nothing has been enrolled or installed."
+	if p.existingID != "" {
+		// The plane must run under the compose project name every command
+		// pins here, or `up -d` would start a second copy of it.
+		if err := otherProjectName(p.dir, envPath, nothing); err != nil {
+			return refuse(err)
+		}
+	}
 
 	// — Bundle ——————————————————————————————————————————————————————————
 	// The whole bundle (compose + ClickHouse schema/users config + the
@@ -938,7 +958,7 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 		switch {
 		case live.gen == "":
 			return refuse(fail("ClickHouse could not be asked which events table this plane holds, so what deploying over it does to the table cannot be checked.",
-				outputHint(live.out)+"Check: docker compose --project-directory "+p.dir+" --env-file "+envPath+" logs clickhouse\nOnce it answers, rerun deploy with the same token. "+nothing))
+				outputHint(live.out)+"Check: "+composeHint(p.dir, envPath)+" logs clickhouse\nOnce it answers, rerun deploy with the same token. "+nothing))
 		case live.gen == liveOther:
 			return refuse(fail(fmt.Sprintf("ClickHouse's %s here has payload columns of type %s, neither the pre-reset (String) nor the new (JSON) schema, which no release writes.", eventsTable, live.typ),
 				"Check what created it, and drop it yourself if it should be recreated with the new schema; then rerun deploy. "+nothing))
@@ -1141,6 +1161,9 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	// even when AI is off: the KEK must survive a disable/enable cycle or the
 	// per-workspace LLM keys encrypted under it become unreadable.
 	existingEnv, _ := os.ReadFile(".env")
+	// The profiles the plane ran with: the services of one the answers turn
+	// off are stopped before `up -d` (stopTurnedOff).
+	before := composeProfiles(".env")
 	orchKEK := readEnvVar(".env", "ORCH_KEK")
 	orchToken := readEnvVar(".env", "ORCH_ENGINE_API_TOKEN")
 	if p.aiEnabled {
@@ -1219,7 +1242,7 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	envPath := filepath.Join(p.dir, ".env")
 	// Every docker compose command runs the release in DP_IMAGE_TAG itself,
 	// whatever the shell exports.
-	tagged := tagEnv(p.imageTag)
+	tagged := composeEnv(p.imageTag)
 	var outcome resetResult
 	if p.resetPending != "" {
 		ui.Title("Storage reset")
@@ -1235,13 +1258,18 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	}
 
 	ui.Title("Bringing services online")
-	sp := ui.Start("Starting services")
 	// Profiles come from COMPOSE_PROFILES in .env, so every later compose
-	// invocation (upgrade/status) sees the same service set. --remove-orphans
-	// stops the containers of a profile a re-deploy just turned off.
-	if out, err := dockerRun(tagged, "docker", "compose", "--env-file", ".env", "up", "-d", "--remove-orphans"); err != nil {
+	// invocation (upgrade/status) sees the same service set. The services
+	// only a profile a re-deploy just turned off ran are stopped (compose
+	// keeps them, and `up -d` leaves them running on the old release), and
+	// --remove-orphans removes those of services the bundle no longer has.
+	if p.existingID != "" {
+		stopTurnedOff(p.dir, envPath, tagged, before, profiles)
+	}
+	sp := ui.Start("Starting services")
+	if out, err := dockerRun(tagged, "docker", composeCmd(p.dir, envPath, "up", "-d", "--remove-orphans")...); err != nil {
 		sp.Fail("docker compose failed")
-		return diagnoseDocker(out, "rerun `docker compose --env-file .env up -d` in ./"+dir)
+		return diagnoseDocker(out, "rerun `"+composeHint(p.dir, envPath)+" up -d`")
 	}
 	sp.Success("Services started")
 	// Compose recreates a container when its definition changes, not when a
@@ -1260,7 +1288,7 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 			}
 		}
 	}
-	restarted := restartMounts(tagged, restarts, "--env-file", ".env")
+	restarted := restartMounts(p.dir, envPath, tagged, restarts)
 	// The deploy succeeds only when the events table the services now run on
 	// is the one the release writes, and the images that run are the
 	// release's.
@@ -1286,7 +1314,7 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	// crashing service is reported here, with its logs, instead of as a plane
 	// that never shows up Connected.
 	sp = ui.Start("Waiting for services to become healthy")
-	healthy, failed := waitForCompose(".", ".env", tagged, sp)
+	healthy, failed := waitForCompose(p.dir, envPath, tagged, sp)
 	switch {
 	case healthy:
 		sp.Success("All services are up and stable")
@@ -1294,14 +1322,14 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 		sp.Fail("Some services exited or keep restarting")
 		for _, svc := range failed {
 			ui.Detail("%s — last log lines:", ui.Bold(svc))
-			for _, l := range strings.Split(composeLogs(".", ".env", tagged, svc, 15), "\n") {
+			for _, l := range strings.Split(composeLogs(p.dir, envPath, tagged, svc, 15), "\n") {
 				if l != "" {
 					fmt.Printf("      %s\n", ui.Gray(l))
 				}
 			}
 		}
 		return fail("The data plane did not come up cleanly.",
-			"Fix the cause above, then rerun `docker compose --env-file .env up -d` in ./"+dir+" — or rerun deploy here with a fresh token to re-enroll.")
+			"Fix the cause above, then rerun `"+composeHint(p.dir, envPath)+" up -d` — or rerun deploy here with a fresh token to re-enroll.")
 	default:
 		sp.Warn("Services are still starting")
 	}

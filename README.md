@@ -92,22 +92,59 @@ disturb the core.
   plane that already runs, what its ClickHouse holds decides (see the storage
   reset below), and after `up -d` both `deploy` and `upgrade` check that
   `events.events` exists and is the generation the release writes, and that
-  the containers that run are the release's: every data-plane service on the
-  release's tag (`docker compose ps`), and ClickHouse 25.3 or newer under the
+  the containers that run are the release's: every data-plane service the
+  profiles that are on run has a container on the image its configuration
+  names, on the release's tag, and ClickHouse is 25.3 or newer under the
   JSON table (as its image tag says, or the server itself when the tag names
   no version). When either is not so, the run fails instead of reporting
-  success, and says what can cause it.
-- **The release `docker compose` runs (Docker).** Every `docker compose`
-  command the CLI runs in a project gets `DP_IMAGE_TAG=<the release it is
-  for>` in its environment: compose takes a `DP_IMAGE_TAG` exported in the
-  shell over `.env`, so one left there by `set -a; . ./.env` cannot start
-  another release (the CLI warns that a plain `docker compose up` from that
-  shell would). `.env` is read as compose reads it, the last of several
-  `KEY=` lines winning, and setting a key leaves one line, the others kept as
-  they were. `.env` is replaced in one step (a file next to it renamed over
-  it), never left half-written.
+  success, and says what can cause it. The data-plane services are told by
+  name (each one whose image the bundle's `docker-compose.yml` takes from
+  `origamy-data-plane/`), so one a compose override takes from a registry
+  mirror is checked too: it must be the release's very image, the same image
+  ID as the release's own reference (pulled to compare when the host does
+  not have it) or an `org.opencontainers.image.version` label naming the
+  release, else the run fails and says so. What a container runs is what
+  `docker inspect` says it was created from (Compose before 2.15 lists no
+  image). An upgrade checks what the services will start from the same way
+  right after the pull, before anything is changed. A `--version` that is
+  not a numbered release (`main`, `production`, `sha-…`; the edge channel's
+  `:staging` writes the JSON table) is refused by `upgrade` and `deploy`
+  before they start: which events table those images write is not known
+  (they carry no version label), so no run could check it.
+- **The release and the project `docker compose` runs (Docker).** Every
+  `docker compose` command the CLI runs in a project gets `DP_IMAGE_TAG=<the
+  release it is for>` in its environment: compose takes a `DP_IMAGE_TAG`
+  exported in the shell over `.env`, so one left there by `set -a; .
+  ./.env` cannot start another release (the CLI warns that a plain `docker
+  compose up` from that shell would). Each one also pins the project's name
+  (`-p`: `COMPOSE_PROJECT_NAME` in `.env`, else the top-level `name:` of
+  `docker-compose.yml`, else the directory's name, as `origamy deploy` named
+  it) and leaves `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, `COMPOSE_PROFILES`
+  (and the other `COMPOSE_*` settings of which project and files it is)
+  exported in the shell out, so compose reads them from `.env`: a name
+  exported for another project can never point `uninstall`'s `down -v` at
+  it, nor a shell's profiles undo `--enable-ai`. A plane whose containers
+  all run under another name (a `COMPOSE_PROJECT_NAME` exported when it was
+  deployed) is refused until that name is in `.env`. `uninstall` removes
+  only the plane's own containers and volumes: it is refused when the
+  project's name also has containers started from another directory.
+  `.env` is read as compose reads it, the last of several `KEY=` lines
+  winning, and setting a key leaves one line, the others kept as they were.
+  `.env` is replaced in one step (a file next to it renamed over it), never
+  left half-written, and the new file keeps the owner and group of the old
+  one (`sudo origamy upgrade` does not leave it to root); a hard-linked
+  `.env`, or one whose owner the user cannot give the new file, is written
+  in place instead.
+- **Profiles turned off (Docker).** compose keeps the services of a profile
+  that is off in the project, so `up -d --remove-orphans` leaves their
+  containers running on the release they were started with. When a run
+  turns a profile off (`upgrade --disable-ai`, or "no" to journeys or the AI
+  engine on an in-place `deploy`), the services only that profile ran are
+  stopped and removed (`docker compose rm --stop --force`, with the old
+  profiles on) before `up -d`; one another profile still runs (Postgres,
+  with `full` or `agentic`) is kept.
 - **In-place deploy (Docker).** Re-running `deploy` in a project downloads
-  the bundle into a directory next to it, runs every check (and the
+  the bundle into a directory inside it, runs every check (and the
   questions) and redeems the token first, and only then swaps the files in,
   each one it replaces backed up as `<file>.bak-<release>`. A refused deploy,
   or one whose enrollment fails, leaves the project byte for byte as it was.
@@ -124,11 +161,22 @@ disturb the core.
   The lock goes with the process that holds it, however that ends, so a run
   that was killed leaves no stale lock (at most the file, which the next run
   simply locks again, and removes when it is done, refused or not; what such
-  a file says is not checked). Ctrl-C, SIGTERM and SIGHUP end an `upgrade` or a
+  a file says is not checked). Where the file system has no advisory locks
+  (`flock` answers `ENOLCK`, `EOPNOTSUPP` or `ENOSYS`: NFS without a lock
+  manager, some SMB and FUSE mounts), the lock file itself is the lock,
+  created with `O_EXCL` and removed by its run. A file such a run left
+  behind (killed) is taken over when it names a process on this host that no
+  longer runs, or has said nothing for 5 seconds; taking it over is
+  serialized by a second `O_EXCL` file, `.origamy.lock.takeover`, so two
+  runs that find it stale at once cannot both get the lock. One that names a
+  running process, or a process on another host (which cannot be checked),
+  refuses the run, and the message says to remove the file once that run is
+  gone. Ctrl-C, SIGTERM and SIGHUP end an `upgrade` or a
   `deploy` with exit code 130 once the step under way (a write of `.env`,
   the swap of the bundle files, the reset's write of `clickhouse-init.sql`)
   is through, removing the bundle download (also one still downloading) and
-  the lock file.
+  the lock file. A signal the CLI was started with ignored stays ignored:
+  `nohup origamy upgrade` over SSH outlives the session.
 
 ## What a deploy does with secrets
 

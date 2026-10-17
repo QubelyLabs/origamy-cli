@@ -620,16 +620,16 @@ func (r *bundleRefresh) composeArgs(envPath string) []string {
 	return composeFileArgs(r.dir, envPath, filepath.Join(r.tmp, "docker-compose.yml"))
 }
 
-// composeFileArgs is the -f list for the compose files a plain `docker
-// compose --project-directory dir --env-file envPath` loads, with dir's
-// docker-compose.yml replaced by compose: the files COMPOSE_FILE names (the
-// process environment over the .env), else docker-compose.yml and the first
+// composeFileArgs is the -f list for the compose files the CLI's own docker
+// compose commands in dir load (composeCmd), with dir's docker-compose.yml
+// replaced by compose: the files COMPOSE_FILE in .env names (the shell's is
+// not taken, see composeShellVars), else docker-compose.yml and the first
 // override file compose picks up next to it.
 func composeFileArgs(dir, envPath, compose string) []string {
 	own := filepath.Join(dir, "docker-compose.yml")
 	var files []string
-	if list := cmp.Or(os.Getenv("COMPOSE_FILE"), unquoteEnv(readEnvVar(envPath, "COMPOSE_FILE"))); list != "" {
-		sep := cmp.Or(os.Getenv("COMPOSE_PATH_SEPARATOR"), unquoteEnv(readEnvVar(envPath, "COMPOSE_PATH_SEPARATOR")), string(os.PathListSeparator))
+	if list := unquoteEnv(readEnvVar(envPath, "COMPOSE_FILE")); list != "" {
+		sep := cmp.Or(unquoteEnv(readEnvVar(envPath, "COMPOSE_PATH_SEPARATOR")), string(os.PathListSeparator))
 		for _, f := range strings.Split(list, sep) {
 			if f = strings.TrimSpace(f); f != "" {
 				if !filepath.IsAbs(f) {
@@ -664,8 +664,7 @@ func composeFileArgs(dir, envPath, compose string) []string {
 // plane down at `up`. And the new schema must be one tag can write.
 func (r *bundleRefresh) validate(envPath string, env []string, tag string) error {
 	if args := r.composeArgs(envPath); args != nil {
-		args = append(append([]string{"compose", "--project-directory", r.dir}, args...), "--env-file", envPath, "config", "-q")
-		if out, err := dockerRun(env, "docker", args...); err != nil {
+		if out, err := dockerRun(env, "docker", composeCmd(r.dir, envPath, append(args, "config", "-q")...)...); err != nil {
 			return fmt.Errorf("the new docker-compose.yml does not validate against your .env: %s", strings.ReplaceAll(lastLines(out, 3), "\n", " "))
 		}
 	}
@@ -927,15 +926,14 @@ func planBundleRefresh(dir, envPath, base, tag, installedTag string, env []strin
 	return r, ""
 }
 
-// pullImages pulls the images of the release env names (tagEnv, and what
+// pullImages pulls the images of the release env names (composeEnv, and what
 // else the run gives compose before .env holds it: the AI toggle's profile).
 // With a refresh that replaces the compose file it pulls with the new one
 // from the download directory, before anything in the project is touched,
 // so the images of services the new bundle adds come too and a failed or
 // interrupted pull leaves the project as it was.
 func pullImages(dir, envPath string, env []string, r *bundleRefresh) (string, error) {
-	args := append(append([]string{"compose", "--project-directory", dir}, r.composeArgs(envPath)...), "--env-file", envPath, "pull")
-	return dockerRun(env, "docker", args...)
+	return dockerRun(env, "docker", composeCmd(dir, envPath, append(r.composeArgs(envPath), "pull")...)...)
 }
 
 // bundleBoxLines summarises the refresh for the upgrade's final box, and

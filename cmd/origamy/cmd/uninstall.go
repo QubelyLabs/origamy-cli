@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"os"
@@ -21,7 +22,10 @@ var uninstallCmd = &cobra.Command{
 Finds the install to remove (override with --target):
   • Kubernetes → helm uninstall odp + delete the origamy-dp namespace, when the
                  cluster kubectl points at has the release or the namespace
-  • Docker     → docker compose down -v in ./origamy-dp-<id>/
+  • Docker     → docker compose down -v in ./origamy-dp-<id>/, pinned to that
+                 project's name (COMPOSE_PROJECT_NAME in its .env, else the
+                 directory's name; never the shell's), and only once every
+                 container of that name was started from that directory
 
 Run this BEFORE deactivating the workspace in your dashboard so the plane
 stops trying to reconnect.`,
@@ -146,6 +150,11 @@ func uninstallDocker(id string, assumeYes bool) error {
 		return fail(fmt.Sprintf("No data plane found at ./%s", dir),
 			"Run this from the directory where you deployed, or pass the right data plane id.")
 	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return fail("Could not read the working directory.", err.Error())
+	}
+	envPath := filepath.Join(abs, ".env")
 	ui.Title("Target")
 	ui.Success("Docker deployment detected (./%s)", dir)
 	// Not while an upgrade or a deploy works on it (lock.go).
@@ -155,16 +164,39 @@ func uninstallDocker(id string, assumeYes bool) error {
 	}
 	defer unlock()
 
-	if !confirmTeardown(fmt.Sprintf("the containers and volumes in ./%s", dir), assumeYes) {
+	// Only this plane's own containers and volumes go. `down -v` works on a
+	// compose project by name: the name is the one the CLI pins for the
+	// project (composeProjectName; never a COMPOSE_PROJECT_NAME exported in
+	// the shell, which can name another project), and every container that
+	// carries it must have been started from this directory.
+	name := composeProjectName(abs, envPath)
+	nothing := "Nothing has been removed."
+	switch o, out, ok := composeOwners(abs, name); {
+	case !ok:
+		return fail("Docker could not list the containers on this host, so whose they are could not be checked.",
+			outputHint(out)+"Fix the cause, then rerun `origamy uninstall "+id+"`. "+nothing)
+	case len(o.elsewhere) > 0:
+		var dirs []string
+		for _, d := range o.elsewhere {
+			dirs = append(dirs, cmp.Or(d, "a directory its containers do not name"))
+		}
+		return fail(fmt.Sprintf("The compose project %s, this data plane's, also has containers started from %s: `docker compose down -v` would remove them, and their volumes, too.", name, strings.Join(dirs, ", ")),
+			"If they are this plane's (a copy of ./"+dir+" runs them), uninstall from there. Otherwise remove them yourself first, or give this plane its own name (COMPOSE_PROJECT_NAME=<the name its containers run under> in "+envPath+"), then rerun. "+nothing)
+	case len(o.here) > 0:
+		return fail(fmt.Sprintf("Containers of this data plane run under the compose project name %s, which this CLI does not pin for ./%s (it pins %s): a COMPOSE_PROJECT_NAME exported in the shell when they were started.", strings.Join(o.here, ", "), dir, name),
+			"Put the name they run under in "+envPath+" (COMPOSE_PROJECT_NAME="+o.here[0]+"), then rerun `origamy uninstall "+id+"`. "+nothing)
+	}
+
+	if !confirmTeardown(fmt.Sprintf("the containers and volumes of compose project %s in ./%s", name, dir), assumeYes) {
 		return fail("Cancelled.", "")
 	}
 
 	sp := ui.Start("Stopping and removing containers + volumes")
-	if out, err := dockerRun(nil, "docker", "compose", "-f", compose, "down", "-v", "--remove-orphans"); err != nil {
+	if out, err := dockerRun(composeEnv(readEnvVar(envPath, "DP_IMAGE_TAG")), "docker", composeCmd(abs, envPath, "down", "-v", "--remove-orphans")...); err != nil {
 		sp.Fail("docker compose down failed")
 		return diagnoseDocker(out, "rerun `origamy uninstall "+id+"`")
 	}
-	sp.Success("Containers and volumes removed")
+	sp.Success("Containers and volumes of %s removed", name)
 
 	// Best-effort: remove the generated deploy directory (.env, compose, etc.),
 	// lock file included; Windows removes that only once it is unlocked.
