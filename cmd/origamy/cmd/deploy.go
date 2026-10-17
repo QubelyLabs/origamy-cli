@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -783,6 +784,12 @@ type dockerPlan struct {
 	aiEnabled     bool
 	ingestDomain  string
 	requireSigned bool
+	// resetPending is the target of a storage reset an earlier upgrade began
+	// here and did not finish (resetPendingVar): this deploy finishes it.
+	// resetDone: ClickHouse already holds the new events table, so finishing
+	// it drops nothing (and nothing was asked).
+	resetPending string
+	resetDone    bool
 }
 
 // planDocker runs the preflight checks, downloads the bundle and asks every
@@ -839,7 +846,8 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 				return nil, fail(fmt.Sprintf("Your control plane does not serve %s.", f),
 					"It predates this CLI's deploy bundle — upgrade the control plane, or deploy with an older CLI.")
 			}
-			return nil, diagnose(err.Error())
+			return nil, fail(fmt.Sprintf("Could not download %s from your control plane (%s).", f, base),
+				err.Error()+"\nCheck that this host reaches the control plane over HTTPS (DNS, proxy, firewall), then retry with the same token: nothing has been enrolled.")
 		}
 	}
 	sp.Success("Bundle downloaded (%s)", strings.Join(bundleFiles, ", "))
@@ -850,14 +858,23 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 		ui.Warn("Could not write %s (%v); `origamy upgrade` falls back to the bundle versions it knows.", bundleManifestFile, err)
 	}
 
+	// — Unfinished storage reset ——————————————————————————————————————
+	if p.existingID != "" {
+		pending, done, err := deployPendingReset(p.dir, imageTag)
+		if err != nil {
+			return nil, err
+		}
+		p.resetPending, p.resetDone = pending, done
+	}
+
 	// — Schema guard ————————————————————————————————————————————————————
 	// The bundle's ClickHouse schema follows the control plane's current build;
 	// the images follow imageTag. A mismatch comes up looking healthy and then
 	// drops every event at insert — refuse it here rather than find out later.
 	// For a plane that already runs, what its volume holds beats what a fresh
-	// volume would get.
+	// volume would get, unless the reset above is about to replace it.
 	live := ""
-	if p.existingID != "" {
+	if p.existingID != "" && (p.resetPending == "" || p.resetDone) {
 		live = liveSchemaGeneration(p.dir, envPath)
 	}
 	if live != "" {
@@ -914,6 +931,58 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 		p.ingestDomain = ingestDefault
 	}
 	return p, nil
+}
+
+// deployPendingReset handles a storage reset an earlier upgrade began in the
+// project dir and did not finish (resetPendingVar): the events table may be
+// the old one or gone, so the re-deploy finishes it before the services
+// start. What ClickHouse holds decides, as in the upgrade: when it is the new
+// table already (done), nothing is dropped or asked and only the record is
+// cleared; otherwise the bundle just downloaded must be able to finish it
+// for imageTag and the operator must agree, like the upgrade asks. It
+// returns the reset's target ("" when none is pending). Nothing has been
+// enrolled when it refuses.
+func deployPendingReset(dir, imageTag string) (pending string, done bool, err error) {
+	envPath := filepath.Join(dir, ".env")
+	pending = readEnvVar(envPath, resetPendingVar)
+	if pending == "" {
+		return "", false, nil
+	}
+	finish := upgradeCommand(pending) + " (in ./" + filepath.Base(dir) + ")"
+	if releaseSchemaGeneration(imageTag) != "json" {
+		return "", false, fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env), and %s.", pending, resetPendingVar, cannotFinishReset(imageTag)),
+			"Finish it first: "+finish+". Nothing has been enrolled or installed.")
+	}
+	live := probeLiveSchema(dir, envPath, nil)
+	switch live.gen {
+	case "json":
+		ui.Step("An earlier upgrade to %s recorded an unfinished storage reset here (%s in .env), but ClickHouse already holds the new events table (%s payload columns): nothing is dropped, and the record is cleared once the services are up.", pending, resetPendingVar, live.typ)
+		return pending, true, nil
+	case liveOther:
+		return "", false, fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here, and ClickHouse's %s has payload columns of type %s, neither the pre-reset (String) nor the new (JSON) schema; the reset drops only the pre-reset table.", pending, eventsTable, live.typ),
+			"Check what created it, and drop it yourself if it should be recreated with the new schema; then rerun deploy. Nothing has been enrolled or installed.")
+	}
+	why, culprit, cfg, cerr := resetComposeProblem(dir, envPath, imageTag, nil)
+	initSQL, _ := os.ReadFile(filepath.Join(dir, "clickhouse-init.sql"))
+	switch {
+	case cerr != nil:
+		return "", false, fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env), and docker compose could not render this project's configuration to tell which ClickHouse it runs.", pending, resetPendingVar),
+			cerr.Error()+"\nFix the compose files or .env, then rerun deploy. Nothing has been enrolled or installed.")
+	case len(culprit) > 0:
+		headline, hint := resetComposeRefusal(dir, pending, nil, "", why, culprit, nil)
+		return "", false, fail(headline, strings.Replace(hint, "rerun `"+upgradeCommand(pending)+"`. Nothing has been changed.", "rerun deploy. Nothing has been enrolled or installed.", 1))
+	case why != "" || schemaGeneration(string(initSQL)) == "string":
+		return "", false, fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env), and your control plane's bundle predates the reset, so it cannot finish it.", pending, resetPendingVar),
+			"Update the control plane, then rerun deploy, or run "+finish+". Nothing has been enrolled or installed.")
+	}
+	note := ""
+	if !live.known() {
+		note = liveResetNote(live, existingVolumes(cfg.serviceVolumes("clickhouse")))
+	}
+	if !confirmResumedReset(pending, imageTag, false, note) {
+		return "", false, fail("Cancelled.", "Nothing has been enrolled or installed.")
+	}
+	return pending, false, nil
 }
 
 // applyDocker installs the plane described by p for the enrolled token.
@@ -1011,6 +1080,20 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 		ui.Success("Wrote mTLS identity (certs/tls.crt, tls.key, ca.crt)")
 	}
 
+	// The storage reset an earlier upgrade left unfinished, on the bundle just
+	// downloaded, before anything runs on the new release.
+	outcome := resetNone
+	if p.resetPending != "" {
+		ui.Title("Storage reset")
+		wd, err := os.Getwd()
+		if err != nil {
+			return fail("Could not read the working directory.", err.Error())
+		}
+		if outcome, err = resetDockerEvents(wd, filepath.Join(wd, ".env"), p.imageTag, !p.resetDone); err != nil {
+			return err
+		}
+	}
+
 	ui.Title("Bringing services online")
 	sp := ui.Start("Starting services")
 	// Profiles come from COMPOSE_PROFILES in .env, so every later compose
@@ -1018,9 +1101,21 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	// stops the containers of a profile a re-deploy just turned off.
 	if out, err := runCaptured("docker", "compose", "--env-file", ".env", "up", "-d", "--remove-orphans"); err != nil {
 		sp.Fail("docker compose failed")
-		return diagnose(out)
+		return diagnoseDocker(out, "rerun `docker compose --env-file .env up -d` in ./"+dir)
 	}
 	sp.Success("Services started")
+	// The upgrade that began the reset may have swapped bundle files under
+	// the services that bind-mount them (bundleMountServices) and stopped
+	// before restarting them; the reset is finished once they were.
+	if p.resetPending != "" {
+		if restartMounts(bundleMountServices(profiles), "--env-file", ".env") {
+			if err := clearResetRecord(".env", p.imageTag); err != nil {
+				return err
+			}
+		} else {
+			ui.Warn("%s stays in .env until those services restart: the next `%s` restarts them and clears it, dropping nothing.", resetPendingVar, upgradeCommand(p.imageTag))
+		}
+	}
 
 	// `up -d` returning 0 only means the containers were created. Watch them
 	// stay up for a while so a wrong token, a refused mTLS handshake or a
@@ -1060,6 +1155,14 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	}
 	if line := signingSummary(tok.CSK != "", signingSupported(p.imageTag), p.requireSigned); line != "" {
 		lines = append(lines, ui.Gray("Config      ")+line)
+	}
+	switch outcome {
+	case resetDropped:
+		lines = append(lines, ui.Gray("Storage     ")+ui.Yellow("reset finished: event history was discarded; profiles, traits, segments and journeys were kept"))
+	case resetCreated:
+		lines = append(lines, ui.Gray("Storage     ")+ui.Yellow("reset finished: the events table was created with the new schema; profiles, traits, segments and journeys were kept"))
+	case resetAlready:
+		lines = append(lines, ui.Gray("Storage     ")+"reset finished: ClickHouse already held the new events table; nothing was dropped")
 	}
 	if p.ingestDomain != "" {
 		lines = append(lines,
@@ -1177,7 +1280,17 @@ func fail(headline, hint string) error {
 // diagnose inspects captured command output, prints the diagnosis, and returns
 // a silent error so cobra doesn't re-print a raw message.
 func diagnose(output string) error {
-	d := ui.DiagnoseHelm(output)
+	return printDiagnosis(ui.DiagnoseHelm(output), output)
+}
+
+// diagnoseDocker is diagnose for a Docker command of a compose install: its
+// output read as Docker's (ui.DiagnoseDocker), and rerun the command that
+// tries again.
+func diagnoseDocker(output, rerun string) error {
+	return printDiagnosis(ui.DiagnoseDocker(output, rerun), output)
+}
+
+func printDiagnosis(d ui.Diagnosis, output string) error {
 	fmt.Println()
 	ui.Fail("%s", d.Headline)
 	if d.Hint != "" {
@@ -1235,6 +1348,26 @@ func runCapturedEnv(extraEnv []string, name string, args ...string) (string, err
 	c.Stdout = &buf
 	c.Stderr = &buf
 	err := c.Run()
+	return buf.String(), err
+}
+
+// runCapturedEnvTimeout is runCapturedEnv that gives up after d: the command
+// is killed and an error returned with whatever it printed so far.
+func runCapturedEnvTimeout(d time.Duration, extraEnv []string, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	var buf bytes.Buffer
+	c := exec.CommandContext(ctx, name, args...)
+	c.Env = append(os.Environ(), extraEnv...)
+	c.Stdout = &buf
+	c.Stderr = &buf
+	// `docker compose` runs the compose plugin as a child process, which can
+	// keep the output open after docker itself is killed.
+	c.WaitDelay = 2 * time.Second
+	err := c.Run()
+	if ctx.Err() != nil {
+		return buf.String(), fmt.Errorf("no answer within %s", d)
+	}
 	return buf.String(), err
 }
 

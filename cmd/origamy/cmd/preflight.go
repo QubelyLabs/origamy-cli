@@ -266,6 +266,92 @@ func crossesSchemaReset(from, to string) bool {
 	return versionLess(from, minImageForJSONSchema) && !versionLess(to, minImageForJSONSchema)
 }
 
+// releaseSchemaGeneration is the schema generation (see schemaGeneration) the
+// images of a release write: "string" before minImageForJSONSchema, "json"
+// from it on and for the edge channel's :staging images, "unknown" for any
+// other moving tag (main, sha-…).
+func releaseSchemaGeneration(tag string) string {
+	switch _, semver := parseVersion(tag); {
+	case semver && versionLess(tag, minImageForJSONSchema):
+		return "string"
+	case semver, tag == dockerEdgeTag:
+		return "json"
+	}
+	return "unknown"
+}
+
+// dockerSchemaResetNeeded reports whether moving a Docker project to tag
+// crosses the storage reset. What the running ClickHouse holds (liveGen, see
+// probeLiveSchema) decides when it says: the pre-reset String columns mean a
+// reset for a target that writes JSON, and the JSON ones never do, whatever
+// the project's clickhouse-init.sql or tags say (an operator can have put the
+// pre-reset file back over a plane that is already across). Only when it
+// cannot say (not running, no events table, another type) do the project's
+// own clickhouse-init.sql (installedGen, what its table was created from) and
+// the release numbers (crossesSchemaReset) decide. That catches a project
+// deployed by CLI v0.1.15–v0.1.18, whose tag is the moving `main`, and one
+// whose schema file is gone.
+func dockerSchemaResetNeeded(installedTag, installedGen, liveGen, tag string) bool {
+	if releaseSchemaGeneration(tag) != "json" {
+		return false
+	}
+	switch liveGen {
+	case "json":
+		return false
+	case "string":
+		return true
+	}
+	return installedGen == "string" || crossesSchemaReset(installedTag, tag)
+}
+
+// minClickHouseForJSON is the first ClickHouse release whose JSON column type
+// is generally available; earlier ones need a setting the schema does not
+// set. The bundle moved to it at the storage reset.
+const minClickHouseForJSON = "25.3"
+
+// reClickHouseTag is the version an image tag starts with: 25.3, 25.3.2.39,
+// 25.8-alpine.
+var reClickHouseTag = regexp.MustCompile(`^(\d+)\.(\d+)(?:[.-]|$)`)
+
+// clickHouseImageVersion reads "major.minor" from a ClickHouse server image
+// reference (a registry prefix and a digest after the tag are fine). ok is
+// false when the reference is not clickhouse-server or its tag is not a
+// version (latest, head, a digest alone, no tag).
+func clickHouseImageVersion(image string) (version string, ok bool) {
+	ref, _, _ := strings.Cut(strings.Trim(strings.TrimSpace(image), `"'`), "@")
+	colon := strings.LastIndex(ref, ":")
+	if colon <= strings.LastIndex(ref, "/") {
+		return "", false
+	}
+	if name := ref[:colon]; name[strings.LastIndex(name, "/")+1:] != "clickhouse-server" {
+		return "", false
+	}
+	m := reClickHouseTag.FindStringSubmatch(ref[colon+1:])
+	if m == nil {
+		return "", false
+	}
+	return m[1] + "." + m[2], true
+}
+
+// clickHouseImageProblem explains why the ClickHouse server image a project
+// runs cannot hold the post-reset schema, "" when its tag names
+// minClickHouseForJSON or newer. One whose version the tag does not tell is a
+// problem too: the reset is refused rather than run on a server that may lack
+// the JSON type.
+func clickHouseImageProblem(image string) string {
+	if strings.TrimSpace(image) == "" {
+		return "it has no clickhouse service"
+	}
+	v, ok := clickHouseImageVersion(image)
+	if !ok {
+		return "it runs " + image + ", whose ClickHouse version the tag does not tell"
+	}
+	if versionLess(v+".0", minClickHouseForJSON+".0") {
+		return "it runs " + image
+	}
+	return ""
+}
+
 // eventsTable is the ClickHouse table the storage reset recreates.
 const eventsTable = "events.events"
 

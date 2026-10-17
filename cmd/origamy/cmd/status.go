@@ -77,7 +77,7 @@ func statusDocker() error {
 	out, err := runCaptured("docker", "compose", "--project-directory", dir,
 		"--env-file", filepath.Join(dir, ".env"), "ps")
 	if err != nil {
-		return diagnose(out)
+		return diagnoseDocker(out, "rerun `origamy status`")
 	}
 	fmt.Println()
 	fmt.Println(out)

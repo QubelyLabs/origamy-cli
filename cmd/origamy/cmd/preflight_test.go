@@ -211,6 +211,96 @@ func TestCrossesSchemaReset(t *testing.T) {
 	}
 }
 
+func TestReleaseSchemaGeneration(t *testing.T) {
+	for tag, want := range map[string]string{
+		"0.1.15": "string", "0.1.17": "string",
+		"0.1.18": "json", "0.1.20": "json", "1.0.0": "json",
+		dockerEdgeTag: "json",
+		"main":        "unknown", "sha-881359f": "unknown", "": "unknown",
+	} {
+		if got := releaseSchemaGeneration(tag); got != want {
+			t.Errorf("releaseSchemaGeneration(%q) = %q, want %q", tag, got, want)
+		}
+	}
+}
+
+func TestDockerSchemaResetNeeded(t *testing.T) {
+	for _, c := range []struct {
+		name                         string
+		installed, gen, live, target string
+		want                         bool
+	}{
+		// CLI v0.1.15–v0.1.18 pinned :main; what the schema file says decides.
+		{"main on the String schema", "main", "string", "", "0.1.20", true},
+		{"main on the JSON schema", "main", "json", "", "0.1.20", false},
+		{"main, ClickHouse holds String", "main", "unknown", "string", "0.1.20", true},
+		{"release before the reset", "0.1.16", "string", "", "0.1.20", true},
+		{"release before the reset, schema file gone", "0.1.16", "unknown", "", "0.1.20", true},
+		// An upgrade by an earlier CLI moved the tag and the file but left the
+		// old table: the running ClickHouse says so.
+		{"tag and file moved, table did not", "0.1.20", "json", "string", "0.1.20", true},
+		{"already across", "0.1.19", "json", "json", "0.1.20", false},
+		{"already across, ClickHouse not running", "0.1.19", "json", "", "0.1.20", false},
+		// The new table is never dropped, whatever the schema file and the
+		// tags say: an operator can have put the pre-reset file back.
+		{"String file, ClickHouse holds JSON, same release", "0.1.20", "string", "json", "0.1.20", false},
+		{"String file, ClickHouse holds JSON, 0.1.19", "0.1.19", "string", "json", "0.1.20", false},
+		{"String file, ClickHouse holds JSON, main", "main", "string", "json", "0.1.20", false},
+		{"before the reset by tag, ClickHouse holds JSON", "0.1.16", "string", "json", "0.1.20", false},
+		{"edge, ClickHouse holds JSON", "0.1.16", "string", "json", dockerEdgeTag, false},
+		// The old table resets whatever the file says.
+		{"JSON file, ClickHouse holds String", "0.1.19", "json", "string", "0.1.20", true},
+		// Only a ClickHouse that cannot say lets the file and tags decide.
+		{"no events table, String file", "0.1.20", "string", liveMissing, "0.1.20", true},
+		{"no events table, JSON file", "0.1.20", "json", liveMissing, "0.1.20", false},
+		{"another type, String file", "0.1.20", "string", liveOther, "0.1.20", true},
+		{"edge from a pre-reset project", "0.1.16", "string", "", dockerEdgeTag, true},
+		{"edge on the JSON schema", dockerEdgeTag, "json", "", dockerEdgeTag, false},
+		// A target that does not write JSON never resets.
+		{"to a pre-reset release", "0.1.16", "string", "", "0.1.17", false},
+		{"to a moving tag of unknown schema", "0.1.16", "string", "", "main", false},
+	} {
+		if got := dockerSchemaResetNeeded(c.installed, c.gen, c.live, c.target); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestClickHouseImageProblem(t *testing.T) {
+	for _, c := range []struct {
+		image string
+		want  string // substring; "" = fine
+	}{
+		{"clickhouse/clickhouse-server:25.3", ""},
+		{"clickhouse/clickhouse-server:26.1.2", ""},
+		{"clickhouse/clickhouse-server:25.3.2.39", ""},
+		{"clickhouse/clickhouse-server:25.8-alpine", ""},
+		{"docker.io/clickhouse/clickhouse-server:25.8-alpine", ""},
+		{"registry.example.com:5000/mirror/clickhouse/clickhouse-server:25.3", ""},
+		{"clickhouse/clickhouse-server:25.3@sha256:0000000000000000000000000000000000000000000000000000000000000000", ""},
+		{`"clickhouse/clickhouse-server:25.3"`, ""},
+		{"clickhouse/clickhouse-server:24.8", "it runs clickhouse/clickhouse-server:24.8"},
+		{"clickhouse/clickhouse-server:25.2", "it runs clickhouse/clickhouse-server:25.2"},
+		{"clickhouse/clickhouse-server:24.8@sha256:0000000000000000000000000000000000000000000000000000000000000000", "it runs clickhouse/clickhouse-server:24.8@"},
+		{"registry.example.com:5000/clickhouse/clickhouse-server:24.8", "it runs registry.example.com:5000/"},
+		// A version the tag does not tell is refused, not allowed.
+		{"clickhouse/clickhouse-server:latest", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-server", "whose ClickHouse version the tag does not tell"},
+		{"registry.example.com:5000/clickhouse/clickhouse-server", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-server@sha256:0000000000000000000000000000000000000000000000000000000000000000", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-server:head", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-server:25", "whose ClickHouse version the tag does not tell"},
+		{"mirror/ch:25.3", "whose ClickHouse version the tag does not tell"},
+		{"clickhouse/clickhouse-keeper:25.3", "whose ClickHouse version the tag does not tell"},
+		{"", "it has no clickhouse service"},
+	} {
+		got := clickHouseImageProblem(c.image)
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%q: got %q, want %q", c.image, got, c.want)
+		}
+	}
+}
+
 func TestIsDesktopContext(t *testing.T) {
 	for ctx, want := range map[string]bool{
 		"docker-desktop": true, "kind-kind": true, "minikube": true, "orbstack": true,

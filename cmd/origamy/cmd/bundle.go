@@ -39,6 +39,11 @@ const bundleManifestFile = ".origamy-bundle.json"
 type bundleManifest struct {
 	Version string            `json:"version"`
 	Files   map[string]string `json:"files"`
+	// Releases is the release each file came with, where known. An edited
+	// file a refresh keeps keeps the release of the version it was made from,
+	// which Version (the last refresh's) is not. Absent in manifests from
+	// earlier CLIs.
+	Releases map[string]string `json:"releases,omitempty"`
 }
 
 func sha256Hex(b []byte) string {
@@ -78,21 +83,25 @@ func writeBundleManifest(dir string, m bundleManifest) error {
 // downloaded into dir: every file as it is on disk, and the release the
 // control plane said the bundle is for ("" when it predates /byod/VERSION).
 func recordDeployedBundle(dir, version string) error {
-	m := bundleManifest{Version: version, Files: map[string]string{}}
+	m := bundleManifest{Version: version, Files: map[string]string{}, Releases: map[string]string{}}
 	for _, name := range bundleFiles {
 		b, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			return err
 		}
 		m.Files[name] = sha256Hex(b)
+		if version != "" {
+			m.Releases[name] = version
+		}
 	}
 	return writeBundleManifest(dir, m)
 }
 
 // recordBundleFile updates one file's entry in dir's manifest after it was
 // rewritten from the control plane outside a refresh (the storage reset's
-// schema fetch), so the next upgrade does not take it for an edit.
-func recordBundleFile(dir, name string) error {
+// schema fetch), so the next upgrade does not take it for an edit. release
+// is the release it came with, "" when unknown.
+func recordBundleFile(dir, name, release string) error {
 	b, err := os.ReadFile(filepath.Join(dir, name))
 	if err != nil {
 		return err
@@ -102,7 +111,80 @@ func recordBundleFile(dir, name string) error {
 		m.Files = map[string]string{}
 	}
 	m.Files[name] = sha256Hex(b)
+	if release != "" {
+		if m.Releases == nil {
+			m.Releases = map[string]string{}
+		}
+		m.Releases[name] = release
+	} else {
+		delete(m.Releases, name)
+	}
 	return writeBundleManifest(dir, m)
+}
+
+// resetSchemaWrite is what writeResetSchema did to clickhouse-init.sql.
+type resetSchemaWrite struct {
+	// backup is where the previous file went ("" when there was none, or it
+	// already held the new schema); edited, whether it was edited here.
+	backup string
+	edited bool
+}
+
+// resetSchemaProblem says why the storage reset cannot write its schema to
+// the project's clickhouse-init.sql ("is …"), "" when it can: a symbolic link
+// (the reset never writes through one) or a directory with something in it
+// is the operator's own arrangement.
+func resetSchemaProblem(dir string) string {
+	path := filepath.Join(dir, "clickhouse-init.sql")
+	cur, err := readBundleCurrent(path)
+	switch {
+	case err != nil:
+		return "cannot be read (" + err.Error() + ")"
+	case !cur.own:
+		return ""
+	}
+	if target, err := os.Readlink(path); err == nil {
+		return "is a symbolic link (to " + target + "), and the reset does not write through a link"
+	}
+	return "is not a regular file"
+}
+
+// writeResetSchema puts sql, the schema the storage reset applies, in the
+// project's clickhouse-init.sql (the bundle's init service reads it from
+// there) when the bundle refresh did not. The file there is backed up first
+// as <file>.bak-<the release it came with>, edited or not, like a refresh
+// does; resetSchemaProblem has ruled out a link or a directory.
+func writeResetSchema(dir string, sql []byte, installedTag string) (resetSchemaWrite, error) {
+	const name = "clickhouse-init.sql"
+	path := filepath.Join(dir, name)
+	cur, err := readBundleCurrent(path)
+	if err != nil {
+		return resetSchemaWrite{}, err
+	}
+	if cur.own {
+		return resetSchemaWrite{}, fmt.Errorf("%s is not a regular file", path)
+	}
+	m := readBundleManifest(dir)
+	var w resetSchemaWrite
+	mode := os.FileMode(0o644)
+	switch {
+	case cur.emptyDir:
+		if err := os.Remove(path); err != nil {
+			return w, err
+		}
+	case cur.exists && !bytes.Equal(cur.data, sql):
+		w.edited = !bundlePristineSum(name, sha256Hex(cur.data), m)
+		if w.backup, err = writeBackup(path, cur.data, cur.mode, backupTag(backupRelease(name, cur.data, m, installedTag))); err != nil {
+			return resetSchemaWrite{}, fmt.Errorf("back up %s: %w", name, err)
+		}
+		mode = cur.mode
+	}
+	if err := os.WriteFile(path, sql, mode); err != nil {
+		return w, err
+	}
+	// The control plane's file now, not an edit, for the next upgrade.
+	_ = recordBundleFile(dir, name, "")
+	return w, nil
 }
 
 // controlPlaneHTTPBase returns the control plane's base URL from a Docker
@@ -115,11 +197,74 @@ func controlPlaneHTTPBase(envPath string) (base string, fromConfigURL bool) {
 		return v, false
 	}
 	v := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONFIG_URL")), "/")
-	v = strings.TrimRight(strings.TrimSuffix(v, "/api/v1/config"), "/")
+	v = strings.TrimRight(strings.TrimSuffix(v, configPath), "/")
 	if u, err := url.Parse(v); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return "", false
 	}
 	return v, true
+}
+
+// configPath and telemetryPath are where config-sync and its telemetry
+// reporter reach the control plane. Both take the FULL endpoint URL
+// (CONFIG_URL, TELEMETRY_URL), which renderDockerEnv writes from the base.
+const (
+	configPath    = "/api/v1/config"
+	telemetryPath = "/api/v1/telemetry"
+)
+
+// backfillDockerEnv brings an .env from CLI v0.1.18 or older up to what
+// renderDockerEnv writes for the control plane at base, without changing a
+// value set here: CONTROL_PLANE_HTTP_URL when it is empty (the CLI reads it
+// for the next refresh); CONFIG_URL when it is empty and TELEMETRY_URL when
+// it is absent (empty turns telemetry off), those two only when the
+// project's compose file reads them. Those CLIs also wrote CONFIG_URL as the
+// bare control-plane URL, which config-sync requests as it is (it never
+// appends the endpoint), so such a plane has never received its config:
+// that one value is corrected. It returns a line for each change.
+func backfillDockerEnv(dir, envPath, base string) ([]string, error) {
+	if base == "" {
+		return nil, nil
+	}
+	compose, _ := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	reads := func(key string) bool {
+		return regexp.MustCompile(`\$\{` + regexp.QuoteMeta(key) + `[}:?-]`).Match(compose)
+	}
+	var notes []string
+	set := func(key, val, note string) error {
+		if err := setEnvVar(envPath, key, val); err != nil {
+			return err
+		}
+		notes = append(notes, note)
+		return nil
+	}
+	if readEnvVar(envPath, "CONTROL_PLANE_HTTP_URL") == "" {
+		if err := set("CONTROL_PLANE_HTTP_URL", base, "Recorded CONTROL_PLANE_HTTP_URL="+base+" in .env."); err != nil {
+			return notes, err
+		}
+	}
+	switch cfg := strings.TrimRight(unquoteEnv(readEnvVar(envPath, "CONFIG_URL")), "/"); {
+	case !reads("CONFIG_URL"):
+	case cfg == "":
+		if err := set("CONFIG_URL", base+configPath, "Recorded CONFIG_URL="+base+configPath+" in .env."); err != nil {
+			return notes, err
+		}
+	case isBareURL(cfg):
+		if err := set("CONFIG_URL", cfg+configPath, "Corrected CONFIG_URL to "+cfg+configPath+" in .env: config-sync requests it as it is, and the bare control-plane URL CLI v0.1.18 and older wrote never returned this plane's config."); err != nil {
+			return notes, err
+		}
+	}
+	if reads("TELEMETRY_URL") && !envHasKey(envPath, "TELEMETRY_URL") {
+		if err := set("TELEMETRY_URL", base+telemetryPath, "Recorded TELEMETRY_URL="+base+telemetryPath+" in .env, so the dashboard gets this plane's health."); err != nil {
+			return notes, err
+		}
+	}
+	return notes, nil
+}
+
+// isBareURL reports whether v is an http(s) URL with no path.
+func isBareURL(v string) bool {
+	u, err := url.Parse(v)
+	return err == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Host != "" && strings.Trim(u.Path, "/") == "" && u.RawQuery == ""
 }
 
 // unquoteEnv strips the quotes compose's dotenv parser would.
@@ -256,8 +401,12 @@ func bundleModeFlags(replace, keep bool) (bundleMode, error) {
 }
 
 // dockerRun runs a docker command with extra environment and returns its
-// combined output. A variable so tests can stand in for Docker.
-var dockerRun = runCapturedEnv
+// combined output; dockerRunTimeout, one that must finish within a time.
+// Variables so tests can stand in for Docker.
+var (
+	dockerRun        = runCapturedEnv
+	dockerRunTimeout = runCapturedEnvTimeout
+)
 
 type bundleFile struct {
 	name  string
@@ -279,12 +428,26 @@ func (f bundleFile) changes() bool { return f.state == bundlePristine || f.state
 // swaps the files in (rollback puts the previous ones back if that fails
 // half-way) and commit finishes it.
 type bundleRefresh struct {
-	dir, tmp, version, backupTag string
-	files                        []bundleFile
+	dir, tmp, version, installedTag string
+	files                           []bundleFile
 	// prev is the manifest as the refresh found it.
 	prev bundleManifest
 	// undo holds, in order, the steps apply took; rollback reverses them.
 	undo []func() error
+	// removedNew lists the stale <name>.new files commit removed.
+	removedNew []string
+}
+
+// controlPlaneFetchFail explains a bundle file (name) a Docker upgrade could
+// not download from its control plane at base: a network or control-plane
+// problem, never a cluster's. rerun says how to try again.
+func controlPlaneFetchFail(base, name string, err error, rerun string) error {
+	if errors.Is(err, errNotServed) {
+		return fail(fmt.Sprintf("Your control plane (%s) does not serve %s.", base, name),
+			"It predates this CLI's deploy bundle: update the control plane, then "+rerun+".")
+	}
+	return fail(fmt.Sprintf("Could not download %s from your control plane (%s).", name, base),
+		err.Error()+"\nCheck CONTROL_PLANE_HTTP_URL in .env and that this host reaches the control plane over HTTPS (DNS, proxy, firewall), then "+rerun+".")
 }
 
 // bundleTempPrefix names the download directory prepareBundleRefresh makes
@@ -315,14 +478,14 @@ func removeStaleBundleDirs(dir string) []string {
 // prepareBundleRefresh downloads the bundle from base into a temporary
 // directory inside dir and classifies every file. force names files replaced
 // even when edited (the storage reset's schema). Backups are named after the
-// bundle being replaced: the manifest's release, else the installed tag.
+// release each replaced file belongs to (backupRelease).
 func prepareBundleRefresh(dir, base, version, installedTag string, replaceEdited bool, force map[string]bool) (*bundleRefresh, error) {
 	tmp, err := os.MkdirTemp(dir, bundleTempPrefix)
 	if err != nil {
 		return nil, err
 	}
 	m := readBundleManifest(dir)
-	r := &bundleRefresh{dir: dir, tmp: tmp, version: version, backupTag: backupTag(cmp.Or(m.Version, installedTag)), prev: m}
+	r := &bundleRefresh{dir: dir, tmp: tmp, version: version, installedTag: installedTag, prev: m}
 	for _, name := range bundleFiles {
 		served, err := fetchBundleBytes(base, name)
 		if err == nil {
@@ -348,7 +511,39 @@ func prepareBundleRefresh(dir, base, version, installedTag string, replaceEdited
 	return r, nil
 }
 
-// backupTag names backups after the release being moved away from.
+// backupRelease is the release the backup of bundle file name (data, as it
+// is now) is named after: one the control plane handed out with exactly
+// these bytes (knownBundleReleases). Otherwise the file was edited here, or
+// holds bytes the table does not know, and it is the release the file itself
+// came with: the manifest's record for it (Releases, else the release of the
+// version recorded in Files, which the edit was made from). Only then the
+// release the manifest recorded the bundle as, which a kept edit can
+// predate, else the installed tag.
+func backupRelease(name string, data []byte, m bundleManifest, installedTag string) string {
+	if rels := knownBundleReleases[sha256Hex(data)]; len(rels) > 0 {
+		return preferRelease(rels, installedTag, m.Version)
+	}
+	if v := m.Releases[name]; v != "" {
+		return v
+	}
+	if rels := knownBundleReleases[m.Files[name]]; len(rels) > 0 {
+		return preferRelease(rels, installedTag, m.Version)
+	}
+	return cmp.Or(m.Version, installedTag)
+}
+
+// preferRelease picks one of rels (oldest first): the first of prefer that is
+// one of them, else the newest.
+func preferRelease(rels []string, prefer ...string) string {
+	for _, v := range prefer {
+		if v != "" && slices.Contains(rels, v) {
+			return v
+		}
+	}
+	return rels[len(rels)-1]
+}
+
+// backupTag makes a release name a backup suffix ("previous" for none).
 func backupTag(installedTag string) string {
 	t := strings.Map(func(c rune) rune {
 		if c == '.' || c == '-' || c == '_' || ('0' <= c && c <= '9') || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') {
@@ -493,7 +688,7 @@ func (r *bundleRefresh) apply() error {
 		dst, src := filepath.Join(r.dir, f.name), filepath.Join(r.tmp, f.name)
 		switch {
 		case f.state == bundlePristine:
-			bak, err := writeBackup(dst, f.cur.data, f.cur.mode, r.backupTag)
+			bak, err := writeBackup(dst, f.cur.data, f.cur.mode, backupTag(backupRelease(f.name, f.cur.data, r.prev, r.installedTag)))
 			if err != nil {
 				return fmt.Errorf("back up %s: %w", f.name, err)
 			}
@@ -571,11 +766,13 @@ func (r *bundleRefresh) rollback() error {
 // of every file kept because it was edited goes next to it as <name>.new, and
 // the manifest records the files now on disk that are the bundle's. An edited
 // file keeps the entry it had (none for a project from an older CLI), so the
-// next upgrade decides about it exactly as this one did.
+// next upgrade decides about it exactly as this one did. A <name>.new an
+// earlier upgrade left next to a file that is now the served version is
+// stale, and removed.
 func (r *bundleRefresh) commit() error {
 	defer r.cleanup()
 	r.undo = nil
-	m := bundleManifest{Version: r.version, Files: map[string]string{}}
+	m := bundleManifest{Version: r.version, Files: map[string]string{}, Releases: map[string]string{}}
 	var errs []error
 	for _, f := range r.files {
 		if f.state == bundleModified {
@@ -585,9 +782,21 @@ func (r *bundleRefresh) commit() error {
 			if prev := r.prev.Files[f.name]; prev != "" {
 				m.Files[f.name] = prev
 			}
+			if rel := r.prev.Releases[f.name]; rel != "" {
+				m.Releases[f.name] = rel
+			}
 			continue
 		}
 		m.Files[f.name] = f.sum
+		m.Releases[f.name] = r.version
+		stale := filepath.Join(r.dir, f.name+".new")
+		if fi, err := os.Lstat(stale); err == nil && fi.Mode().IsRegular() {
+			if err := os.Remove(stale); err != nil {
+				errs = append(errs, err)
+			} else {
+				r.removedNew = append(r.removedNew, f.name+".new")
+			}
+		}
 	}
 	if err := writeBundleManifest(r.dir, m); err != nil {
 		errs = append(errs, err)
@@ -602,15 +811,32 @@ func (r *bundleRefresh) cleanup() {
 }
 
 // restarts names the services to restart after `up -d` because a file they
-// bind-mount was replaced. Compose recreates a container when its service
-// definition changes, not when a mounted file does, and the replaced file is
-// a new inode the running container never sees.
+// bind-mount was replaced (none for a nil refresh). Compose recreates a
+// container when its service definition changes, not when a mounted file
+// does, and the replaced file is a new inode the running container never
+// sees.
 func (r *bundleRefresh) restarts(profiles []string) []string {
+	if r == nil {
+		return nil
+	}
 	var out []string
 	if r.changes("clickhouse-users.xml") {
 		out = append(out, "clickhouse")
 	}
 	if r.changes("Caddyfile") && hasProfile(profiles, "ingress") {
+		out = append(out, "caddy")
+	}
+	return out
+}
+
+// bundleMountServices are all the services that bind-mount bundle files
+// (restarts): ClickHouse, and Caddy when the ingress profile runs it. A run
+// that finishes a storage reset restarts them whatever it replaced itself,
+// since the run that began the reset may have swapped files under them and
+// stopped before restarting them.
+func bundleMountServices(profiles []string) []string {
+	out := []string{"clickhouse"}
+	if hasProfile(profiles, "ingress") {
 		out = append(out, "caddy")
 	}
 	return out
@@ -623,8 +849,14 @@ func (r *bundleRefresh) restarts(profiles []string) []string {
 // the project has. reset forces the new schema in: the storage reset
 // recreates the events table from it.
 func planBundleRefresh(dir, envPath, base, tag, installedTag string, mode bundleMode, reset bool) (*bundleRefresh, string) {
+	// Across the reset a skipped refresh does not leave the files as they
+	// are: the reset writes its schema to clickhouse-init.sql all the same.
+	asIs, resetNote := "left as-is", ""
+	if reset {
+		asIs, resetNote = "not refreshed", "; the storage reset still writes its schema to clickhouse-init.sql"
+	}
 	if mode == bundleKeep {
-		ui.Step("Bundle files left as-is (--keep-bundle).")
+		ui.Step("Bundle files %s (--keep-bundle)%s.", asIs, resetNote)
 		return nil, "--keep-bundle"
 	}
 	if base == "" {
@@ -634,7 +866,7 @@ func planBundleRefresh(dir, envPath, base, tag, installedTag string, mode bundle
 	sp := ui.Start("Checking the control plane's deploy bundle")
 	served, err := servedBundleVersion(base)
 	if why := bundleVersionProblem(served, err, tag); why != "" {
-		sp.Warn("Bundle files (%s) left as-is: %s", strings.Join(bundleFiles, ", "), why)
+		sp.Warn("Bundle files (%s) %s: %s%s", strings.Join(bundleFiles, ", "), asIs, why, resetNote)
 		switch {
 		case errors.Is(err, errNotServed):
 			return nil, "control plane has no /byod/VERSION"
@@ -645,12 +877,12 @@ func planBundleRefresh(dir, envPath, base, tag, installedTag string, mode bundle
 	}
 	r, err := prepareBundleRefresh(dir, base, tag, installedTag, mode == bundleReplace, map[string]bool{"clickhouse-init.sql": reset})
 	if err != nil {
-		sp.Warn("Bundle files left as-is: could not download the %s bundle (%v)", tag, err)
+		sp.Warn("Bundle files %s: could not download the %s bundle (%v)%s", asIs, tag, err, resetNote)
 		return nil, "download failed"
 	}
 	if err := r.validate(envPath, tag); err != nil {
 		r.cleanup()
-		sp.Warn("Bundle files left as-is: %v", err)
+		sp.Warn("Bundle files %s: %v%s", asIs, err, resetNote)
 		return nil, "new bundle failed validation"
 	}
 	switch changed := r.changed(); {
@@ -682,9 +914,25 @@ func pullImages(dir, envPath, tag string, r *bundleRefresh) (string, error) {
 	return dockerRun([]string{"DP_IMAGE_TAG=" + tag}, "docker", args...)
 }
 
-// bundleBoxLines summarises the refresh for the upgrade's final box.
-func bundleBoxLines(r *bundleRefresh, skipped string) []string {
+// bundleBoxLines summarises the refresh for the upgrade's final box, and
+// the storage reset's own write of clickhouse-init.sql (schema; nil when the
+// reset wrote none).
+func bundleBoxLines(r *bundleRefresh, skipped string, schema *resetSchemaWrite) []string {
 	label := ui.Gray("Bundle     ")
+	indent := "           "
+	if schema != nil {
+		what := "clickhouse-init.sql replaced with your control plane's current schema for the storage reset"
+		switch {
+		case schema.edited:
+			what = ui.Yellow("replaced your edited clickhouse-init.sql") + " with your control plane's current schema for the storage reset — yours is in " + filepath.Base(schema.backup)
+		case schema.backup != "":
+			what += " — the previous one is in " + filepath.Base(schema.backup)
+		}
+		if r == nil {
+			return []string{label + "not refreshed (" + skipped + ")", indent + what}
+		}
+		return append(bundleBoxLines(r, skipped, nil), indent+what)
+	}
 	if r == nil {
 		return []string{label + "left as-is (" + skipped + ")"}
 	}

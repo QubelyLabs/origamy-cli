@@ -73,6 +73,54 @@ func DiagnoseHelm(output string) Diagnosis {
 	}
 }
 
+// DiagnoseDocker is DiagnoseHelm for the Docker commands of a compose install
+// (pull, up, restart). Its network and timeout cases are about Docker and the
+// image registry, never a Kubernetes cluster, and the fallback asks for a
+// rerun (rerun, e.g. "rerun `origamy upgrade --version 0.1.20`") rather than
+// a fresh enrollment token.
+func DiagnoseDocker(output, rerun string) Diagnosis {
+	o := strings.ToLower(output)
+	switch {
+	case contains(o, "conflict. the container name"):
+		return Diagnosis{
+			"Another Origamy data plane is already running on this host.",
+			"The compose bundle uses fixed container names, so one host runs one plane. Run this inside its ./origamy-dp-<id>/ directory, or `origamy uninstall <id>` the old one first.",
+		}
+	case contains(o, "no matching manifest for linux/arm64"), contains(o, "exec format error"):
+		return Diagnosis{
+			"The data-plane images are published for linux/amd64 only.",
+			"Run on an amd64 host, or (Docker Desktop / Linux with QEMU binfmt) let Docker emulate amd64.",
+		}
+	case contains(o, "cannot connect to the docker daemon"), contains(o, "is the docker daemon running"):
+		return Diagnosis{
+			"Docker is not running.",
+			"Start Docker, then " + rerun + ".",
+		}
+	case contains(o, "manifest unknown"), contains(o, "pull access denied"),
+		contains(o, "401 unauthorized"), contains(o, "denied: "):
+		return Diagnosis{
+			"A container image could not be pulled.",
+			"The release may not exist (check the version you passed) or the registry refused the request. Fix the cause, then " + rerun + ".",
+		}
+	case contains(o, "no space left on device"):
+		return Diagnosis{
+			"The Docker host is out of disk space.",
+			"Free some space (docker system df shows what Docker holds), then " + rerun + ".",
+		}
+	case contains(o, "connection refused"), contains(o, "no such host"), contains(o, "i/o timeout"),
+		contains(o, "tls handshake timeout"), contains(o, "context deadline exceeded"), contains(o, "network is unreachable"):
+		return Diagnosis{
+			"Docker could not reach the image registry.",
+			"Check this host's network access to ghcr.io and Docker Hub (a proxy needs Docker's own proxy settings), then " + rerun + ".",
+		}
+	default:
+		return Diagnosis{
+			"The Docker command failed.",
+			"See the output below. Fix the cause, then " + rerun + ".",
+		}
+	}
+}
+
 // DiagnosePod maps a pod's waiting/phase reason to a one-line hint.
 func DiagnosePod(reason string) string {
 	switch reason {
