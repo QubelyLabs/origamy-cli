@@ -90,24 +90,163 @@ disturb the core.
   --version 0.1.17` over the String table with a control plane serving the
   JSON schema), since the served schema is what the deploy installs. For a
   plane that already runs, what its ClickHouse holds decides (see the storage
-  reset below), and after `up -d` both `deploy` and `upgrade` check that
+  reset below).
+
+  **Which checks run depends on the move.** The heavy ones run only on a move
+  that can touch the events table: it crosses the storage reset (the release
+  the plane runs and the target write different tables, up or down), a reset
+  is recorded in `.env`, either release is not a numbered one (`main`: the
+  projects of CLI v0.1.15 to v0.1.18 run it), or ClickHouse, peeked at, holds
+  another table than the target writes. Any other move (0.1.19 → 0.1.20, a
+  rollback within a generation, an in-place `deploy` of the release the plane
+  runs) behaves like CLI v0.1.20: no new refusal for want of an answer and no
+  new failure after the commit point. For it, ClickHouse is only asked if it
+  already answers (never started), nothing is pulled to compare images, and
+  what the checks after `up -d` find (a ClickHouse that does not answer, a
+  data-plane container on another release of the same generation) is a
+  warning. Two things fail it all the same, because they are the very
+  mismatch the checks exist for: an events table of another generation than
+  the target writes, or none (recorded as a reset for the next run to
+  finish), and a data-plane image of the other generation (an override
+  pinning 0.1.17 under 0.1.20: refused before anything is changed, found
+  after `up -d` otherwise, from the reference the container was made from).
+
+  **On a move that can touch the table**, `upgrade` and in-place `deploy`
+  start ClickHouse when it does not answer, and refuse when it still cannot be
+  asked; `upgrade` compares, right after the pull and before anything is
+  changed, what every data-plane service the configuration starts would run
+  with the release; the containers of data-plane services whose profile is
+  off are removed before `up -d`; and after `up -d` both check that
   `events.events` exists and is the generation the release writes, and that
-  the containers that run are the release's: every data-plane service on the
-  release's tag (`docker compose ps`), and ClickHouse 25.3 or newer under the
-  JSON table (as its image tag says, or the server itself when the tag names
-  no version). When either is not so, the run fails instead of reporting
-  success, and says what can cause it.
-- **The release `docker compose` runs (Docker).** Every `docker compose`
-  command the CLI runs in a project gets `DP_IMAGE_TAG=<the release it is
-  for>` in its environment: compose takes a `DP_IMAGE_TAG` exported in the
-  shell over `.env`, so one left there by `set -a; . ./.env` cannot start
-  another release (the CLI warns that a plain `docker compose up` from that
-  shell would). `.env` is read as compose reads it, the last of several
-  `KEY=` lines winning, and setting a key leaves one line, the others kept as
-  they were. `.env` is replaced in one step (a file next to it renamed over
-  it), never left half-written.
+  EVERY container of the compose project (found by its
+  `com.docker.compose.project` label, under the name the CLI pins) that runs
+  a data-plane image runs the release's, ClickHouse being 25.3 or newer
+  under the JSON table (as its image tag says, or the server itself when the
+  tag names no version). When either is not so, the run fails instead of
+  reporting success, and says what can cause it. The details:
+
+  - A data-plane image is told by the reference its container was created
+    from (an image of `origamy-data-plane/`, whichever service it belongs
+    to: a `bulker-worker-2` an override file adds counts), by its service's
+    name (the bundle's data-plane services), or by its ID, when that is the
+    ID of a data-plane image on this host (a mirror's retag of one).
+  - A container is the release's when it runs the same image, by ID, as the
+    release's own reference
+    (`ghcr.io/qubelylabs/origamy-data-plane/<service>:<release>`) names,
+    whatever tag its reference carries (a tag can name another image than it
+    did when the container was made), or the image has an
+    `org.opencontainers.image.version` label naming the release. Only
+    running (or restarting, or paused) containers count; an exited one writes
+    nothing.
+  - An image pinned by digest (`<repo>:<tag>@sha256:…`) is judged by the
+    digest, which must be the ID or a manifest digest of the release's image:
+    compose runs the digest and ignores the tag next to it, so changing the
+    tag text alone does not pass.
+  - A service the configuration scales to 0 (`scale: 0`,
+    `deploy.replicas: 0`) runs nowhere on purpose: it needs no container, is
+    reported as scaled down, and its image is not judged.
+  - **Known limitation: registry mirrors without access to ghcr.io.** The
+    release's image is looked at on the host and pulled when the host does
+    not have it, so a mirror's image can be compared with it. A host that
+    cannot reach ghcr.io cannot make the comparison, and a move that can
+    touch the events table is refused before anything is changed. To go on,
+    put the release's image on the host under its ghcr.io reference: `docker
+    pull` it where ghcr.io is reachable and carry it over (`docker save` |
+    `docker load`), or, once you have checked that the mirror's image is the
+    release's (the digest `docker image inspect` shows is the one ghcr.io has
+    for that release), tag it: `docker tag <mirror image>
+    ghcr.io/qubelylabs/origamy-data-plane/<service>:<release>`. The CLI then
+    compares the images it has. An ordinary move is not refused.
+  - **Known limitation: other platforms and unknown names.** Images are
+    compared by ID, so a service the configuration pins to another platform
+    than the host's (`platform:`) does not match the image the host pulls for
+    the release, and is refused until its release image is on the host under
+    that platform. A mirror's image under a service name the CLI does not
+    know is recognised as a data-plane image only when the host has an image
+    of that ID under a `origamy-data-plane/` reference.
+  - What a container runs is what `docker inspect` says it was created from
+    (Compose before 2.15 lists no image).
+
+  A `--version` that is not a numbered release (`main`, `production`,
+  `sha-…`; the edge channel's `:staging` writes the JSON table) is refused by
+  `upgrade` and `deploy` before they start: which events table those images
+  write is not known (they carry no version label), so no run could check it.
+- **The release and the project `docker compose` runs (Docker).** Every
+  `docker compose` command the CLI runs in a project gets `DP_IMAGE_TAG=<the
+  release it is for>` in its environment: compose takes a `DP_IMAGE_TAG`
+  exported in the shell over `.env`, so one left there by `set -a; .
+  ./.env` cannot start another release (the CLI warns that a plain `docker
+  compose up` from that shell would). Each one also pins the project's name
+  (`-p`): `COMPOSE_PROJECT_NAME` in `.env`, else the top-level `name:` of
+  `docker-compose.yml`, else the directory's name, as `origamy deploy` named
+  it. It leaves `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, `COMPOSE_PROFILES`
+  (and the other `COMPOSE_*` settings of which project and files it is)
+  exported in the shell out, so compose reads them from `.env`: a name
+  exported for another project can never point `uninstall`'s `down -v` at
+  it, nor a shell's profiles undo `--enable-ai`. A plane whose containers
+  all run under another name (a `COMPOSE_PROJECT_NAME` exported when it was
+  deployed) is refused until that name is in `.env`. So is one with no
+  container at all (it was taken down with `docker compose down`) and no
+  volume under the pinned name while the data volumes of a plane like it
+  (`clickhouse-data`, `dp-redis-data`, `nats-data`, `dp-postgres-data`) exist
+  under another, unless that project runs from another directory that still
+  exists: the refusal comes before anything is created, because `up -d` under
+  the pinned name would make a new, empty plane (a ClickHouse without the
+  history) beside them, and the upgrade would report it done. It names the
+  volumes and the project, and says to put `COMPOSE_PROJECT_NAME=<that name>`
+  in `.env` (or, when the variable in the shell names another project, to
+  unset it, and start the plane under its own name first if it has no data to
+  keep). `uninstall` removes only the plane's own containers and volumes.
+  `down -v` removes every container and volume labelled with the project's
+  name, so `uninstall` is refused while a container of that name was started
+  from another directory that still exists; one whose directory is gone is
+  taken for this plane's (a project that was moved) and removed with the
+  rest, with every volume carrying the name, those the compose file does not
+  declare too. When the plane's data volumes exist under another name than the
+  pinned one, `uninstall` says which before it asks, does not call that data
+  removed (it lists the volumes that stay, and the `docker volume rm` to
+  run), and removes the directory, and the `.env` with the passwords the data
+  was created with, only once you confirm.
+  `.env` is read as compose reads it where the CLI decides what compose will
+  do with a value (`COMPOSE_PROFILES`, `COMPOSE_PROJECT_NAME`,
+  `COMPOSE_FILE`, `DP_IMAGE_TAG`, the control plane's URL): the last of
+  several `KEY=` lines winning, quotes and `export` handled and an inline
+  `# comment` dropped (a `${VAR}` in a value is not expanded); the
+  generated secrets are carried forward as they are written. Setting a key
+  leaves one line, the others kept as they were.
+  `.env` is written by renaming a file written next to it over it, so a run
+  that stops half-way never leaves it cut short, and the new file keeps the
+  owner and group of the old one (`sudo origamy upgrade` does not leave it to
+  root). Two cases cannot be done that way and are **not atomic**: a
+  hard-linked `.env` (renaming would break its other links), and one whose
+  owner the user cannot give the new file. Those are written over in place:
+  the new text first, padded with blank lines to the old length, flushed,
+  and only then cut to size and flushed again. A run killed, or a machine
+  lost, after that first write leaves the new `.env` followed by blank
+  lines, never a key of the old file behind the new text; one lost during
+  the write itself can leave a mix of the two, which this cannot prevent.
+- **Profiles (Docker).** `origamy deploy` and `upgrade` manage three
+  profiles: `full` (journeys, broadcasts, tasks), `agentic` (the AI engine)
+  and `ingress` (HTTPS). Every other profile in `COMPOSE_PROFILES` (the
+  bundle's log stack, `logs` and `loki`, or the operator's own) stays as it
+  is, in `.env` and running: an in-place `deploy` writes the answers for the
+  three and keeps the rest in the order they had. compose keeps the services
+  of a profile that is off in the project, so `up -d --remove-orphans` leaves
+  their containers running on the release they were started with. When a run
+  turns a profile off (`upgrade --disable-ai`, or "no" to journeys or the AI
+  engine on an in-place `deploy`), the services only that profile ran are
+  stopped and removed (`docker compose rm --stop --force`, with the old
+  profiles on) before `up -d`; one another profile still runs (Postgres,
+  with `full` or `agentic`) is kept. On a move that can touch the events
+  table, the containers of data-plane services whose profiles are all off
+  are removed whoever turned the profile off (a hand edit of
+  `COMPOSE_PROFILES`, an earlier run whose removal failed, a fresh deploy
+  over an old plane's containers), so the plane that runs is the one the
+  summary describes; a removal that fails is warned about with the command,
+  and the check after `up -d` fails the run on the container. On any other
+  move they are left alone (a warning names one on another release).
 - **In-place deploy (Docker).** Re-running `deploy` in a project downloads
-  the bundle into a directory next to it, runs every check (and the
+  the bundle into a directory inside it, runs every check (and the
   questions) and redeems the token first, and only then swaps the files in,
   each one it replaces backed up as `<file>.bak-<release>`. A refused deploy,
   or one whose enrollment fails, leaves the project byte for byte as it was.
@@ -124,11 +263,22 @@ disturb the core.
   The lock goes with the process that holds it, however that ends, so a run
   that was killed leaves no stale lock (at most the file, which the next run
   simply locks again, and removes when it is done, refused or not; what such
-  a file says is not checked). Ctrl-C, SIGTERM and SIGHUP end an `upgrade` or a
+  a file says is not checked). Where the file system has no advisory locks
+  (`flock` answers `ENOLCK`, `EOPNOTSUPP` or `ENOSYS`: NFS without a lock
+  manager, some SMB and FUSE mounts), the lock file itself is the lock,
+  created with `O_EXCL` and removed by its run. A file such a run left
+  behind (killed) is taken over when it names a process on this host that no
+  longer runs, or has said nothing for 5 seconds; taking it over is
+  serialized by a second `O_EXCL` file, `.origamy.lock.takeover`, so two
+  runs that find it stale at once cannot both get the lock. One that names a
+  running process, or a process on another host (which cannot be checked),
+  refuses the run, and the message says to remove the file once that run is
+  gone. Ctrl-C, SIGTERM and SIGHUP end an `upgrade` or a
   `deploy` with exit code 130 once the step under way (a write of `.env`,
   the swap of the bundle files, the reset's write of `clickhouse-init.sql`)
   is through, removing the bundle download (also one still downloading) and
-  the lock file.
+  the lock file. A signal the CLI was started with ignored stays ignored:
+  `nohup origamy upgrade` over SSH outlives the session.
 
 ## What a deploy does with secrets
 
@@ -224,10 +374,13 @@ Two release boundaries the CLI knows about:
   missing events table is created with the new schema (nothing is dropped,
   so nothing is asked). A table that already has the JSON columns is never
   dropped, and moving it to a release before 0.1.18 is refused, as is an
-  events table of any other type. A ClickHouse that does not answer
+  events table of any other type. On a move that can touch the table (see
+  the preflight checks above) a ClickHouse that does not answer
   (stopped, hung, no container) is started with `up -d clickhouse` on the
   release and compose files the project runs now and asked again; when it
-  still cannot be asked, the upgrade is refused rather than guessing. The
+  still cannot be asked, the upgrade is refused rather than guessing. On any
+  other move ClickHouse is only peeked at, and one table of another
+  generation than the target writes, or none, turns it into this one. The
   reset asks ClickHouse again once it is up on the new bundle and moves the
   table aside only if it is the String one, and only when
   `clickhouse-init.sql` is the new schema (a served schema of neither
@@ -264,7 +417,9 @@ Two release boundaries the CLI knows about:
   the run that began the reset may have replaced the files they mount.
   Every upgrade, reset or not, ends with the check after `up -d`: a missing
   or String table under a release that writes JSON fails the run and is
-  recorded as `ORIGAMY_RESET_PENDING`, so the next run finishes it.
+  recorded as `ORIGAMY_RESET_PENDING`, so the next run finishes it. (A
+  ClickHouse that does not answer fails a move that can touch the table; any
+  other move only warns.)
   The commit point of a Docker upgrade is the pull and, across the reset,
   the reset itself: until both went through, `.env` is left byte for byte as
   it was but for that record, and `DP_IMAGE_TAG` and the `--enable-ai` /

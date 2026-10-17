@@ -130,16 +130,16 @@ func TestCommandEnv(t *testing.T) {
 		}
 		return n, val
 	}
-	if n, v := count(commandEnv(tagEnv("0.1.20"))); n != 1 || v != "0.1.20" {
+	if n, v := count(commandEnv(composeEnv("0.1.20"))); n != 1 || v != "0.1.20" {
 		t.Fatalf("set: %d, %q", n, v)
 	}
-	if n, _ := count(commandEnv(tagEnv(""))); n != 0 {
+	if n, _ := count(commandEnv(composeEnv(""))); n != 0 {
 		t.Fatal("a bare name must leave the shell's out")
 	}
-	if out, err := runCapturedEnv(tagEnv("0.1.20"), "sh", "-c", "echo ${DP_IMAGE_TAG-unset}"); err != nil || strings.TrimSpace(out) != "0.1.20" {
+	if out, err := runCapturedEnv(composeEnv("0.1.20"), "sh", "-c", "echo ${DP_IMAGE_TAG-unset}"); err != nil || strings.TrimSpace(out) != "0.1.20" {
 		t.Fatalf("%q, %v", out, err)
 	}
-	if out, err := runCapturedEnv(tagEnv(""), "sh", "-c", "echo ${DP_IMAGE_TAG-unset}"); err != nil || strings.TrimSpace(out) != "unset" {
+	if out, err := runCapturedEnv(composeEnv(""), "sh", "-c", "echo ${DP_IMAGE_TAG-unset}"); err != nil || strings.TrimSpace(out) != "unset" {
 		t.Fatalf("%q, %v", out, err)
 	}
 }

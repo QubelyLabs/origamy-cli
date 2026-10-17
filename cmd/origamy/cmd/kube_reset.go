@@ -774,17 +774,17 @@ func jobSucceeded(o kubeObject) bool {
 
 // ── What the release runs ────────────────────────────────────────────────────
 
-// dataPlaneServices are the chart's data-plane services: their component
+// chartDataPlaneServices are the chart's data-plane services: their component
 // labels, container names and image names.
-var dataPlaneServices = []string{
+var chartDataPlaneServices = []string{
 	"bulker-worker", "config-sync", "destination-worker", "identity-resolver",
 	"ingestion-gateway", "orchestrator-engine", "portal-agent", "predictor",
 	"segment-evaluator", "source-worker", "transformer-engine", "workflow-engine",
 }
 
-// imageName is the last path element of an image reference, without tag or
+// kubeImageName is the last path element of an image reference, without tag or
 // digest (ghcr.io/…/bulker-worker:0.1.20 → bulker-worker).
-func imageName(ref string) string {
+func kubeImageName(ref string) string {
 	ref, _, _ = strings.Cut(ref, "@")
 	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
 		ref = ref[:i]
@@ -793,10 +793,10 @@ func imageName(ref string) string {
 }
 
 // isDataPlaneContainer reports whether a container runs a data-plane
-// service: an image of dataPlaneImageRepo, or one of dataPlaneServices by
+// service: an image of dataPlaneImageRepo, or one of chartDataPlaneServices by
 // its container or image name (a mirror in another registry).
 func isDataPlaneContainer(c kubeContainer) bool {
-	return strings.Contains(c.Image, dataPlaneImageRepo) || slices.Contains(dataPlaneServices, c.Name) || slices.Contains(dataPlaneServices, imageName(c.Image))
+	return strings.Contains(c.Image, dataPlaneImageRepo) || slices.Contains(chartDataPlaneServices, c.Name) || slices.Contains(chartDataPlaneServices, kubeImageName(c.Image))
 }
 
 // imageGeneration is the events table the image of a data-plane service

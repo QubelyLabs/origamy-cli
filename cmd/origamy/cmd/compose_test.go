@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -193,7 +194,7 @@ func TestProbeLiveSchema(t *testing.T) {
 		if got.gen != tc.want || got.typ != tc.typ {
 			t.Errorf("%s: got %+v, want %q %q", tc.name, got, tc.want, tc.typ)
 		}
-		if !strings.HasPrefix(call, "DP_IMAGE_TAG=0.1.20 compose --project-directory /dp --env-file /dp/.env exec -T clickhouse sh -c ") || limit != clickhouseProbeTimeout {
+		if !strings.HasPrefix(call, "DP_IMAGE_TAG=0.1.20 compose -p dp --project-directory /dp exec -T clickhouse sh -c ") || limit != clickhouseProbeTimeout {
 			t.Errorf("%s: call %q within %s", tc.name, call, limit)
 		}
 	}
@@ -221,19 +222,19 @@ func TestEffectiveCompose(t *testing.T) {
 	var call string
 	stubDocker(t, func(env []string, name string, args ...string) (string, error) {
 		call = strings.Join(append(append([]string{}, env...), args...), " ")
-		return renderComposeConfig(args)
+		return renderComposeConfig(env, args)
 	})
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "docker-compose.yml"), compose253)
 	writeFile(t, filepath.Join(dir, "override.yml"), "services:\n  clickhouse:\n    image: clickhouse/clickhouse-server:24.8\n")
 	files := []string{"-f", filepath.Join(dir, "docker-compose.yml"), "-f", filepath.Join(dir, "override.yml")}
-	cfg, err := effectiveCompose(dir, filepath.Join(dir, ".env"), "0.1.20", files)
+	cfg, err := effectiveCompose(dir, filepath.Join(dir, ".env"), composeEnv("0.1.20"), files)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The files are rendered together, with the .env and the target tag, and
 	// the JSON is read past compose's warnings.
-	if want := "DP_IMAGE_TAG=0.1.20 compose --project-directory " + dir + " " + strings.Join(files, " ") + " --env-file " + filepath.Join(dir, ".env") + " config --format json"; call != want {
+	if want := strings.Replace(dcCall("0.1.20", dir, filepath.Join(dir, ".env")), " docker ", " ", 1) + strings.Join(files, " ") + " config --format json"; call != want {
 		t.Fatalf("call %q\nwant %q", call, want)
 	}
 	if cfg.Services["clickhouse"].Image != "clickhouse/clickhouse-server:24.8" {
@@ -243,11 +244,11 @@ func TestEffectiveCompose(t *testing.T) {
 	stubDocker(t, func([]string, string, ...string) (string, error) {
 		return "yaml: line 3: did not find expected key", errors.New("exit status 15")
 	})
-	if _, err := effectiveCompose(dir, filepath.Join(dir, ".env"), "0.1.20", files); err == nil || !strings.Contains(err.Error(), "did not find expected key") {
+	if _, err := effectiveCompose(dir, filepath.Join(dir, ".env"), composeEnv("0.1.20"), files); err == nil || !strings.Contains(err.Error(), "did not find expected key") {
 		t.Fatalf("err = %v", err)
 	}
 	stubDocker(t, func([]string, string, ...string) (string, error) { return "level=warning msg=x\n", nil })
-	if _, err := effectiveCompose(dir, filepath.Join(dir, ".env"), "0.1.20", files); err == nil {
+	if _, err := effectiveCompose(dir, filepath.Join(dir, ".env"), composeEnv("0.1.20"), files); err == nil {
 		t.Fatal("no configuration must be an error")
 	}
 }
@@ -257,7 +258,7 @@ func TestEffectiveCompose(t *testing.T) {
 // and asked again; gen stays "" when it still cannot be asked.
 func TestAskClickHouse(t *testing.T) {
 	t.Setenv("COMPOSE_PROJECT_NAME", "")
-	dc := "DP_IMAGE_TAG=0.1.16 docker compose --project-directory /dp --env-file /dp/.env "
+	dc := dcCall("0.1.16", "/dp", "/dp/.env")
 	lookup := "docker ps -a --filter label=com.docker.compose.project=dp --filter label=com.docker.compose.service=clickhouse --format {{.ID}} {{.State}}"
 	for _, tc := range []struct {
 		name  string
@@ -298,7 +299,7 @@ func TestAskClickHouse(t *testing.T) {
 	f := newFakeCompose(t)
 	f.live = liveJSONRow
 	captureStdout(t, func() { askClickHouse("/dp", "/dp/.env", "") })
-	if len(f.calls) != 1 || !strings.HasPrefix(f.calls[0], "DP_IMAGE_TAG docker compose") {
+	if len(f.calls) != 1 || !strings.HasPrefix(f.calls[0], dcCall("", "/dp", "/dp/.env")) {
 		t.Fatalf("calls: %v", f.calls)
 	}
 }
@@ -366,10 +367,27 @@ func TestComposeProjectName(t *testing.T) {
 	if got := composeProjectName(dir, env); got != "dp_one" {
 		t.Fatalf("from .env: %q", got)
 	}
+	// Never the shell's, which can name another project.
 	t.Setenv("COMPOSE_PROJECT_NAME", "Shell")
-	if got := composeProjectName(dir, env); got != "shell" {
+	if got := composeProjectName(dir, env); got != "dp_one" {
 		t.Fatalf("from the shell: %q", got)
 	}
+	// A relative directory is named by what it resolves to.
+	chdir(t, dir)
+	writeFile(t, env, "")
+	if err := os.Remove(filepath.Join(dir, "docker-compose.yml")); err != nil {
+		t.Fatal(err)
+	}
+	if got := composeProjectName(".", ".env"); got != "myplane-1" {
+		t.Fatalf("relative: %q", got)
+	}
+}
+
+// dcCall is how the fakes record the start of a docker compose command the
+// CLI runs for release tag in the project at dir: the compose environment
+// (composeEnv), then docker and composeCmd's arguments.
+func dcCall(tag, dir, envPath string) string {
+	return strings.Join(composeEnv(tag), " ") + " docker " + strings.Join(composeCmd(dir, envPath), " ") + " "
 }
 
 // TestEventsTableProblem: a missing table is asked about again while the
@@ -389,7 +407,8 @@ func TestEventsTableProblem(t *testing.T) {
 		{"never created", 2, "", "0.1.20", "ClickHouse holds no events table"},
 		{"the wrong generation", 0, liveStringRow, "0.1.20", "the pre-reset events table (String payload columns), which the 0.1.20 images cannot write"},
 		{"a release before the reset", 0, liveStringRow, "0.1.17", ""},
-		{"a moving tag, either generation", 0, liveStringRow, "main", ""},
+		// Never a success: which table the images write is not known.
+		{"a moving tag", 0, liveStringRow, "main", "whether the :main images write it is not known"},
 		{"a moving tag, another type", 0, "Object('json')\t" + eventsColumnMark + "\n", "main", "neither the pre-reset (String) nor the new (JSON) schema"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -410,7 +429,7 @@ func TestEventsTableProblem(t *testing.T) {
 				return "", nil
 			})
 			var why string
-			out := captureStdout(t, func() { _, why = eventsTableProblem("/dp", "/dp/.env", tc.tag) })
+			out := captureStdout(t, func() { _, why = eventsTableProblem("/dp", "/dp/.env", tc.tag, true) })
 			if (why == "") != (tc.problem == "") || !strings.Contains(why, tc.problem) {
 				t.Fatalf("why %q\n%s", why, out)
 			}
@@ -421,67 +440,128 @@ func TestEventsTableProblem(t *testing.T) {
 	}
 }
 
-// TestRunningImagesProblem: what runs is read from `docker compose ps` (its
-// warnings first), a container listed by its image's ID is asked what it was
-// created from, and every data-plane service must run the release, with
-// ClickHouse 25.3 or newer under the new events table.
+// TestRunningImagesProblem: every data-plane service the configuration runs
+// (told by name, from the bundle's compose file) has a container, and each
+// runs the release: the image the configuration names, on the release's tag;
+// one from another registry (a mirror) is the release's very image, by its
+// version label or its ID. What a container runs is what docker inspect says
+// (Compose before 2.15 lists no image). A service of a profile that is off
+// is not checked. ClickHouse is 25.3 or newer under the new events table.
 func TestRunningImagesProblem(t *testing.T) {
-	const warn = "time=x level=warning msg=\"The \\\"WRITE_KEYS\\\" variable is not set.\"\n"
-	row := func(id, svc, image string) string {
-		return `{"ID":"` + id + `","Service":"` + svc + `","Image":"` + image + `","State":"running","Status":"Up 1 second"}` + "\n"
+	const (
+		gw     = dpImage + "ingestion-gateway:"
+		ai     = dpImage + "orchestrator-engine:"
+		mirror = "mirror.example.com/origamy/ingestion-gateway:"
+		bundle = "services:\n  clickhouse:\n    image: clickhouse/clickhouse-server:25.3\n  redis:\n    image: redis:7-alpine\n" +
+			"  ingestion-gateway:\n    image: " + gw + "${DP_IMAGE_TAG:-main}\n" +
+			"  orchestrator-engine:\n    image: " + ai + "${DP_IMAGE_TAG:-main}\n    profiles: [\"agentic\"]\n"
+		mirrored = "services:\n  ingestion-gateway:\n    image: " + mirror + "${DP_IMAGE_TAG:-main}\n"
+	)
+	release := map[string]string{"ingestion-gateway": gw + "0.1.20", "clickhouse": "clickhouse/clickhouse-server:25.3", "redis": "redis:7-alpine"}
+	with := func(svc, image string) map[string]string {
+		m := maps.Clone(release)
+		if image == "" {
+			delete(m, svc)
+		} else {
+			m[svc] = image
+		}
+		return m
 	}
-	gw := func(tag string) string {
-		return row("a1", "ingestion-gateway", "ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:"+tag)
-	}
-	ch := func(v string) string { return row("c1", "clickhouse", "clickhouse/clickhouse-server:"+v) }
-	const id = "sha256:5f0d3c4a1b2e5f0d3c4a1b2e5f0d3c4a1b2e5f0d3c4a1b2e5f0d3c4a1b2e5f0d"
-	// A ClickHouse image whose tag names no version: the server says.
-	custom := row("c1", "clickhouse", "registry.example.com/clickhouse-server:prod")
 	for _, tc := range []struct {
-		name, ps, gen, inspect, want string
-		psFails                      bool
-		server                       string // what SELECT version() prints ("" = no answer)
+		name     string
+		override string            // docker-compose.override.yml ("" = none)
+		running  map[string]string // service → image its container runs
+		gen      string
+		setup    func(*fakeCompose)
+		want     string
 	}{
-		{"the release", warn + gw("0.1.20") + ch("25.3") + row("r1", "redis", "redis:7-alpine"), "json", "", "", false, ""},
-		{"another tag", gw("0.1.17") + ch("25.3"), "json", "", "ingestion-gateway runs ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.17", false, ""},
-		{"a digest-pinned release", row("a1", "ingestion-gateway", "ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.20@sha256:00") + ch("25.3"), "json", "", "", false, ""},
-		{"listed by its image's ID, created from the release", row("a1", "ingestion-gateway", id) + ch("25.3"), "json", "ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.20", "", false, ""},
-		{"listed by its image's ID, created from another", row("a1", "ingestion-gateway", id) + ch("25.3"), "json", "ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.19", "runs ghcr.io/qubelylabs/origamy-data-plane/ingestion-gateway:0.1.19", false, ""},
-		{"no data-plane service", ch("25.3"), "json", "", "no data-plane service is running", false, ""},
-		{"an older ClickHouse under the new table", gw("0.1.20") + ch("24.8"), "json", "", "clickhouse runs clickhouse/clickhouse-server:24.8", false, ""},
-		{"an older ClickHouse under the pre-reset table", gw("0.1.20") + ch("24.8"), "string", "", "", false, ""},
-		{"no ClickHouse under the new table", gw("0.1.20"), "json", "", "ClickHouse is not among the containers that run", false, ""},
-		{"a ClickHouse tag without a version, the server new enough", gw("0.1.20") + custom, "json", "", "", false, warn + "25.3.14.14\n"},
-		{"a ClickHouse tag without a version, the server older", gw("0.1.20") + custom, "json", "", "clickhouse runs registry.example.com/clickhouse-server:prod (ClickHouse 24.8)", false, "24.8.14.39\n"},
-		{"a ClickHouse tag without a version, no answer", gw("0.1.20") + custom, "json", "", "whose version neither its tag nor the server", false, ""},
-		{"a ClickHouse tag without a version under the pre-reset table", gw("0.1.20") + custom, "string", "", "", false, ""},
-		{"compose cannot list them", "", "json", "", "docker compose could not list the containers that run", true, ""},
+		{"the release", "", release, "json", nil, ""},
+		{"another tag", "", with("ingestion-gateway", gw+"0.1.17"), "json", nil, "ingestion-gateway runs " + gw + "0.1.17"},
+		{"no container", "", with("ingestion-gateway", ""), "json", nil, "ingestion-gateway has no container"},
+		{"an override pins another tag", "services:\n  ingestion-gateway:\n    image: " + gw + "0.1.19\n", with("ingestion-gateway", gw+"0.1.19"), "json", nil, "ingestion-gateway runs " + gw + "0.1.19"},
+		// A digest decides, not the tag text next to it.
+		{"a digest-pinned release", "services:\n  ingestion-gateway:\n    image: " + gw + "0.1.20@sha256:00\n", with("ingestion-gateway", gw+"0.1.20@sha256:00"), "json", func(f *fakeCompose) {
+			f.ids[gw+"0.1.20@sha256:00"] = f.imageID(gw + "0.1.20")
+		}, ""},
+		{"a digest-pinned older image under the release's tag", "services:\n  ingestion-gateway:\n    image: " + gw + "0.1.20@sha256:00\n", with("ingestion-gateway", gw+"0.1.20@sha256:00"), "json", nil,
+			"ingestion-gateway runs " + gw + "0.1.20@sha256:00"},
+		// A tag that names another image now than when the container was made.
+		{"a tag that moved", "", release, "json", func(f *fakeCompose) {
+			f.containerImage["ingestion-gateway"] = f.imageID(gw + "0.1.17")
+		}, "ingestion-gateway runs " + "sha256:" + sha256Hex([]byte(gw+"0.1.17")) + ", created from " + gw + "0.1.20 when that tag named another image than the release's " + gw + "0.1.20"},
+		// Compose before 2.15 names no image: docker inspect does.
+		{"ps without images", "", release, "json", func(f *fakeCompose) { f.psNoImage = true }, ""},
+		{"ps without images, another tag", "", with("ingestion-gateway", gw+"0.1.17"), "json", func(f *fakeCompose) { f.psNoImage = true }, "ingestion-gateway runs " + gw + "0.1.17"},
+		// A container of a profile that is off still runs: one on an older
+		// release fails the run (removeInactiveDataPlane removes it before `up -d`
+		// on a move that can touch the events table); one on the release's does not.
+		{"an old container of a profile that is off", "", with("orchestrator-engine", ai+"0.1.19"), "json", nil,
+			"orchestrator-engine (not run by the configuration) runs " + ai + "0.1.19"},
+		{"a container of a profile that is off, on the release", "", with("orchestrator-engine", ai+"0.1.20"), "json", nil, ""},
+		// Every container of the project that runs a data-plane image: also
+		// one an override file adds, one under a service name the CLI does not
+		// know, whose image is, by ID, one of the data-plane images on this host.
+		{"an old writer an override adds", "services:\n  bulker-worker-2:\n    image: " + dpImage + "bulker-worker:0.1.16\n", with("bulker-worker-2", dpImage+"bulker-worker:0.1.16"), "json", nil,
+			"bulker-worker-2 runs " + dpImage + "bulker-worker:0.1.16"},
+		{"a writer an override adds, on the release", "services:\n  bulker-worker-2:\n    image: " + dpImage + "bulker-worker:0.1.20\n", with("bulker-worker-2", dpImage+"bulker-worker:0.1.20"), "json", nil, ""},
+		{"an old writer under a name nobody knows, from a mirror", "", with("shadow", "mirror.example.com/x/bw:1"), "json", func(f *fakeCompose) {
+			f.ids["mirror.example.com/x/bw:1"] = f.imageID(dpImage + "bulker-worker:0.1.16")
+			f.images = []string{dpImage + "bulker-worker:0.1.16"}
+		}, "shadow (not run by the configuration) runs mirror.example.com/x/bw:1, which is not the release's image " + dpImage + "bulker-worker:0.1.20"},
+		{"a stopped old container of an extra service", "", with("bulker-worker-2", dpImage+"bulker-worker:0.1.16"), "json", func(f *fakeCompose) { f.states["bulker-worker-2"] = "exited" }, ""},
+		{"an old writer, restarting", "", with("bulker-worker-2", dpImage+"bulker-worker:0.1.16"), "json", func(f *fakeCompose) { f.states["bulker-worker-2"] = "restarting" },
+			"bulker-worker-2 (not run by the configuration) runs " + dpImage + "bulker-worker:0.1.16"},
+		// scale: 0 and deploy.replicas: 0 run a service nowhere, on purpose.
+		{"scaled to 0", "services:\n  ingestion-gateway:\n    scale: 0\n", with("ingestion-gateway", ""), "json", nil, ""},
+		{"replicas 0", "services:\n  ingestion-gateway:\n    deploy:\n      replicas: 0\n", with("ingestion-gateway", ""), "json", nil, ""},
+		{"scaled to 0, but still running old", "services:\n  ingestion-gateway:\n    scale: 0\n", with("ingestion-gateway", gw+"0.1.17"), "json", nil, "ingestion-gateway runs " + gw + "0.1.17"},
+		// From a registry mirror: the release's image by ID, or by label.
+		{"a mirror of the release", mirrored, with("ingestion-gateway", mirror+"0.1.20"), "json", func(f *fakeCompose) { f.ids[mirror+"0.1.20"] = f.imageID(gw + "0.1.20") }, ""},
+		{"a mirror of the release, pulled to compare", mirrored, with("ingestion-gateway", mirror+"0.1.20"), "json", func(f *fakeCompose) {
+			f.ids[mirror+"0.1.20"], f.missing[gw+"0.1.20"] = f.imageID(gw+"0.1.20"), true
+		}, ""},
+		{"a mirror labelled with the release", mirrored, with("ingestion-gateway", mirror+"0.1.20"), "json", func(f *fakeCompose) {
+			f.versions[mirror+"0.1.20"], f.missing[gw+"0.1.20"], f.pullFails = "0.1.20", true, true
+		}, ""},
+		{"a mirror of another image", mirrored, with("ingestion-gateway", mirror+"0.1.20"), "json", nil, "which is not the release's image " + gw + "0.1.20"},
+		{"a mirror that cannot be compared", mirrored, with("ingestion-gateway", mirror+"0.1.20"), "json", func(f *fakeCompose) { f.missing[gw+"0.1.20"], f.pullFails = true, true }, "could not be pulled here to compare them"},
+		{"a mirror on another tag", mirrored, with("ingestion-gateway", mirror+"0.1.19"), "json", nil, "ingestion-gateway runs " + mirror + "0.1.19"},
+		{"no data-plane service", "services:\n  ingestion-gateway:\n    profiles: [\"off\"]\n", release, "json", nil, "runs no data-plane service"},
+		{"an older ClickHouse under the new table", "", with("clickhouse", "clickhouse/clickhouse-server:24.8"), "json", nil, "clickhouse runs clickhouse/clickhouse-server:24.8"},
+		{"an older ClickHouse under the pre-reset table", "", with("clickhouse", "clickhouse/clickhouse-server:24.8"), "string", nil, ""},
+		{"no ClickHouse under the new table", "", with("clickhouse", ""), "json", nil, "ClickHouse is not among the containers that run"},
+		{"a ClickHouse tag without a version, the server new enough", "", with("clickhouse", "registry.example.com/clickhouse-server:prod"), "json", func(f *fakeCompose) { f.server = "25.3.14.14\n" }, ""},
+		{"a ClickHouse tag without a version, the server older", "", with("clickhouse", "registry.example.com/clickhouse-server:prod"), "json", func(f *fakeCompose) { f.server = "24.8.14.39\n" }, "clickhouse runs registry.example.com/clickhouse-server:prod (ClickHouse 24.8)"},
+		{"a ClickHouse tag without a version, no answer", "", with("clickhouse", "registry.example.com/clickhouse-server:prod"), "json", nil, "whose version neither its tag nor the server"},
+		{"docker cannot list them", "", release, "json", func(f *fakeCompose) { f.psFails = true }, "docker could not list the containers of the compose project"},
+		// The bundle's compose file itself edited to take a data-plane image
+		// from a mirror: still a data-plane service, by its name.
+		{"an edited compose file with a mirror", "<edited>", with("ingestion-gateway", mirror+"0.1.20"), "json", nil, "which is not the release's image " + gw + "0.1.20"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var calls []string
-			stubDocker(t, func(env []string, name string, args ...string) (string, error) {
-				calls = append(calls, strings.Join(append(append([]string{}, env...), args...), " "))
-				if args[0] == "inspect" {
-					return tc.inspect + "\n", nil
-				}
-				if args[len(args)-1] == clickhouseServerVersion {
-					if tc.server == "" {
-						return "Code: 210. DB::NetException: Connection refused", errors.New("exit status 210")
-					}
-					return tc.server, nil
-				}
-				if tc.psFails {
-					return "yaml: line 3: did not find expected key", errors.New("exit status 15")
-				}
-				return tc.ps, nil
-			})
-			var why string
-			captureStdout(t, func() { why = runningImagesProblem("/dp", "/dp/.env", "0.1.20", tc.gen) })
-			if (why == "") != (tc.want == "") || !strings.Contains(why, tc.want) {
-				t.Fatalf("why %q", why)
+			dir := t.TempDir()
+			env := filepath.Join(dir, ".env")
+			writeFile(t, env, "DP_IMAGE_TAG=0.1.20\nCOMPOSE_PROFILES=\n")
+			writeFile(t, filepath.Join(dir, "docker-compose.yml"), bundle)
+			if tc.override == "<edited>" {
+				writeFile(t, filepath.Join(dir, "docker-compose.yml"), strings.Replace(bundle, gw+"${DP_IMAGE_TAG:-main}", mirror+"${DP_IMAGE_TAG:-main}", 1))
+			} else if tc.override != "" {
+				writeFile(t, filepath.Join(dir, "docker-compose.override.yml"), tc.override)
 			}
-			if calls[0] != "DP_IMAGE_TAG=0.1.20 compose --project-directory /dp --env-file /dp/.env ps --format json" {
-				t.Fatalf("calls %v", calls)
+			f := newFakeCompose(t)
+			f.running = maps.Clone(tc.running)
+			if tc.setup != nil {
+				tc.setup(f)
+			}
+			var why string
+			out := captureStdout(t, func() { why = runningImagesProblem(dir, env, "0.1.20", tc.gen) })
+			if (why == "") != (tc.want == "") || !strings.Contains(why, tc.want) {
+				t.Fatalf("why %q\n%s", why, out)
+			}
+			for _, c := range f.calls {
+				if strings.Contains(c, " compose ") && !strings.HasPrefix(c, dcCall("0.1.20", dir, env)) {
+					t.Fatalf("not pinned: %q", c)
+				}
 			}
 		})
 	}
@@ -490,11 +570,15 @@ func TestRunningImagesProblem(t *testing.T) {
 	t.Setenv("DP_IMAGE_TAG", "0.1.16")
 	env := filepath.Join(t.TempDir(), ".env")
 	writeFile(t, env, "DP_IMAGE_TAG=0.1.20\nDP_IMAGE_TAG=0.1.17\n")
-	causes := strings.Join(runningImagesCauses("/dp", env, "0.1.20"), "\n")
-	for _, want := range []string{"DP_IMAGE_TAG=0.1.16 is exported in your shell", ".env has 2 DP_IMAGE_TAG lines, and docker compose takes the last (0.1.17)", "config --images"} {
+	causes := strings.Join(runningImagesCauses("/dp", env, "0.1.20", "portal-agent runs x, which is not the release's image y"), "\n")
+	for _, want := range []string{"DP_IMAGE_TAG=0.1.16 is exported in your shell", ".env has 2 DP_IMAGE_TAG lines, and docker compose takes the last (0.1.17)", "config --images", "registry mirror", "docker save", "docker tag"} {
 		if !strings.Contains(causes, want) {
 			t.Errorf("causes lack %q:\n%s", want, causes)
 		}
+	}
+	// The advice on mirrors comes with a failure about comparing images only.
+	if causes := strings.Join(runningImagesCauses("/dp", env, "0.1.20", "portal-agent is set to y:0.1.19"), "\n"); strings.Contains(causes, "registry mirror") {
+		t.Errorf("a tag mismatch is advised about mirrors:\n%s", causes)
 	}
 }
 
@@ -508,5 +592,138 @@ func TestImageTag(t *testing.T) {
 		if got := imageTag(ref); got != want {
 			t.Errorf("imageTag(%q) = %q, want %q", ref, got, want)
 		}
+	}
+}
+
+// TestComposeEnvIgnoresTheShell: no docker compose command the CLI runs
+// takes the project's name, files or profiles from the shell, only from .env
+// (compose reads it when the process environment does not set them).
+func TestComposeEnvIgnoresTheShell(t *testing.T) {
+	for _, k := range composeShellVars {
+		t.Setenv(k, "from-the-shell")
+	}
+	t.Setenv("DP_IMAGE_TAG", "0.1.17")
+	out, err := runCapturedEnv(composeEnv("0.1.20"), "sh", "-c", `echo "${COMPOSE_PROJECT_NAME-unset} ${COMPOSE_FILE-unset} ${COMPOSE_PROFILES-unset} ${COMPOSE_PATH_SEPARATOR-unset} ${COMPOSE_ENV_FILES-unset} ${COMPOSE_REMOVE_ORPHANS-unset} ${COMPOSE_IGNORE_ORPHANS-unset} ${DP_IMAGE_TAG-unset}"`)
+	if err != nil || strings.TrimSpace(out) != "unset unset unset unset unset unset unset 0.1.20" {
+		t.Fatalf("%v: %q", err, out)
+	}
+	// What a run sets after composeEnv wins (the AI toggle's profiles).
+	out, _ = runCapturedEnv(append(composeEnv("0.1.20"), "COMPOSE_PROFILES=full"), "sh", "-c", `echo "${COMPOSE_PROFILES-unset}"`)
+	if strings.TrimSpace(out) != "full" {
+		t.Fatalf("%q", out)
+	}
+	// The name is pinned, the env file given only when there is one.
+	dir := t.TempDir()
+	env := filepath.Join(dir, ".env")
+	if got := composeCmd(dir, env, "ps"); !slices.Equal(got, []string{"compose", "-p", composeProjectName(dir, env), "--project-directory", dir, "ps"}) {
+		t.Fatalf("%v", got)
+	}
+	writeFile(t, env, "COMPOSE_PROJECT_NAME=mine\n")
+	if got := composeCmd(dir, env, "ps"); !slices.Equal(got, []string{"compose", "-p", "mine", "--project-directory", dir, "--env-file", env, "ps"}) {
+		t.Fatalf("%v", got)
+	}
+}
+
+// TestComposeOwners: Docker's containers are sorted, by their compose labels,
+// against the project directory and the name the CLI pins for it.
+func TestComposeOwners(t *testing.T) {
+	parent := t.TempDir()
+	dir, other := filepath.Join(parent, "origamy-dp-dp-1"), filepath.Join(parent, "copy")
+	for _, d := range []string{dir, other} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The same directory through a symbolic link is this one.
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, rows string
+		want       projectOwners
+	}{
+		{"none", "", projectOwners{}},
+		{"this plane", "origamy-dp-dp-1\t" + dir + "\norigamy-dp-dp-1\t" + link + "\nvictim\t/somewhere/else\n", projectOwners{pinned: true}},
+		{"started under another name", "custom\t" + dir + "\n", projectOwners{here: []string{"custom"}}},
+		{"both", "origamy-dp-dp-1\t" + dir + "\ncustom\t" + dir + "\n", projectOwners{pinned: true, here: []string{"custom"}}},
+		{"the name used elsewhere", "origamy-dp-dp-1\t" + dir + "\norigamy-dp-dp-1\t" + other + "\n", projectOwners{pinned: true, elsewhere: []string{other}}},
+		{"the name without a directory", "origamy-dp-dp-1\t\n", projectOwners{elsewhere: []string{""}}},
+		// A directory that is gone: the project moved, compose goes by the name.
+		{"moved", "origamy-dp-dp-1\t" + filepath.Join(parent, "gone") + "\n", projectOwners{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubDocker(t, func(env []string, name string, args ...string) (string, error) { return tc.rows, nil })
+			got, _, ok := composeOwners(dir, "origamy-dp-dp-1")
+			if !ok || got.pinned != tc.want.pinned || !slices.Equal(got.here, tc.want.here) || !slices.Equal(got.elsewhere, tc.want.elsewhere) {
+				t.Fatalf("%+v, want %+v", got, tc.want)
+			}
+		})
+	}
+	stubDocker(t, func([]string, string, ...string) (string, error) {
+		return "Cannot connect", errors.New("exit status 1")
+	})
+	if _, out, ok := composeOwners(dir, "origamy-dp-dp-1"); ok || out != "Cannot connect" {
+		t.Fatalf("%v %q", ok, out)
+	}
+}
+
+// TestStopTurnedOff: the services only a profile a run turned off ran are
+// stopped and removed (by name, with the profiles that ran them on), one a
+// profile still on runs is kept, and nothing is asked when no profile went.
+func TestStopTurnedOff(t *testing.T) {
+	dir := t.TempDir()
+	env := filepath.Join(dir, ".env")
+	writeFile(t, filepath.Join(dir, "docker-compose.yml"), compose253)
+	writeFile(t, env, "COMPOSE_PROFILES=full\n")
+	for _, tc := range []struct {
+		name          string
+		before, after []string
+		stopped       []string
+	}{
+		{"the AI engine off", []string{"full", "agentic"}, []string{"full"}, []string{"orchestrator-engine"}},
+		{"journeys off", []string{"full"}, nil, []string{"dp-postgres", "workflow-engine"}},
+		{"journeys off, the AI engine on", []string{"full"}, []string{"agentic"}, []string{"workflow-engine"}},
+		{"everything off", []string{"full", "agentic", "ingress"}, nil, []string{"dp-postgres", "orchestrator-engine", "workflow-engine"}},
+		{"a profile on", []string{"full"}, []string{"full", "agentic"}, nil},
+		{"nothing changes", []string{"full"}, []string{"full"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeCompose(t)
+			for _, s := range []string{"clickhouse", "portal-agent", "dp-postgres", "workflow-engine", "orchestrator-engine"} {
+				f.running[s] = "old"
+			}
+			out := captureStdout(t, func() { stopTurnedOff(dir, env, composeEnv("0.1.20"), tc.before, tc.after) })
+			if !slices.Equal(f.removed, tc.stopped) {
+				t.Fatalf("removed %v, want %v\n%s", f.removed, tc.stopped, out)
+			}
+			// Named, pinned, with the profiles that ran them on.
+			rm := callIndex(f.calls, " rm ")
+			want := strings.Join(composeEnv("0.1.20"), " ") + " COMPOSE_PROFILES=" + strings.Join(tc.before, ",") + " docker " +
+				strings.Join(composeCmd(dir, env, append([]string{"rm", "--stop", "--force"}, tc.stopped...)...), " ")
+			if (rm >= 0) != (len(tc.stopped) > 0) || (rm >= 0 && f.calls[rm] != want) {
+				t.Fatalf("calls:\n%s\nwant %s", strings.Join(f.calls, "\n"), want)
+			}
+			if tc.name == "a profile on" || tc.name == "nothing changes" {
+				if len(f.calls) != 0 {
+					t.Fatalf("asked compose although no profile went: %v", f.calls)
+				}
+			}
+		})
+	}
+
+	// A container that cannot be stopped is warned about, with the command.
+	f := newFakeCompose(t)
+	f.running["orchestrator-engine"] = "old"
+	prev := dockerRun
+	stubDocker(t, func(env []string, name string, args ...string) (string, error) {
+		if slices.Contains(args, "rm") {
+			return "Error response from daemon: cannot stop container", errors.New("exit status 1")
+		}
+		return prev(env, name, args...)
+	})
+	out := captureStdout(t, func() { stopTurnedOff(dir, env, composeEnv("0.1.20"), []string{"full", "agentic"}, []string{"full"}) })
+	if !strings.Contains(out, "Could not stop orchestrator-engine (Error response from daemon: cannot stop container)") || !strings.Contains(out, "rm --stop --force orchestrator-engine") {
+		t.Fatalf("%s", out)
 	}
 }
