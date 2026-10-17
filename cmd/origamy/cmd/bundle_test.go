@@ -83,6 +83,24 @@ func writeFile(t *testing.T, path, body string) {
 	}
 }
 
+// recordDeployedBundle writes the manifest a deploy leaves for the bundle
+// files now in dir, from the release the control plane said they are for
+// ("" when it predates /byod/VERSION).
+func recordDeployedBundle(dir, version string) error {
+	m := bundleManifest{Version: version, Files: map[string]string{}, Releases: map[string]string{}}
+	for _, name := range bundleFiles {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+		m.Files[name] = sha256Hex(b)
+		if version != "" {
+			m.Releases[name] = version
+		}
+	}
+	return writeBundleManifest(dir, m)
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -242,7 +260,7 @@ func TestPlanBundleRefreshV018Env(t *testing.T) {
 	if base != p.base || !fromConfigURL {
 		t.Fatalf("base = %q, %v", base, fromConfigURL)
 	}
-	r, skipped := planBundleRefresh(p.dir, p.env, base, "0.1.20", readEnvVar(p.env, "DP_IMAGE_TAG"), bundleAuto, false)
+	r, skipped := planBundleRefresh(p.dir, p.env, base, "0.1.20", readEnvVar(p.env, "DP_IMAGE_TAG"), tagEnv("0.1.20"), bundleAuto, false)
 	if r == nil {
 		t.Fatalf("no refresh: %q", skipped)
 	}
@@ -258,7 +276,7 @@ func TestPlanBundleRefreshWithoutControlPlaneURL(t *testing.T) {
 	calls := fakeDocker(t)
 	before := p.snapshot(t)
 	base, _ := controlPlaneHTTPBase(p.env)
-	r, skipped := planBundleRefresh(p.dir, p.env, base, "0.1.20", "0.1.19", bundleAuto, false)
+	r, skipped := planBundleRefresh(p.dir, p.env, base, "0.1.20", "0.1.19", tagEnv("0.1.20"), bundleAuto, false)
 	if r != nil || !strings.Contains(skipped, "URL missing from .env") || strings.Contains(skipped, "unreachable") {
 		t.Fatalf("got %v, %q", r, skipped)
 	}
@@ -340,7 +358,7 @@ func TestPlanBundleRefreshGating(t *testing.T) {
 			p := newBundleProject(t, tc.served)
 			calls := fakeDocker(t)
 			before := p.snapshot(t)
-			r, skipped := planBundleRefresh(p.dir, p.env, p.base, tc.tag, "0.1.19", tc.mode, false)
+			r, skipped := planBundleRefresh(p.dir, p.env, p.base, tc.tag, "0.1.19", tagEnv(tc.tag), tc.mode, false)
 			if skipped != tc.wantSkip {
 				t.Fatalf("skipped = %q, want %q", skipped, tc.wantSkip)
 			}
@@ -391,7 +409,7 @@ func TestPlanBundleRefreshValidationFailureKeepsFiles(t *testing.T) {
 	p := newBundleProject(t, "0.1.20")
 	fakeDocker(t, "config")
 	before := p.snapshot(t)
-	r, skipped := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.19", bundleAuto, false)
+	r, skipped := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.19", tagEnv("0.1.20"), bundleAuto, false)
 	if r != nil || skipped != "new bundle failed validation" {
 		t.Fatalf("got %v, %q", r, skipped)
 	}
@@ -407,7 +425,7 @@ func TestPlanBundleRefreshSchemaGuard(t *testing.T) {
 	p := newBundleProject(t, "0.1.17")
 	writeFile(t, filepath.Join(p.dir, "clickhouse-init.sql"), "CREATE TABLE events.events (\n    properties String\n);\n")
 	fakeDocker(t)
-	if r, skipped := planBundleRefresh(p.dir, p.env, p.base, "0.1.17", "0.1.16", bundleAuto, true); r != nil || skipped != "new bundle failed validation" {
+	if r, skipped := planBundleRefresh(p.dir, p.env, p.base, "0.1.17", "0.1.16", tagEnv("0.1.17"), bundleAuto, true); r != nil || skipped != "new bundle failed validation" {
 		t.Fatalf("got %v, %q", r, skipped)
 	}
 }
@@ -416,12 +434,12 @@ func TestPlanBundleRefreshResetForcesSchema(t *testing.T) {
 	p := newBundleProject(t, "0.1.20")
 	writeFile(t, filepath.Join(p.dir, "clickhouse-init.sql"), "-- my edit\n")
 	fakeDocker(t)
-	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.17", bundleAuto, false)
+	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.17", tagEnv("0.1.20"), bundleAuto, false)
 	if r == nil || r.served("clickhouse-init.sql") {
 		t.Fatalf("without the reset an edited schema is kept: %+v", r)
 	}
 	r.cleanup()
-	r, _ = planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.17", bundleAuto, true)
+	r, _ = planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.17", tagEnv("0.1.20"), bundleAuto, true)
 	if r == nil || !r.changes("clickhouse-init.sql") || !r.served("clickhouse-init.sql") {
 		t.Fatalf("across the reset the new schema is forced in: %+v", r)
 	}
@@ -441,7 +459,7 @@ func TestBundleRefreshApplyCommit(t *testing.T) {
 	// An earlier upgrade from the same release left a backup: keep it.
 	writeFile(t, filepath.Join(p.dir, "docker-compose.yml.bak-0.1.19"), "older backup\n")
 
-	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.19", bundleAuto, false)
+	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.19", tagEnv("0.1.20"), bundleAuto, false)
 	if r == nil {
 		t.Fatal("no refresh planned")
 	}
@@ -491,7 +509,7 @@ func TestBundleRefreshApplyCommit(t *testing.T) {
 
 	// The next upgrade, with the manifest, still sees the Caddyfile as edited
 	// and everything else as current.
-	r2, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", bundleAuto, false)
+	r2, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", tagEnv("0.1.20"), bundleAuto, false)
 	if r2 == nil || len(r2.changed()) != 0 || !slices.Equal(r2.kept(), []string{"Caddyfile"}) {
 		t.Fatalf("second refresh: changed %v kept %v", r2.changed(), r2.kept())
 	}
@@ -499,7 +517,7 @@ func TestBundleRefreshApplyCommit(t *testing.T) {
 
 	// --replace-bundle takes the edit out too, backing it up under the
 	// release the manifest names, and says so.
-	r3, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", bundleReplace, false)
+	r3, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", tagEnv("0.1.20"), bundleReplace, false)
 	if r3 == nil || !slices.Equal(r3.changed(), []string{"Caddyfile"}) {
 		t.Fatalf("--replace-bundle: changed %v", r3.changed())
 	}
@@ -530,7 +548,7 @@ func TestBundleRefreshApplyCommit(t *testing.T) {
 // the files it replaced and kept.
 func refreshOnce(t *testing.T, p bundleProject, installed string, mode bundleMode) (changed, kept []string) {
 	t.Helper()
-	r, skipped := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", installed, mode, false)
+	r, skipped := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", installed, tagEnv("0.1.20"), mode, false)
 	if r == nil {
 		t.Fatalf("no refresh: %q", skipped)
 	}
@@ -654,7 +672,7 @@ func TestKeptEditBackedUpUnderItsOwnRelease(t *testing.T) {
 	}
 	// --replace-bundle later backs the edit up under 0.1.17, the release it
 	// was made from, not 0.1.20.
-	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", bundleReplace, false)
+	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", tagEnv("0.1.20"), bundleReplace, false)
 	if r == nil {
 		t.Fatal("no refresh planned")
 	}
@@ -685,7 +703,7 @@ func TestBundleRefreshRemovesStaleNew(t *testing.T) {
 	}
 	// Run 2 replaces the Caddyfile (--replace-bundle): its .new is stale now,
 	// and so is the compose file's (that one is the served version already).
-	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", bundleReplace, false)
+	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.20", tagEnv("0.1.20"), bundleReplace, false)
 	if r == nil {
 		t.Fatal("no refresh planned")
 	}
@@ -733,7 +751,7 @@ func TestBundleBackupTag(t *testing.T) {
 		if err := writeBundleManifest(p.dir, bundleManifest{Version: tc.manifest, Files: map[string]string{"docker-compose.yml": sha256Hex([]byte(oldCompose))}}); err != nil {
 			t.Fatal(err)
 		}
-		r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", tc.installed, bundleAuto, false)
+		r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", tc.installed, tagEnv("0.1.20"), bundleAuto, false)
 		if r == nil {
 			t.Fatal("no refresh planned")
 		}
@@ -755,11 +773,11 @@ func TestPullImagesBeforeSwap(t *testing.T) {
 	}
 	calls := fakeDocker(t, "pull")
 	before := p.snapshot(t)
-	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.19", bundleAuto, false)
+	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.19", tagEnv("0.1.20"), bundleAuto, false)
 	if r == nil {
 		t.Fatal("no refresh planned")
 	}
-	out, err := pullImages(p.dir, p.env, "0.1.20", r)
+	out, err := pullImages(p.dir, p.env, tagEnv("0.1.20"), r)
 	if err == nil || !strings.Contains(out, "pull failed") {
 		t.Fatalf("the pull must fail: %q, %v", out, err)
 	}
@@ -779,7 +797,7 @@ func TestPullImagesBeforeSwap(t *testing.T) {
 
 	// Without a new compose file the pull is the project's own.
 	calls = fakeDocker(t)
-	if _, err := pullImages(p.dir, p.env, "0.1.20", nil); err != nil {
+	if _, err := pullImages(p.dir, p.env, tagEnv("0.1.20"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := (*calls)[0]; got != "DP_IMAGE_TAG=0.1.20 docker compose --project-directory "+p.dir+" --env-file "+p.env+" pull" {
@@ -794,7 +812,7 @@ func TestBundleRefreshRollback(t *testing.T) {
 	}
 	fakeDocker(t)
 	before := p.snapshot(t)
-	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.19", bundleAuto, false)
+	r, _ := planBundleRefresh(p.dir, p.env, p.base, "0.1.20", "0.1.19", tagEnv("0.1.20"), bundleAuto, false)
 	if r == nil {
 		t.Fatal("no refresh planned")
 	}
@@ -847,10 +865,10 @@ func TestComposeFileArgs(t *testing.T) {
 	writeFile(t, env, "DATA_PLANE_ID=dp-1\n")
 	r := &bundleRefresh{dir: dir, tmp: filepath.Dir(tmp), files: []bundleFile{{name: "docker-compose.yml", state: bundlePristine}}}
 	calls := fakeDocker(t)
-	if err := r.validate(env, "0.1.20"); err != nil {
+	if err := r.validate(env, tagEnv("0.1.20"), "0.1.20"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pullImages(dir, env, "0.1.20", r); err != nil {
+	if _, err := pullImages(dir, env, tagEnv("0.1.20"), r); err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range *calls {
@@ -889,6 +907,30 @@ func TestRemoveStaleBundleDirs(t *testing.T) {
 	}
 }
 
+// TestBundleDownloadGoesOnExit: a prompt or a signal that ends the CLI while
+// a run holds a bundle download, the download itself included, removes it
+// (prepareBundleRefresh registers it).
+func TestBundleDownloadGoesOnExit(t *testing.T) {
+	dir := t.TempDir()
+	served := map[string]string{}
+	for _, name := range bundleFiles {
+		served[name] = name + " body\n"
+	}
+	fakeDocker(t)
+	r, err := prepareBundleRefresh(dir, fakeControlPlane(t, served), "0.1.20", "", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(r.tmp); err != nil {
+		t.Fatal(err)
+	}
+	runExitHooks()
+	if _, err := os.Stat(r.tmp); !os.IsNotExist(err) {
+		t.Fatalf("the download is still there: %v", err)
+	}
+	r.cleanup() // the run's own cleanup afterwards: nothing left to do
+}
+
 func TestBundleRestarts(t *testing.T) {
 	r := &bundleRefresh{files: []bundleFile{
 		{name: "clickhouse-users.xml", state: bundleUnchanged},
@@ -916,29 +958,51 @@ func TestBundleManifest(t *testing.T) {
 		t.Fatalf("a corrupt manifest must read as empty: %+v", m)
 	}
 
+	// A deploy takes the bundle as a refresh that replaces everything; the
+	// manifest records every file, and their release only when the control
+	// plane says which it is.
+	served := map[string]string{}
 	for _, name := range bundleFiles {
-		writeFile(t, filepath.Join(dir, name), name+" body\n")
+		served[name] = name + " body\n"
 	}
-	if err := recordDeployedBundle(dir, ""); err != nil {
-		t.Fatal(err)
+	base := fakeControlPlane(t, served)
+	fakeDocker(t)
+	for _, version := range []string{"", "0.1.20"} {
+		r, err := prepareBundleRefresh(dir, base, version, "", true, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.apply(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.commit(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	m := readBundleManifest(dir)
-	if m.Version != "" || len(m.Files) != len(bundleFiles) || m.Files["Caddyfile"] != sha256Hex([]byte("Caddyfile body\n")) {
+	if m.Version != "0.1.20" || len(m.Files) != len(bundleFiles) || m.Files["Caddyfile"] != sha256Hex([]byte("Caddyfile body\n")) {
 		t.Fatalf("deploy manifest = %+v", m)
 	}
 	raw := readFile(t, filepath.Join(dir, bundleManifestFile))
-	if !strings.Contains(raw, `"version": ""`) || !strings.Contains(raw, `"files": {`) {
+	if !strings.Contains(raw, `"version": "0.1.20"`) || !strings.Contains(raw, `"files": {`) {
 		t.Fatalf("manifest format: %s", raw)
 	}
-
-	if len(m.Releases) != 0 {
-		t.Fatalf("a bundle of no known release records none: %+v", m.Releases)
+	if len(m.Releases) != len(bundleFiles) || m.Releases["Caddyfile"] != "0.1.20" {
+		t.Fatalf("deploy manifest releases = %+v", m.Releases)
 	}
-	if err := recordDeployedBundle(dir, "0.1.20"); err != nil {
+	unknown := t.TempDir()
+	r, err := prepareBundleRefresh(unknown, base, "", "", true, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if m = readBundleManifest(dir); len(m.Releases) != len(bundleFiles) || m.Releases["Caddyfile"] != "0.1.20" {
-		t.Fatalf("deploy manifest releases = %+v", m.Releases)
+	if err := r.apply(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.commit(); err != nil {
+		t.Fatal(err)
+	}
+	if u := readBundleManifest(unknown); u.Version != "" || len(u.Files) != len(bundleFiles) || len(u.Releases) != 0 {
+		t.Fatalf("a bundle of no known release records none: %+v", u)
 	}
 
 	// The storage reset rewrites the schema outside a refresh, from a control
