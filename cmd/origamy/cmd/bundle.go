@@ -21,9 +21,11 @@ import (
 // ── Docker deploy bundle ─────────────────────────────────────────────────────
 // A Docker data plane runs the compose bundle its control plane serves at
 // /byod/* — the data-plane repo is private, so the control plane is the only
-// source. `origamy deploy` downloads it; `origamy upgrade` refreshes it, but
-// only when the control plane serves the bundle for exactly the release being
-// moved to (/byod/VERSION), and only the files the operator has not edited.
+// source. `origamy deploy` downloads it (next to the project, swapped in once
+// the deploy can go ahead, every file it replaces backed up); `origamy
+// upgrade` refreshes it, but only when the control plane serves the bundle
+// for exactly the release being moved to (/byod/VERSION), and only the files
+// the operator has not edited.
 
 // The known-version table is generated from the control plane's git history.
 //go:generate bash ../../../scripts/gen-bundle-hashes.sh
@@ -77,24 +79,6 @@ func writeBundleManifest(dir string, m bundleManifest) error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(dir, bundleManifestFile))
-}
-
-// recordDeployedBundle writes the manifest for a bundle deploy just
-// downloaded into dir: every file as it is on disk, and the release the
-// control plane said the bundle is for ("" when it predates /byod/VERSION).
-func recordDeployedBundle(dir, version string) error {
-	m := bundleManifest{Version: version, Files: map[string]string{}, Releases: map[string]string{}}
-	for _, name := range bundleFiles {
-		b, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			return err
-		}
-		m.Files[name] = sha256Hex(b)
-		if version != "" {
-			m.Releases[name] = version
-		}
-	}
-	return writeBundleManifest(dir, m)
 }
 
 // recordBundleFile updates one file's entry in dir's manifest after it was
@@ -475,10 +459,21 @@ func removeStaleBundleDirs(dir string) []string {
 	return removed
 }
 
+// bundleFileError is a bundle file prepareBundleRefresh could not download
+// or read.
+type bundleFileError struct {
+	name string
+	err  error
+}
+
+func (e *bundleFileError) Error() string { return e.name + ": " + e.err.Error() }
+func (e *bundleFileError) Unwrap() error { return e.err }
+
 // prepareBundleRefresh downloads the bundle from base into a temporary
 // directory inside dir and classifies every file. force names files replaced
 // even when edited (the storage reset's schema). Backups are named after the
-// release each replaced file belongs to (backupRelease).
+// release each replaced file belongs to (backupRelease). An in-place deploy
+// takes the bundle the same way, with replaceEdited.
 func prepareBundleRefresh(dir, base, version, installedTag string, replaceEdited bool, force map[string]bool) (*bundleRefresh, error) {
 	tmp, err := os.MkdirTemp(dir, bundleTempPrefix)
 	if err != nil {
@@ -497,7 +492,7 @@ func prepareBundleRefresh(dir, base, version, installedTag string, replaceEdited
 		}
 		if err != nil {
 			r.cleanup()
-			return nil, fmt.Errorf("%s: %w", name, err)
+			return nil, &bundleFileError{name: name, err: err}
 		}
 		state := classifyBundleFile(name, cur, served, m, replaceEdited || force[name])
 		r.files = append(r.files, bundleFile{
@@ -788,7 +783,9 @@ func (r *bundleRefresh) commit() error {
 			continue
 		}
 		m.Files[f.name] = f.sum
-		m.Releases[f.name] = r.version
+		if r.version != "" {
+			m.Releases[f.name] = r.version
+		}
 		stale := filepath.Join(r.dir, f.name+".new")
 		if fi, err := os.Lstat(stale); err == nil && fi.Mode().IsRegular() {
 			if err := os.Remove(stale); err != nil {

@@ -321,7 +321,7 @@ func exitNoAnswer(what string) {
 	ui.Fail("No answer for %s (input ended).", what)
 	ui.Detail("Nothing has been enrolled or installed.")
 	fmt.Println()
-	os.Exit(1)
+	exitNow(1)
 }
 
 // rejectSecret is rejectAnswer for a hidden answer: a non-interactive run
@@ -334,5 +334,5 @@ func rejectSecret(what string) {
 	ui.Fail("Unusable answer on a non-interactive stdin for %s.", what)
 	ui.Detail("Check the piped answers. Nothing has been enrolled or installed.")
 	fmt.Println()
-	os.Exit(1)
+	exitNow(1)
 }

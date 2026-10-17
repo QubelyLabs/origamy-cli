@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -145,18 +146,23 @@ func classifyCompose(svcs []composeService) (pending, failed []string) {
 // restart, before the stack counts as healthy. A service that cannot reach
 // the control plane (wrong token, refused client cert) starts fine and dies a
 // few seconds later; declaring success on the first all-running snapshot
-// would miss exactly that.
-const composeSettle = 30 * time.Second
+// would miss exactly that. composeWait bounds the whole watch, and
+// composePoll is how often it looks. Variables so tests need not wait.
+var (
+	composeSettle = 30 * time.Second
+	composeWait   = 3 * time.Minute
+	composePoll   = 3 * time.Second
+)
 
-// waitForCompose polls the project for up to ~3 minutes. It returns healthy
+// waitForCompose polls the project for up to composeWait. It returns healthy
 // when every service has been running (and healthy, where it has a check)
 // for composeSettle, or the failed services as soon as one exits or starts
 // restarting.
 func waitForCompose(dir, envPath string, sp *ui.Spinner) (healthy bool, failed []string) {
-	deadline := time.Now().Add(3 * time.Minute)
+	deadline := time.Now().Add(composeWait)
 	var stableSince time.Time
 	for {
-		out, err := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath, "ps", "-a", "--format", "json")
+		out, err := dockerRun(nil, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "ps", "-a", "--format", "json")
 		if err == nil {
 			if svcs, perr := parseComposePS(out); perr == nil && len(svcs) > 0 {
 				pending, failed := classifyCompose(svcs)
@@ -180,7 +186,7 @@ func waitForCompose(dir, envPath string, sp *ui.Spinner) (healthy bool, failed [
 		if time.Now().After(deadline) {
 			return false, nil
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(composePoll)
 	}
 }
 
@@ -240,13 +246,141 @@ func probeLiveSchema(dir, envPath string, env []string) liveSchema {
 	return liveSchema{gen: liveMissing}
 }
 
-// liveSchemaGeneration is probeLiveSchema's generation, "" unless ClickHouse
-// holds one of the two (not running, no events table, another type).
-func liveSchemaGeneration(dir, envPath string) string {
-	if l := probeLiveSchema(dir, envPath, nil); l.known() {
-		return l.gen
+// describe says what ClickHouse holds, for a message.
+func (l liveSchema) describe() string {
+	switch l.gen {
+	case "json":
+		return "the new events table (JSON payload columns)"
+	case "string":
+		return "the pre-reset events table (String payload columns)"
+	case liveMissing:
+		return "no events table"
+	case liveOther:
+		return "an events table with payload columns of type " + l.typ + ", neither the pre-reset (String) nor the new (JSON) schema"
 	}
-	return ""
+	return "an events table it did not say"
+}
+
+// waitClickHouse waits, up to clickhouseReadyTimeout, until the project's
+// ClickHouse answers a query. out is what the last ping printed when it never
+// did. env is extra environment for compose.
+func waitClickHouse(dir, envPath string, env []string) (out string, ok bool) {
+	deadline := time.Now().Add(clickhouseReadyTimeout)
+	for {
+		o, err := dockerRunTimeout(clickhouseProbeTimeout, env, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "exec", "-T", "clickhouse", "sh", "-c", clickhousePing)
+		if err == nil {
+			return "", true
+		}
+		if time.Now().After(deadline) {
+			return o, false
+		}
+		time.Sleep(clickhouseReadyPoll)
+	}
+}
+
+// askClickHouse asks the project's ClickHouse which events table it holds,
+// which decides what an upgrade or an in-place deploy does with it. One that
+// cannot be asked (stopped, hung, no container) is started and asked again:
+// `up -d clickhouse` with the project's own compose files and .env on the
+// release it runs now (tag, its DP_IMAGE_TAG), so nothing but ClickHouse
+// changes, then waited for (clickhouseReadyTimeout). gen stays "" when it
+// still cannot be asked; the caller refuses rather than guess from files or
+// tags.
+func askClickHouse(dir, envPath, tag string) liveSchema {
+	var env []string
+	if tag != "" {
+		env = []string{"DP_IMAGE_TAG=" + tag}
+	}
+	if live := probeLiveSchema(dir, envPath, env); live.gen != "" {
+		return live
+	}
+	sp := ui.Start("ClickHouse did not answer; starting it on the release this plane runs now")
+	if out, err := dockerRun(env, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "up", "-d", "clickhouse"); err != nil {
+		sp.Fail("Could not start ClickHouse")
+		return liveSchema{out: out}
+	}
+	if out, ok := waitClickHouse(dir, envPath, env); !ok {
+		sp.Fail("ClickHouse did not answer within %s", clickhouseReadyTimeout)
+		return liveSchema{out: out}
+	}
+	live := probeLiveSchema(dir, envPath, env)
+	if live.gen == "" {
+		sp.Fail("ClickHouse is up, and did not say which events table it holds")
+		return live
+	}
+	sp.Success("ClickHouse is up and holds %s", live.describe())
+	return live
+}
+
+// initRunning reports whether the bundle's one-shot clickhouse-init service,
+// which every `up -d` runs again, is still at work (created or running).
+func initRunning(dir, envPath string, env []string) bool {
+	out, err := dockerRun(env, "docker", "compose", "--project-directory", dir, "--env-file", envPath, "ps", "-a", "--format", "json", "clickhouse-init")
+	if err != nil {
+		return false
+	}
+	// compose's warnings come first on the same output.
+	var rows []string
+	for _, l := range strings.Split(out, "\n") {
+		if t := strings.TrimSpace(l); strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[") {
+			rows = append(rows, t)
+		}
+	}
+	svcs, err := parseComposePS(strings.Join(rows, "\n"))
+	if err != nil {
+		return false
+	}
+	for _, s := range svcs {
+		if s.Service == "clickhouse-init" && slices.Contains([]string{"created", "running", "restarting"}, strings.ToLower(s.State)) {
+			return true
+		}
+	}
+	return false
+}
+
+// eventsTableProblem is the check after the last `up -d` of an upgrade or a
+// deploy: ClickHouse answers, and its events table exists and is the one the
+// images of tag write (any of the two for a tag whose schema is not known:
+// main, sha-…). It returns what ClickHouse holds and, when that is not it,
+// why ("" when it is). A missing table is asked about again while the init
+// service `up -d` started is still at work.
+func eventsTableProblem(dir, envPath, tag string) (liveSchema, string) {
+	env := []string{"DP_IMAGE_TAG=" + tag}
+	sp := ui.Start("Checking the events table the %s images write to", tag)
+	if out, ok := waitClickHouse(dir, envPath, env); !ok {
+		sp.Fail("ClickHouse did not answer within %s", clickhouseReadyTimeout)
+		return liveSchema{out: out}, "ClickHouse did not answer, so whether " + eventsTable + " is there could not be checked"
+	}
+	deadline := time.Now().Add(clickhouseReadyTimeout)
+	var live liveSchema
+	for {
+		live = probeLiveSchema(dir, envPath, env)
+		settled := live.gen != "" && (live.gen != liveMissing || !initRunning(dir, envPath, env))
+		if settled || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(clickhouseReadyPoll)
+	}
+	want := releaseSchemaGeneration(tag)
+	why := ""
+	switch {
+	case live.gen == "":
+		why = "ClickHouse did not say which events table it holds"
+	case !live.known():
+		why = "ClickHouse holds " + live.describe()
+	case want != "unknown" && live.gen != want:
+		why = "ClickHouse holds " + live.describe() + ", which the " + tag + " images cannot write"
+	}
+	if why != "" {
+		sp.Fail("%s", why)
+		return live, why
+	}
+	if want == "unknown" {
+		sp.Success("ClickHouse holds %s (the :%s images are not a numbered release, so which one they write is not known)", live.describe(), tag)
+	} else {
+		sp.Success("ClickHouse holds %s", live.describe())
+	}
+	return live, ""
 }
 
 // eventsColumnMark follows the type on the probe's answer, so a type of
@@ -261,17 +395,9 @@ const clickhouseEventsPropertiesType = `clickhouse-client --password "$CH_DEFAUL
 // composeConfig is what the CLI reads of `docker compose config --format
 // json`: the project's effective configuration.
 type composeConfig struct {
-	Name     string `json:"name"`
 	Services map[string]struct {
-		Image   string `json:"image"`
-		Volumes []struct {
-			Type   string `json:"type"`
-			Source string `json:"source"`
-		} `json:"volumes"`
+		Image string `json:"image"`
 	} `json:"services"`
-	Volumes map[string]struct {
-		Name string `json:"name"`
-	} `json:"volumes"`
 }
 
 // effectiveCompose renders the configuration `docker compose up` would run in
@@ -303,37 +429,9 @@ func effectiveCompose(dir, envPath, tag string, fileArgs []string) (composeConfi
 	return cfg, nil
 }
 
-// serviceVolumes names the Docker volumes service keeps its data in, as the
-// configuration resolves them.
-func (c composeConfig) serviceVolumes(service string) []string {
-	var out []string
-	for _, v := range c.Services[service].Volumes {
-		if v.Type != "volume" || v.Source == "" {
-			continue
-		}
-		name := c.Volumes[v.Source].Name
-		if name == "" {
-			name = c.Name + "_" + v.Source
-		}
-		out = append(out, name)
-	}
-	return out
-}
-
-// existingVolumes keeps the volumes Docker has.
-func existingVolumes(names []string) []string {
-	var out []string
-	for _, n := range names {
-		if _, err := dockerRun(nil, "docker", "volume", "inspect", n); err == nil {
-			out = append(out, n)
-		}
-	}
-	return out
-}
-
 // composeLogs returns the last n log lines of one service.
 func composeLogs(dir, envPath, service string, n int) string {
-	out, _ := runCaptured("docker", "compose", "--project-directory", dir, "--env-file", envPath,
+	out, _ := dockerRun(nil, "docker", "compose", "--project-directory", dir, "--env-file", envPath,
 		"logs", "--no-color", "--tail", fmt.Sprintf("%d", n), service)
 	return strings.TrimSpace(out)
 }

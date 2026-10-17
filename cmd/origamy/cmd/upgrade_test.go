@@ -21,23 +21,28 @@ const (
 )
 
 // fakeCompose stands in for Docker in the storage reset and in a whole Docker
-// upgrade, with a ClickHouse that keeps state: live is what the events-table
-// probe answers ("" = no table); a DROP empties it, and a clickhouse-init run
-// that succeeds leaves afterInit there (the new table, unless a test says the
-// schema silently failed). Everything else succeeds, except: ClickHouse
-// answers nothing while stopped (until an `up`), the first pingFails pings
-// fail (all when < 0), the probe cannot be asked while probeFails (nor after
-// an init while checkFails), the first initFails clickhouse-init runs fail,
-// and a pull fails while failPull is set. `docker compose config --format json` renders
-// the clickhouse image of the -f files given (the last that sets it wins),
-// after a compose warning, like compose does.
+// upgrade or deploy, with a ClickHouse that keeps state: live is what the
+// events-table probe answers ("" = no table); a DROP empties it, and a
+// clickhouse-init run that succeeds leaves afterInit there (the new table,
+// unless a test says the schema silently failed). Everything else succeeds,
+// except: ClickHouse answers nothing while stopped (until an `up`; startFails
+// makes `up -d clickhouse` fail), the first pingFails pings fail (all when
+// < 0), the probe cannot be asked while probeFails (or for its first
+// probeHangs answers, nor after an init while checkFails), the first
+// initFails clickhouse-init runs fail, and a pull fails while failPull is
+// set. onUp runs at every `up` of the whole project (compose reruns the init
+// then). `docker compose config --format json` renders the clickhouse image
+// of the -f files given (the last that sets it wins), after a compose
+// warning, like compose does; `ps` lists one running service.
 type fakeCompose struct {
 	calls                           []string
 	live, afterInit                 string
 	pingFails, initFails            int
+	probeHangs                      int
 	stopped, probeFails, checkFails bool
-	failPull                        bool
-	pings, inits                    int
+	startFails, failPull            bool
+	onUp                            func(*fakeCompose)
+	pings, inits, probes            int
 }
 
 func newFakeCompose(t *testing.T) *fakeCompose {
@@ -45,15 +50,23 @@ func newFakeCompose(t *testing.T) *fakeCompose {
 	f := &fakeCompose{afterInit: liveJSONRow}
 	prevTimeout, prevPoll := clickhouseReadyTimeout, clickhouseReadyPoll
 	clickhouseReadyTimeout, clickhouseReadyPoll = 100*time.Millisecond, time.Millisecond
+	prevSettle, prevWait, prevPoll2 := composeSettle, composeWait, composePoll
+	composeSettle, composeWait, composePoll = 0, 100*time.Millisecond, time.Millisecond
 	stubDocker(t, func(env []string, name string, args ...string) (string, error) {
 		f.calls = append(f.calls, strings.Join(append(append(append([]string{}, env...), name), args...), " "))
 		switch last := args[len(args)-1]; {
 		case slices.Contains(args, "up"):
+			if last == "clickhouse" && f.startFails {
+				return "Error response from daemon: no such image", errors.New("exit status 1")
+			}
 			f.stopped = false
+			if last == "--remove-orphans" && f.onUp != nil {
+				f.onUp(f)
+			}
 		case f.stopped && slices.Contains(args, "exec"):
 			return "service \"clickhouse\" is not running", errors.New("exit status 1")
 		case last == clickhouseEventsPropertiesType:
-			if f.probeFails || (f.checkFails && f.inits > 0) {
+			if f.probes++; f.probeFails || f.probes <= f.probeHangs || (f.checkFails && f.inits > 0) {
 				return "", errors.New("no answer within 20s")
 			}
 			return f.live, nil
@@ -74,10 +87,15 @@ func newFakeCompose(t *testing.T) *fakeCompose {
 			return "manifest unknown", errors.New("exit status 1")
 		case last == "json" && slices.Contains(args, "config"):
 			return renderComposeConfig(args)
+		case slices.Contains(args, "ps") && last == "json":
+			return `{"Service":"portal-agent","State":"running","Status":"Up 5 seconds"}` + "\n", nil
 		}
 		return "", nil
 	})
-	t.Cleanup(func() { clickhouseReadyTimeout, clickhouseReadyPoll = prevTimeout, prevPoll })
+	t.Cleanup(func() {
+		clickhouseReadyTimeout, clickhouseReadyPoll = prevTimeout, prevPoll
+		composeSettle, composeWait, composePoll = prevSettle, prevWait, prevPoll2
+	})
 	return f
 }
 
@@ -102,12 +120,22 @@ func renderComposeConfig(args []string) (string, error) {
 		fmt.Sprintf(`{"name": "dp", "services": {"clickhouse": {"image": %q, "volumes": [{"type": "volume", "source": "clickhouse-data", "target": "/var/lib/clickhouse"}]}}, "volumes": {"clickhouse-data": {"name": "dp_clickhouse-data"}}}`, image) + "\n", nil
 }
 
+// resetProject is a project directory whose clickhouse-init.sql is sql, for
+// the reset alone.
+func resetProject(t *testing.T, sql string) (dir, env string) {
+	t.Helper()
+	dir = t.TempDir()
+	writeFile(t, filepath.Join(dir, "clickhouse-init.sql"), sql)
+	return dir, filepath.Join(dir, ".env")
+}
+
 func TestResetDockerEventsStartsClickHouseFirst(t *testing.T) {
 	f := newFakeCompose(t)
 	f.live, f.pingFails = liveStringRow, 2
+	dir, env := resetProject(t, jsonSchemaSQL)
 	var outcome resetOutcome
 	var err error
-	out := captureStdout(t, func() { outcome, err = resetDockerEvents("/dp", "/dp/.env", "0.1.20", true) })
+	out := captureStdout(t, func() { outcome, err = resetDockerEvents(dir, env, "0.1.20", "string") })
 	if err != nil || outcome != resetDropped {
 		t.Fatalf("%v, %v\n%s", outcome, err, out)
 	}
@@ -115,7 +143,7 @@ func TestResetDockerEventsStartsClickHouseFirst(t *testing.T) {
 	// and answers BEFORE anything else; it is asked which table it holds,
 	// the old one dropped, the schema applied on the new server rather than
 	// the container still running, and the result checked.
-	dc := "DP_IMAGE_TAG=0.1.20 docker compose --project-directory /dp --env-file /dp/.env "
+	dc := "DP_IMAGE_TAG=0.1.20 docker compose --project-directory " + dir + " --env-file " + env + " "
 	want := []string{
 		dc + "up -d clickhouse",
 		dc + "exec -T clickhouse sh -c " + clickhousePing,
@@ -137,8 +165,9 @@ func TestResetDockerEventsStartsClickHouseFirst(t *testing.T) {
 func TestResetDockerEventsClickHouseNeverReady(t *testing.T) {
 	f := newFakeCompose(t)
 	f.live, f.pingFails = liveStringRow, -1
+	dir, env := resetProject(t, jsonSchemaSQL)
 	var err error
-	captureStdout(t, func() { _, err = resetDockerEvents("/dp", "/dp/.env", "0.1.20", true) })
+	captureStdout(t, func() { _, err = resetDockerEvents(dir, env, "0.1.20", "string") })
 	if err == nil {
 		t.Fatal("a ClickHouse that never answers must fail the reset")
 	}
@@ -150,35 +179,40 @@ func TestResetDockerEventsClickHouseNeverReady(t *testing.T) {
 }
 
 // TestResetDockerEventsDropsOnlyThePreResetTable is the cardinal rule: the
-// events table is dropped only when ClickHouse says it is the String one.
+// events table is dropped only when ClickHouse says it is the String one, and
+// the run decided on that table (asked to drop it).
 func TestResetDockerEventsDropsOnlyThePreResetTable(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		live       string
 		probeFails bool
-		mayDrop    bool
+		found      string // what the run decided on
 		want       resetOutcome
 		dropped    bool
 		init       bool
 		failure    string // "" = the reset succeeds
 	}{
-		{"the pre-reset table", liveStringRow, false, true, resetDropped, true, true, ""},
-		{"no events table", "", false, true, resetCreated, false, true, ""},
-		{"the new table already", liveJSONRow, false, true, resetAlready, false, false, ""},
-		{"the new table, bare answer", "JSON\n", false, true, resetAlready, false, false, ""},
-		{"ClickHouse cannot be asked", "", true, true, resetNone, false, false, "so nothing was dropped"},
-		{"another type", "Object('json')\t" + eventsColumnMark + "\n", false, true, resetNone, false, false, "neither the pre-reset (String) nor the new (JSON)"},
-		// A run that did not ask accepts only the new table.
-		{"not asked, the new table", liveJSONRow, false, false, resetAlready, false, false, ""},
-		{"not asked, the pre-reset table", liveStringRow, false, false, resetNone, false, false, "it asks before it finishes the reset"},
-		{"not asked, no table", "", false, false, resetNone, false, false, "it asks before it finishes the reset"},
+		{"the pre-reset table", liveStringRow, false, "string", resetDropped, true, true, ""},
+		{"no events table", "", false, liveMissing, resetCreated, false, true, ""},
+		{"no events table, a drop agreed to", "", false, "string", resetCreated, false, true, ""},
+		{"the new table already", liveJSONRow, false, "string", resetAlready, false, false, ""},
+		{"the new table, bare answer", "JSON\n", false, "string", resetAlready, false, false, ""},
+		{"ClickHouse cannot be asked", "", true, "string", resetNone, false, false, "so nothing was dropped"},
+		{"another type", "Object('json')\t" + eventsColumnMark + "\n", false, "string", resetNone, false, false, "neither the pre-reset (String) nor the new (JSON)"},
+		// A run that did not ask to drop accepts no pre-reset table, and one
+		// that found the new table accepts only that.
+		{"found the new table, still there", liveJSONRow, false, "json", resetAlready, false, false, ""},
+		{"found the new table, now the pre-reset one", liveStringRow, false, "json", resetNone, false, false, "it asks again, before it drops anything"},
+		{"found the new table, now none", "", false, "json", resetNone, false, false, "although it held the new events table"},
+		{"found no table, now the pre-reset one", liveStringRow, false, liveMissing, resetNone, false, false, "although it held no events table"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeCompose(t)
 			f.live, f.probeFails = tc.live, tc.probeFails
+			dir, env := resetProject(t, jsonSchemaSQL)
 			var got resetOutcome
 			var err error
-			out := captureStdout(t, func() { got, err = resetDockerEvents("/dp", "/dp/.env", "0.1.20", tc.mayDrop) })
+			out := captureStdout(t, func() { got, err = resetDockerEvents(dir, env, "0.1.20", tc.found) })
 			if (err == nil) != (tc.failure == "") || got != tc.want || !strings.Contains(out, tc.failure) {
 				t.Fatalf("got %v, %v\n%s", got, err, out)
 			}
@@ -187,6 +221,34 @@ func TestResetDockerEventsDropsOnlyThePreResetTable(t *testing.T) {
 			}
 			if tc.failure != "" && strings.Contains(out, "Events table recreated") {
 				t.Fatalf("a failed reset said the table was recreated:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestResetDockerEventsNeedsTheNewSchemaFile: the init service applies the
+// project's clickhouse-init.sql, so nothing is dropped or created unless it
+// is the new schema.
+func TestResetDockerEventsNeedsTheNewSchemaFile(t *testing.T) {
+	for name, sql := range map[string]string{
+		"the pre-reset schema": stringSchemaSQL,
+		"neither schema":       "CREATE TABLE IF NOT EXISTS events.events (id UInt64) ENGINE = MergeTree ORDER BY id;\n",
+		"no file":              "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeCompose(t)
+			f.live = liveStringRow
+			dir, env := resetProject(t, sql)
+			if sql == "" {
+				_ = os.Remove(filepath.Join(dir, "clickhouse-init.sql"))
+			}
+			var err error
+			out := captureStdout(t, func() { _, err = resetDockerEvents(dir, env, "0.1.20", "string") })
+			if err == nil || !strings.Contains(out, "is not the new ClickHouse schema") || !strings.Contains(out, "nothing was dropped or created") {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			if callIndex(f.calls, "DROP") >= 0 || callIndex(f.calls, "clickhouse-init") >= 0 || f.live != liveStringRow {
+				t.Fatalf("calls:\n%s", strings.Join(f.calls, "\n"))
 			}
 		})
 	}
@@ -203,8 +265,9 @@ func TestResetDockerEventsChecksTheTable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeCompose(t)
 			f.live, f.afterInit = liveStringRow, tc.afterInit
+			dir, env := resetProject(t, jsonSchemaSQL)
 			var err error
-			out := captureStdout(t, func() { _, err = resetDockerEvents("/dp", "/dp/.env", "0.1.20", true) })
+			out := captureStdout(t, func() { _, err = resetDockerEvents(dir, env, "0.1.20", "string") })
 			if err == nil || !strings.Contains(out, tc.want) || strings.Contains(out, "Events table recreated") ||
 				!strings.Contains(out, "ClickHouse schema ready.") || !strings.Contains(out, "rerun `origamy upgrade --version 0.1.20`") {
 				t.Fatalf("%v\n%s", err, out)
@@ -214,8 +277,9 @@ func TestResetDockerEventsChecksTheTable(t *testing.T) {
 	// The check itself cannot be asked: not done either.
 	f := newFakeCompose(t)
 	f.live, f.checkFails = liveStringRow, true
+	dir, env := resetProject(t, jsonSchemaSQL)
 	var err error
-	out := captureStdout(t, func() { _, err = resetDockerEvents("/dp", "/dp/.env", "0.1.20", true) })
+	out := captureStdout(t, func() { _, err = resetDockerEvents(dir, env, "0.1.20", "string") })
 	if err == nil || !strings.Contains(out, "could not be asked whether") || strings.Contains(out, "Events table recreated") {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -261,7 +325,11 @@ func newUpgradeProject(t *testing.T, compose, initSQL string, env func(base stri
 		}
 	}
 	base := fakeControlPlane(t, files)
-	dir := t.TempDir()
+	// The upgrade works on the absolute path the working directory resolves to.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	writeFile(t, filepath.Join(dir, "docker-compose.yml"), compose)
 	writeFile(t, filepath.Join(dir, "clickhouse-init.sql"), initSQL)
 	envPath := filepath.Join(dir, ".env")
@@ -435,9 +503,10 @@ func TestUpgradeDockerFailedPullRecordsNoReset(t *testing.T) {
 
 func TestUpgradeDockerV018Project(t *testing.T) {
 	// Deployed by CLI v0.1.15–v0.1.18: DP_IMAGE_TAG=main, a bare CONFIG_URL,
-	// the pre-reset bundle, ClickHouse stopped. With nothing to ask, the
-	// schema file, not the tag, says this crosses the reset; the reset asks
-	// ClickHouse once it is up, and drops the table it finds is the old one.
+	// the pre-reset bundle, ClickHouse stopped. ClickHouse is started on the
+	// release and files the project runs now, asked, and says this crosses
+	// the reset; the reset asks it again once it is up on the new bundle, and
+	// drops the table it finds is the old one.
 	p := newUpgradeProject(t, compose248, stringSchemaSQL, v018Env, nil)
 	f := newFakeCompose(t)
 	f.live, f.stopped = liveStringRow, true
@@ -445,12 +514,12 @@ func TestUpgradeDockerV018Project(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	if !strings.Contains(out, "Upgrading main → 0.1.20 crosses the data plane's storage reset") || callIndex(f.calls, "DROP TABLE") < 0 {
+	if !strings.Contains(out, "upgrading main → 0.1.20 crosses the data plane's storage reset") || callIndex(f.calls, "DROP TABLE") < 0 {
 		t.Fatalf("no reset:\n%s", out)
 	}
-	// The confirmation says ClickHouse could not be asked about its volume.
-	if !strings.Contains(out, "what its data volume (dp_clickhouse-data) holds could not be checked") || !strings.Contains(out, "drops the table only if it is the pre-reset one") {
-		t.Fatalf("the confirmation does not say ClickHouse was not asked:\n%s", out)
+	if first := callIndex(f.calls, "up -d clickhouse"); first < 0 || first > callIndex(f.calls, " pull") ||
+		f.calls[first] != "DP_IMAGE_TAG=main docker compose --project-directory "+p.dir+" --env-file "+p.env+" up -d clickhouse" {
+		t.Fatalf("ClickHouse was not started on the release it runs to be asked:\n%s", strings.Join(f.calls, "\n"))
 	}
 	for _, bad := range []string{"Upgrade the control plane", "may be a downgrade", notTouched} {
 		if strings.Contains(out, bad) {
@@ -901,15 +970,331 @@ func TestUpgradeDockerRefusesBeforeAsking(t *testing.T) {
 }
 
 // TestUpgradeDockerProbeTimeout: a ClickHouse that does not answer the probe
-// in time counts as not asked; the decision falls back, and the reset asks
-// again before it drops anything.
+// in time is started (a no-op when it runs) and asked again; when it still
+// does not answer, the upgrade is refused rather than decided from the files
+// and tags, and nothing is touched.
 func TestUpgradeDockerProbeTimeout(t *testing.T) {
+	// It answers the second time: the upgrade goes on, on what it says.
 	p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("0.1.20"), nil)
 	f := newFakeCompose(t)
-	f.live, f.probeFails = liveStringRow, true
+	f.live, f.probeHangs = liveStringRow, 1
 	out, err := upgradeIn(t, p.dir, "0.1.20", bundleAuto)
-	// The file and tags say across: no reset, nothing dropped.
-	if err != nil || callIndex(f.calls, "DROP") >= 0 || !strings.Contains(out, notTouched) {
+	if err != nil || callIndex(f.calls, "DROP") < 0 || !strings.Contains(out, "still holds the pre-reset events table") {
 		t.Fatalf("%v\n%s", err, out)
+	}
+
+	for name, setup := range map[string]func(*fakeCompose){
+		"the probe never answers":      func(f *fakeCompose) { f.live, f.probeFails = liveStringRow, true },
+		"ClickHouse never answers":     func(f *fakeCompose) { f.live, f.stopped, f.pingFails = liveStringRow, true, -1 },
+		"ClickHouse cannot be started": func(f *fakeCompose) { f.live, f.stopped, f.startFails = liveStringRow, true, true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, schema := range []string{jsonSchemaSQL, stringSchemaSQL} {
+				p := newUpgradeProject(t, compose253, schema, envAt("0.1.20"), nil)
+				f := newFakeCompose(t)
+				setup(f)
+				before := p.snapshot(t)
+				out, err := upgradeIn(t, p.dir, "0.1.20", bundleAuto)
+				if err == nil || !strings.Contains(out, "ClickHouse could not be asked which events table it holds") || strings.Contains(out, "Upgraded") {
+					t.Fatalf("%v\n%s", err, out)
+				}
+				for _, c := range f.calls {
+					if strings.Contains(c, " pull") || strings.Contains(c, "DROP") || strings.Contains(c, "clickhouse-init") || strings.Contains(c, "--remove-orphans") {
+						t.Fatalf("ran %q", c)
+					}
+				}
+				if callIndex(f.calls, "DP_IMAGE_TAG=0.1.20 docker compose --project-directory "+p.dir+" --env-file "+p.env+" up -d clickhouse") < 0 {
+					t.Fatalf("ClickHouse was not started to be asked:\n%s", strings.Join(f.calls, "\n"))
+				}
+				if after := p.snapshot(t); !mapsEqual(before, after) {
+					t.Fatalf("the project was touched:\nbefore %v\nafter  %v", before, after)
+				}
+			}
+		})
+	}
+}
+
+// TestUpgradeDockerStoppedClickHouseIsAsked: an in-place deploy by an earlier
+// CLI put the 0.1.20 bundle over a :main project before it was refused, and
+// ClickHouse was then stopped. Neither the files (the new schema) nor the tag
+// (main) say this crosses the reset; ClickHouse, started and asked, does.
+func TestUpgradeDockerStoppedClickHouseIsAsked(t *testing.T) {
+	p := newUpgradeProject(t, compose253, jsonSchemaSQL, v018Env, nil)
+	f := newFakeCompose(t)
+	f.live, f.stopped = liveStringRow, true
+	out, err := upgradeIn(t, p.dir, "", bundleAuto)
+	if err != nil || callIndex(f.calls, "DROP TABLE") < 0 || strings.Contains(out, notTouched) || !strings.Contains(out, "Event history was discarded") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if f.live != liveJSONRow || readEnvVar(p.env, "DP_IMAGE_TAG") != helmVersion || envHasKey(p.env, resetPendingVar) {
+		t.Fatalf("after: table %q, .env:\n%s", f.live, readFile(t, p.env))
+	}
+}
+
+// TestUpgradeDockerCreatesAMissingTable: a released CLI dropped the pre-reset
+// table and its schema failed silently on ClickHouse 24.8, leaving no events
+// table and the tag already moved on. The upgrade creates the table with the
+// new schema (nothing to drop, so nothing is asked) and checks it.
+func TestUpgradeDockerCreatesAMissingTable(t *testing.T) {
+	for _, tc := range []struct {
+		name, compose, schema, installed string
+		mode                             bundleMode
+	}{
+		{"0.1.20 with the old bundle", compose248, jsonSchemaSQL, "0.1.20", bundleAuto},
+		{"0.1.16 with the old bundle", compose248, stringSchemaSQL, "0.1.16", bundleAuto},
+		{"the new bundle, --keep-bundle", compose253, jsonSchemaSQL, "0.1.20", bundleKeep},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newUpgradeProject(t, tc.compose, tc.schema, envAt(tc.installed), nil)
+			f := newFakeCompose(t)
+			out, err := upgradeAsking(t, p.dir, "0.1.20", tc.mode, false, "")
+			if err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			if callIndex(f.calls, "DROP") >= 0 || callIndex(f.calls, "run --rm --no-deps clickhouse-init") < 0 || strings.Contains(out, asked) {
+				t.Fatalf("calls:\n%s\n%s", strings.Join(f.calls, "\n"), out)
+			}
+			if f.live != liveJSONRow || !strings.Contains(out, "ClickHouse has no events table") || !strings.Contains(out, "the events table was created with the new schema") || strings.Contains(out, notTouched) {
+				t.Fatalf("output:\n%s", out)
+			}
+			if readEnvVar(p.env, "DP_IMAGE_TAG") != "0.1.20" || envHasKey(p.env, resetPendingVar) {
+				t.Fatalf(".env:\n%s", readFile(t, p.env))
+			}
+		})
+	}
+
+	// The operator's edited compose file pins ClickHouse 24.8 and the refresh
+	// keeps it: the new schema cannot be created there, so the upgrade is
+	// refused before anything is touched, instead of reporting success on a
+	// plane with no events table.
+	edited := compose248 + "# local edit\n"
+	p := newUpgradeProject(t, edited, jsonSchemaSQL, envAt("0.1.20"), nil)
+	f := newFakeCompose(t)
+	before := p.snapshot(t)
+	out, err := upgradeIn(t, p.dir, "0.1.20", bundleAuto)
+	if err == nil || !strings.Contains(out, "your edited docker-compose.yml, which the refresh keeps, does not run it") || strings.Contains(out, "Upgraded") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if after := p.snapshot(t); !mapsEqual(before, after) || callIndex(f.calls, " pull") >= 0 || callIndex(f.calls, "clickhouse-init") >= 0 {
+		t.Fatalf("the project was touched:\nbefore %v\nafter  %v\ncalls %v", before, after, f.calls)
+	}
+}
+
+// TestUpgradeDockerChecksTheTableAfterUp is cardinal rule 2: whatever the run
+// did, it succeeds only when, after the last `up -d`, ClickHouse holds the
+// events table the release writes. A missing or pre-reset one under a release
+// that writes the new schema is recorded as a reset for the next run.
+func TestUpgradeDockerChecksTheTableAfterUp(t *testing.T) {
+	for _, tc := range []struct {
+		name, live, target string
+		onUp               func(*fakeCompose)
+		ok                 bool
+		says               string
+		pending            string
+	}{
+		{"the new table stays", liveJSONRow, "0.1.20", nil, true, notTouched, ""},
+		{"gone after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.live = "" }, false, "ClickHouse holds no events table", "0.1.20"},
+		{"the pre-reset one after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.live = liveStringRow }, false, "which the 0.1.20 images cannot write", "0.1.20"},
+		{"another type after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.live = "Nullable(String)\t" + eventsColumnMark + "\n" }, false, "neither the pre-reset (String) nor the new (JSON) schema", ""},
+		{"no answer after up", liveJSONRow, "0.1.20", func(f *fakeCompose) { f.probeFails = true }, false, "did not say which events table it holds", ""},
+		// A release before the reset with no table: the init `up -d` runs
+		// creates it, or the run fails.
+		{"before the reset, created by up", "", "0.1.17", func(f *fakeCompose) { f.live = liveStringRow }, true, notTouched, ""},
+		{"before the reset, not created", "", "0.1.17", nil, false, "ClickHouse holds no events table", ""},
+		// The edge channel writes the new schema; :main is not known to write
+		// either, so either is taken, but no table is not.
+		{"edge, the new table", liveJSONRow, dockerEdgeTag, nil, true, notTouched, ""},
+		{"main, the pre-reset table", liveStringRow, "main", nil, true, "which one they write is not known", ""},
+		{"main, no table", "", "main", nil, false, "ClickHouse holds no events table", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("0.1.20"), map[string]string{"VERSION": ""})
+			if releaseSchemaGeneration(tc.target) != "json" {
+				p = newUpgradeProject(t, compose248, stringSchemaSQL, envAt("0.1.16"), map[string]string{"VERSION": ""})
+			}
+			f := newFakeCompose(t)
+			f.live, f.onUp = tc.live, tc.onUp
+			chdir(t, p.dir)
+			var err error
+			out := captureStdout(t, func() {
+				if tc.target == dockerEdgeTag {
+					err = upgradeDocker("", "edge", false, false, false, true, bundleAuto)
+				} else {
+					err = upgradeDocker(tc.target, "stable", false, false, false, true, bundleAuto)
+				}
+			})
+			if (err == nil) != tc.ok || !strings.Contains(out, tc.says) || strings.Contains(out, "Upgraded") != tc.ok {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			if !tc.ok && (strings.Contains(out, notTouched) || strings.Contains(out, "were kept")) {
+				t.Fatalf("a failed check still reported success:\n%s", out)
+			}
+			if got := readEnvVar(p.env, resetPendingVar); got != tc.pending {
+				t.Fatalf("%s = %q", resetPendingVar, got)
+			}
+			// Checked after everything that restarts ClickHouse.
+			if all, check := callIndex(f.calls, "up -d --remove-orphans"), len(f.calls)-1; all < 0 || !strings.Contains(strings.Join(f.calls[all:], "\n"), clickhouseEventsPropertiesType) || check < all {
+				t.Fatalf("calls:\n%s", strings.Join(f.calls, "\n"))
+			}
+		})
+	}
+
+	// The recorded reset is finished by the next run, which creates the table.
+	p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("0.1.20"), map[string]string{"VERSION": ""})
+	f := newFakeCompose(t)
+	f.live, f.onUp = liveJSONRow, func(f *fakeCompose) { f.live = "" }
+	if _, err := upgradeIn(t, p.dir, "0.1.20", bundleAuto); err == nil || readEnvVar(p.env, resetPendingVar) != "0.1.20" {
+		t.Fatal("the first run must fail and record the reset")
+	}
+	f.onUp = nil
+	n := len(f.calls)
+	out, err := upgradeIn(t, p.dir, "0.1.20", bundleAuto)
+	if err != nil || callIndex(f.since(n), "DROP") >= 0 || callIndex(f.since(n), "run --rm --no-deps clickhouse-init") < 0 || f.live != liveJSONRow || envHasKey(p.env, resetPendingVar) {
+		t.Fatalf("rerun: %v\n%s", err, out)
+	}
+}
+
+// TestUpgradeDockerKeepsTheNewTableFromAnOlderRelease: ClickHouse holding the
+// new table is never moved to a release that cannot write it, whatever the
+// project's clickhouse-init.sql says (the operator put the pre-reset one back).
+func TestUpgradeDockerKeepsTheNewTableFromAnOlderRelease(t *testing.T) {
+	for _, tc := range []struct {
+		name, schema string
+		served       map[string]string
+		mode         bundleMode
+	}{
+		{"the pre-reset file put back", stringSchemaSQL, map[string]string{"VERSION": "0.1.20\n"}, bundleAuto},
+		{"the pre-reset file put back, --keep-bundle", stringSchemaSQL, nil, bundleKeep},
+		{"the new file", jsonSchemaSQL, nil, bundleAuto},
+		// The control plane serves the 0.1.17 bundle, which would refresh the
+		// files to it.
+		{"the control plane serves 0.1.17", jsonSchemaSQL, map[string]string{"VERSION": "0.1.17\n", "docker-compose.yml": compose248, "clickhouse-init.sql": stringSchemaSQL}, bundleAuto},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newUpgradeProject(t, compose253, tc.schema, envAt("0.1.20"), tc.served)
+			f := newFakeCompose(t)
+			f.live = liveJSONRow
+			before := p.snapshot(t)
+			out, err := upgradeIn(t, p.dir, "0.1.17", tc.mode)
+			if err == nil || !strings.Contains(out, "holds the new events table (JSON payload columns), which release 0.1.17 cannot write") || strings.Contains(out, "Upgraded") {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			for _, c := range f.calls {
+				if strings.Contains(c, " pull") || strings.Contains(c, " up ") || strings.Contains(c, "DROP") {
+					t.Fatalf("ran %q", c)
+				}
+			}
+			if after := p.snapshot(t); !mapsEqual(before, after) {
+				t.Fatalf("the project was touched:\nbefore %v\nafter  %v", before, after)
+			}
+		})
+	}
+}
+
+// TestUpgradeDockerServedPreResetSchema: a control plane whose bundle for the
+// target release carries the pre-reset schema is refused, also when that file
+// is already the project's (nothing to replace), as before the refresh.
+func TestUpgradeDockerServedPreResetSchema(t *testing.T) {
+	p := newUpgradeProject(t, compose253, stringSchemaSQL, envAt("0.1.19"), map[string]string{"clickhouse-init.sql": stringSchemaSQL})
+	f := newFakeCompose(t)
+	f.live = liveJSONRow
+	before := p.snapshot(t)
+	out, err := upgradeIn(t, p.dir, "0.1.20", bundleAuto)
+	if err == nil || !strings.Contains(out, "Your control plane serves the pre-0.1.18 ClickHouse schema (String payload columns), which data-plane release 0.1.20 no longer writes") ||
+		!strings.Contains(out, "Update the control plane first") || strings.Contains(out, "Upgraded") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if after := p.snapshot(t); !mapsEqual(before, after) || callIndex(f.calls, " pull") >= 0 {
+		t.Fatalf("the project was touched:\nbefore %v\nafter  %v", before, after)
+	}
+}
+
+// TestUpgradeDockerRefusesAnotherType: an events table of neither generation
+// is refused whether or not the run would reset, before anything is touched.
+func TestUpgradeDockerRefusesAnotherType(t *testing.T) {
+	for _, tc := range []struct {
+		name, installed, target string
+		pending                 bool
+	}{
+		{"to a release that writes the new schema", "0.1.16", "0.1.20", false},
+		{"to a release before the reset", "0.1.16", "0.1.17", false},
+		{"same release", "0.1.20", "0.1.20", false},
+		{"an unfinished reset", "0.1.16", "0.1.20", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := envAt(tc.installed)
+			if tc.pending {
+				env = withPending(env, tc.target)
+			}
+			p := newUpgradeProject(t, compose253, jsonSchemaSQL, env, nil)
+			f := newFakeCompose(t)
+			f.live = "Map(String, String)\t" + eventsColumnMark + "\n"
+			before := p.snapshot(t)
+			out, err := upgradeAsking(t, p.dir, tc.target, bundleAuto, false, "yes\n")
+			if err == nil || !strings.Contains(out, "payload columns of type Map(String, String), neither the pre-reset (String) nor the new (JSON) schema") || strings.Contains(out, asked) {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			for _, c := range f.calls {
+				if strings.Contains(c, " pull") || strings.Contains(c, " up ") || strings.Contains(c, "DROP") {
+					t.Fatalf("ran %q", c)
+				}
+			}
+			if after := p.snapshot(t); !mapsEqual(before, after) {
+				t.Fatalf("the project was touched:\nbefore %v\nafter  %v", before, after)
+			}
+		})
+	}
+}
+
+// TestUpgradeDockerUnknownServedSchema: a reset whose schema is of neither
+// generation is refused before anything is dropped, whether it comes with
+// the refresh or is fetched.
+func TestUpgradeDockerUnknownServedSchema(t *testing.T) {
+	neither := "CREATE TABLE IF NOT EXISTS events.events (id UInt64) ENGINE = MergeTree ORDER BY id;\n"
+	for name, served := range map[string]map[string]string{
+		"with the refresh": {"clickhouse-init.sql": neither},
+		"fetched":          {"VERSION": "", "clickhouse-init.sql": neither},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := newUpgradeProject(t, compose253, stringSchemaSQL, envAt("0.1.17"), served)
+			f := newFakeCompose(t)
+			f.live = liveStringRow
+			before := p.snapshot(t)
+			out, err := upgradeAsking(t, p.dir, "0.1.20", bundleAuto, false, "yes\n")
+			if err == nil || !strings.Contains(out, "has neither the pre-reset (String) nor the new (JSON) payload columns") || strings.Contains(out, asked) {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			if after := p.snapshot(t); !mapsEqual(before, after) || callIndex(f.calls, "DROP") >= 0 || callIndex(f.calls, " pull") >= 0 {
+				t.Fatalf("the project was touched, or dropped:\nbefore %v\nafter  %v", before, after)
+			}
+		})
+	}
+}
+
+// TestUpgradeDockerLocked: a run that finds another one working on the
+// project changes nothing and asks Docker nothing.
+func TestUpgradeDockerLocked(t *testing.T) {
+	p := newUpgradeProject(t, compose253, jsonSchemaSQL, envAt("0.1.19"), nil)
+	host, _ := os.Hostname()
+	writeFile(t, filepath.Join(p.dir, projectLockFile), projectLock{pid: os.Getppid(), host: host, started: "2026-10-17T09:00:00Z", command: "origamy deploy"}.String())
+	f := newFakeCompose(t)
+	f.live = liveJSONRow
+	before := p.snapshot(t)
+	out, err := upgradeIn(t, p.dir, "0.1.20", bundleAuto)
+	if err == nil || !strings.Contains(out, "Another origamy run is working on this data plane (origamy deploy, pid ") || len(f.calls) != 0 {
+		t.Fatalf("%v, calls %v\n%s", err, f.calls, out)
+	}
+	if after := p.snapshot(t); !mapsEqual(before, after) {
+		t.Fatalf("the project was touched:\nbefore %v\nafter  %v", before, after)
+	}
+	// Once that run is over the lock is its own to remove; a run that went
+	// away without removing it (a dead pid here) is taken over, and the
+	// upgrade removes its own lock again.
+	writeFile(t, filepath.Join(p.dir, projectLockFile), projectLock{pid: deadPID(t), host: host, started: "2026-10-17T09:00:00Z", command: "origamy upgrade"}.String())
+	if out, err := upgradeIn(t, p.dir, "0.1.20", bundleAuto); err != nil || !strings.Contains(out, "Removed the lock an earlier run left") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(p.dir, projectLockFile)); !os.IsNotExist(err) {
+		t.Fatalf("the upgrade left its lock behind: %v", err)
 	}
 }

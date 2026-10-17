@@ -196,11 +196,6 @@ func TestProbeLiveSchema(t *testing.T) {
 		if !strings.HasPrefix(call, "DP_IMAGE_TAG=0.1.20 compose --project-directory /dp --env-file /dp/.env exec -T clickhouse sh -c ") || limit != clickhouseProbeTimeout {
 			t.Errorf("%s: call %q within %s", tc.name, call, limit)
 		}
-		// liveSchemaGeneration (deploy's guard) knows only the two.
-		stubDocker(t, func([]string, string, ...string) (string, error) { return tc.out, tc.err })
-		if g := liveSchemaGeneration("/dp", "/dp/.env"); (g != "") != (tc.want == "json" || tc.want == "string") {
-			t.Errorf("%s: liveSchemaGeneration = %q", tc.name, g)
-		}
 	}
 }
 
@@ -241,12 +236,8 @@ func TestEffectiveCompose(t *testing.T) {
 	if want := "DP_IMAGE_TAG=0.1.20 compose --project-directory " + dir + " " + strings.Join(files, " ") + " --env-file " + filepath.Join(dir, ".env") + " config --format json"; call != want {
 		t.Fatalf("call %q\nwant %q", call, want)
 	}
-	if cfg.Services["clickhouse"].Image != "clickhouse/clickhouse-server:24.8" || !slices.Equal(cfg.serviceVolumes("clickhouse"), []string{"dp_clickhouse-data"}) {
+	if cfg.Services["clickhouse"].Image != "clickhouse/clickhouse-server:24.8" {
 		t.Fatalf("cfg = %+v", cfg)
-	}
-	// A volume without a name of its own is <project>_<volume>.
-	if got := (composeConfig{Name: "p", Services: cfg.Services}).serviceVolumes("clickhouse"); !slices.Equal(got, []string{"p_clickhouse-data"}) {
-		t.Fatalf("volumes = %v", got)
 	}
 	// compose failing, or printing no configuration, is an error.
 	stubDocker(t, func([]string, string, ...string) (string, error) {
@@ -258,5 +249,94 @@ func TestEffectiveCompose(t *testing.T) {
 	stubDocker(t, func([]string, string, ...string) (string, error) { return "level=warning msg=x\n", nil })
 	if _, err := effectiveCompose(dir, filepath.Join(dir, ".env"), "0.1.20", files); err == nil {
 		t.Fatal("no configuration must be an error")
+	}
+}
+
+// TestAskClickHouse: a ClickHouse that does not answer is started on what the
+// project runs now (its own files, the release in .env), never the target,
+// and asked again; gen stays "" when it still cannot be asked.
+func TestAskClickHouse(t *testing.T) {
+	dc := "DP_IMAGE_TAG=0.1.16 docker compose --project-directory /dp --env-file /dp/.env "
+	for _, tc := range []struct {
+		name  string
+		setup func(*fakeCompose)
+		want  string
+		start bool
+	}{
+		{"answers", func(f *fakeCompose) { f.live = liveStringRow }, "string", false},
+		{"stopped", func(f *fakeCompose) { f.live, f.stopped = liveJSONRow, true }, "json", true},
+		{"stopped, no events table", func(f *fakeCompose) { f.stopped = true }, liveMissing, true},
+		{"hangs once", func(f *fakeCompose) { f.live, f.probeHangs = liveStringRow, 1 }, "string", true},
+		{"never answers the probe", func(f *fakeCompose) { f.live, f.probeFails = liveStringRow, true }, "", true},
+		{"never answers at all", func(f *fakeCompose) { f.stopped, f.pingFails = true, -1 }, "", true},
+		{"cannot be started", func(f *fakeCompose) { f.stopped, f.startFails = true, true }, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeCompose(t)
+			tc.setup(f)
+			var got liveSchema
+			out := captureStdout(t, func() { got = askClickHouse("/dp", "/dp/.env", "0.1.16") })
+			if got.gen != tc.want {
+				t.Fatalf("gen %q\n%s", got.gen, out)
+			}
+			up := callIndex(f.calls, "up -d clickhouse")
+			if (up >= 0) != tc.start || (up >= 0 && f.calls[up] != dc+"up -d clickhouse") {
+				t.Fatalf("calls:\n%s", strings.Join(f.calls, "\n"))
+			}
+			for _, c := range f.calls {
+				if !strings.HasPrefix(c, dc) || strings.Contains(c, " -f ") {
+					t.Fatalf("not on what the project runs now: %q", c)
+				}
+			}
+		})
+	}
+}
+
+// TestEventsTableProblem: a missing table is asked about again while the
+// init service `up -d` started is still at work, and the answer is held
+// against what the release writes.
+func TestEventsTableProblem(t *testing.T) {
+	prevTimeout, prevPoll := clickhouseReadyTimeout, clickhouseReadyPoll
+	clickhouseReadyTimeout, clickhouseReadyPoll = 2*time.Second, time.Millisecond
+	t.Cleanup(func() { clickhouseReadyTimeout, clickhouseReadyPoll = prevTimeout, prevPoll })
+	for _, tc := range []struct {
+		name         string
+		running      int    // ps lists clickhouse-init as running this many times
+		answer       string // the probe's answer once it has stopped
+		tag, problem string
+	}{
+		{"created while the init runs", 3, liveJSONRow, "0.1.20", ""},
+		{"never created", 2, "", "0.1.20", "ClickHouse holds no events table"},
+		{"the wrong generation", 0, liveStringRow, "0.1.20", "the pre-reset events table (String payload columns), which the 0.1.20 images cannot write"},
+		{"a release before the reset", 0, liveStringRow, "0.1.17", ""},
+		{"a moving tag, either generation", 0, liveStringRow, "main", ""},
+		{"a moving tag, another type", 0, "Object('json')\t" + eventsColumnMark + "\n", "main", "neither the pre-reset (String) nor the new (JSON) schema"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := 0
+			stubDocker(t, func(env []string, name string, args ...string) (string, error) {
+				switch last := args[len(args)-1]; {
+				case last == "clickhouse-init" && slices.Contains(args, "ps"):
+					if ps++; ps <= tc.running {
+						return "time=x level=warning msg=y\n" + `{"Service":"clickhouse-init","State":"running"}` + "\n", nil
+					}
+					return `{"Service":"clickhouse-init","State":"exited","ExitCode":0}` + "\n", nil
+				case last == clickhouseEventsPropertiesType:
+					if ps < tc.running {
+						return "", nil
+					}
+					return tc.answer, nil
+				}
+				return "", nil
+			})
+			var why string
+			out := captureStdout(t, func() { _, why = eventsTableProblem("/dp", "/dp/.env", tc.tag) })
+			if (why == "") != (tc.problem == "") || !strings.Contains(why, tc.problem) {
+				t.Fatalf("why %q\n%s", why, out)
+			}
+			if tc.running > 0 && ps < tc.running {
+				t.Fatalf("stopped asking while the init ran (%d)", ps)
+			}
+		})
 	}
 }

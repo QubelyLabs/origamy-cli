@@ -224,44 +224,29 @@ func TestReleaseSchemaGeneration(t *testing.T) {
 	}
 }
 
-func TestDockerSchemaResetNeeded(t *testing.T) {
+// TestDockerResetAction: what ClickHouse holds decides, nothing else; the new
+// table is never dropped.
+func TestDockerResetAction(t *testing.T) {
 	for _, c := range []struct {
-		name                         string
-		installed, gen, live, target string
-		want                         bool
+		live, target string
+		drop, create bool
 	}{
-		// CLI v0.1.15–v0.1.18 pinned :main; what the schema file says decides.
-		{"main on the String schema", "main", "string", "", "0.1.20", true},
-		{"main on the JSON schema", "main", "json", "", "0.1.20", false},
-		{"main, ClickHouse holds String", "main", "unknown", "string", "0.1.20", true},
-		{"release before the reset", "0.1.16", "string", "", "0.1.20", true},
-		{"release before the reset, schema file gone", "0.1.16", "unknown", "", "0.1.20", true},
-		// An upgrade by an earlier CLI moved the tag and the file but left the
-		// old table: the running ClickHouse says so.
-		{"tag and file moved, table did not", "0.1.20", "json", "string", "0.1.20", true},
-		{"already across", "0.1.19", "json", "json", "0.1.20", false},
-		{"already across, ClickHouse not running", "0.1.19", "json", "", "0.1.20", false},
-		// The new table is never dropped, whatever the schema file and the
-		// tags say: an operator can have put the pre-reset file back.
-		{"String file, ClickHouse holds JSON, same release", "0.1.20", "string", "json", "0.1.20", false},
-		{"String file, ClickHouse holds JSON, 0.1.19", "0.1.19", "string", "json", "0.1.20", false},
-		{"String file, ClickHouse holds JSON, main", "main", "string", "json", "0.1.20", false},
-		{"before the reset by tag, ClickHouse holds JSON", "0.1.16", "string", "json", "0.1.20", false},
-		{"edge, ClickHouse holds JSON", "0.1.16", "string", "json", dockerEdgeTag, false},
-		// The old table resets whatever the file says.
-		{"JSON file, ClickHouse holds String", "0.1.19", "json", "string", "0.1.20", true},
-		// Only a ClickHouse that cannot say lets the file and tags decide.
-		{"no events table, String file", "0.1.20", "string", liveMissing, "0.1.20", true},
-		{"no events table, JSON file", "0.1.20", "json", liveMissing, "0.1.20", false},
-		{"another type, String file", "0.1.20", "string", liveOther, "0.1.20", true},
-		{"edge from a pre-reset project", "0.1.16", "string", "", dockerEdgeTag, true},
-		{"edge on the JSON schema", dockerEdgeTag, "json", "", dockerEdgeTag, false},
-		// A target that does not write JSON never resets.
-		{"to a pre-reset release", "0.1.16", "string", "", "0.1.17", false},
-		{"to a moving tag of unknown schema", "0.1.16", "string", "", "main", false},
+		{"string", "0.1.20", true, false},
+		{"string", dockerEdgeTag, true, false},
+		{liveMissing, "0.1.20", false, true},
+		{liveMissing, "0.1.18", false, true},
+		{"json", "0.1.20", false, false},
+		{"json", dockerEdgeTag, false, false},
+		{liveOther, "0.1.20", false, false},
+		{"", "0.1.20", false, false},
+		// A target that does not write JSON never resets, whatever is there.
+		{"string", "0.1.17", false, false},
+		{liveMissing, "0.1.17", false, false},
+		{"string", "main", false, false},
+		{liveMissing, "sha-881359f", false, false},
 	} {
-		if got := dockerSchemaResetNeeded(c.installed, c.gen, c.live, c.target); got != c.want {
-			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		if drop, create := dockerResetAction(c.live, c.target); drop != c.drop || create != c.create {
+			t.Errorf("%q → %s: drop %v create %v, want %v %v", c.live, c.target, drop, create, c.drop, c.create)
 		}
 	}
 }

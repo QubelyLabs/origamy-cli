@@ -90,7 +90,7 @@ func normalizeArch(a string) string {
 
 // dockerArch returns the Docker engine's CPU architecture, "" if unknown.
 func dockerArch() string {
-	out, err := runCaptured("docker", "info", "--format", "{{.Architecture}}")
+	out, err := dockerRun(nil, "docker", "info", "--format", "{{.Architecture}}")
 	if err != nil {
 		return ""
 	}
@@ -280,28 +280,20 @@ func releaseSchemaGeneration(tag string) string {
 	return "unknown"
 }
 
-// dockerSchemaResetNeeded reports whether moving a Docker project to tag
-// crosses the storage reset. What the running ClickHouse holds (liveGen, see
-// probeLiveSchema) decides when it says: the pre-reset String columns mean a
-// reset for a target that writes JSON, and the JSON ones never do, whatever
-// the project's clickhouse-init.sql or tags say (an operator can have put the
-// pre-reset file back over a plane that is already across). Only when it
-// cannot say (not running, no events table, another type) do the project's
-// own clickhouse-init.sql (installedGen, what its table was created from) and
-// the release numbers (crossesSchemaReset) decide. That catches a project
-// deployed by CLI v0.1.15–v0.1.18, whose tag is the moving `main`, and one
-// whose schema file is gone.
-func dockerSchemaResetNeeded(installedTag, installedGen, liveGen, tag string) bool {
+// dockerResetAction says what moving a Docker project to tag does with its
+// events table, from what the running ClickHouse holds (liveGen, see
+// probeLiveSchema) and nothing else: neither the project's
+// clickhouse-init.sql nor the tags decide, since an earlier upgrade can have
+// moved them on and left the table behind, and an operator can have put the
+// pre-reset file back over a plane that is across. A target that writes the
+// new (JSON) schema drops the pre-reset String table (drop, asked first) and
+// creates a missing one (create, nothing to ask); the new table is never
+// dropped, and a target that does not write JSON never resets.
+func dockerResetAction(liveGen, tag string) (drop, create bool) {
 	if releaseSchemaGeneration(tag) != "json" {
-		return false
+		return false, false
 	}
-	switch liveGen {
-	case "json":
-		return false
-	case "string":
-		return true
-	}
-	return installedGen == "string" || crossesSchemaReset(installedTag, tag)
+	return liveGen == "string", liveGen == liveMissing
 }
 
 // minClickHouseForJSON is the first ClickHouse release whose JSON column type

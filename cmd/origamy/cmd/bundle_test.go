@@ -83,6 +83,24 @@ func writeFile(t *testing.T, path, body string) {
 	}
 }
 
+// recordDeployedBundle writes the manifest a deploy leaves for the bundle
+// files now in dir, from the release the control plane said they are for
+// ("" when it predates /byod/VERSION).
+func recordDeployedBundle(dir, version string) error {
+	m := bundleManifest{Version: version, Files: map[string]string{}, Releases: map[string]string{}}
+	for _, name := range bundleFiles {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+		m.Files[name] = sha256Hex(b)
+		if version != "" {
+			m.Releases[name] = version
+		}
+	}
+	return writeBundleManifest(dir, m)
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -916,29 +934,51 @@ func TestBundleManifest(t *testing.T) {
 		t.Fatalf("a corrupt manifest must read as empty: %+v", m)
 	}
 
+	// A deploy takes the bundle as a refresh that replaces everything; the
+	// manifest records every file, and their release only when the control
+	// plane says which it is.
+	served := map[string]string{}
 	for _, name := range bundleFiles {
-		writeFile(t, filepath.Join(dir, name), name+" body\n")
+		served[name] = name + " body\n"
 	}
-	if err := recordDeployedBundle(dir, ""); err != nil {
-		t.Fatal(err)
+	base := fakeControlPlane(t, served)
+	fakeDocker(t)
+	for _, version := range []string{"", "0.1.20"} {
+		r, err := prepareBundleRefresh(dir, base, version, "", true, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.apply(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.commit(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	m := readBundleManifest(dir)
-	if m.Version != "" || len(m.Files) != len(bundleFiles) || m.Files["Caddyfile"] != sha256Hex([]byte("Caddyfile body\n")) {
+	if m.Version != "0.1.20" || len(m.Files) != len(bundleFiles) || m.Files["Caddyfile"] != sha256Hex([]byte("Caddyfile body\n")) {
 		t.Fatalf("deploy manifest = %+v", m)
 	}
 	raw := readFile(t, filepath.Join(dir, bundleManifestFile))
-	if !strings.Contains(raw, `"version": ""`) || !strings.Contains(raw, `"files": {`) {
+	if !strings.Contains(raw, `"version": "0.1.20"`) || !strings.Contains(raw, `"files": {`) {
 		t.Fatalf("manifest format: %s", raw)
 	}
-
-	if len(m.Releases) != 0 {
-		t.Fatalf("a bundle of no known release records none: %+v", m.Releases)
+	if len(m.Releases) != len(bundleFiles) || m.Releases["Caddyfile"] != "0.1.20" {
+		t.Fatalf("deploy manifest releases = %+v", m.Releases)
 	}
-	if err := recordDeployedBundle(dir, "0.1.20"); err != nil {
+	unknown := t.TempDir()
+	r, err := prepareBundleRefresh(unknown, base, "", "", true, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if m = readBundleManifest(dir); len(m.Releases) != len(bundleFiles) || m.Releases["Caddyfile"] != "0.1.20" {
-		t.Fatalf("deploy manifest releases = %+v", m.Releases)
+	if err := r.apply(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.commit(); err != nil {
+		t.Fatal(err)
+	}
+	if u := readBundleManifest(unknown); u.Version != "" || len(u.Files) != len(bundleFiles) || len(u.Releases) != 0 {
+		t.Fatalf("a bundle of no known release records none: %+v", u)
 	}
 
 	// The storage reset rewrites the schema outside a refresh, from a control

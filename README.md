@@ -85,7 +85,20 @@ disturb the core.
   pins the images to a release. The two diverged in the 2026-08 storage reset
   (payload columns became native JSON): releases up to 0.1.17 cannot write the
   current schema, so `deploy` refuses that pairing instead of bringing up a
-  plane that looks Connected and drops every event at insert.
+  plane that looks Connected and drops every event at insert. For a plane
+  that already runs, what its ClickHouse holds decides (see the storage
+  reset below), and after `up -d` both `deploy` and `upgrade` check that
+  `events.events` exists and is the generation the release writes; when it
+  is not, the run fails instead of reporting success.
+- **In-place deploy (Docker).** Re-running `deploy` in a project downloads
+  the bundle into a directory next to it, runs every check (and the
+  questions) and redeems the token first, and only then swaps the files in,
+  each one it replaces backed up as `<file>.bak-<release>`. A refused deploy,
+  or one whose enrollment fails, leaves the project byte for byte as it was.
+- **One run at a time (Docker).** `upgrade` and `deploy` hold
+  `.origamy.lock` in the project directory (created exclusively; it records
+  the pid, host and start time). Another run is refused with what holds it;
+  a lock left by a process on this host that is gone is taken over.
 
 ## What a deploy does with secrets
 
@@ -174,15 +187,22 @@ Two release boundaries the CLI knows about:
   event history collected so far (profiles, traits, segments and journeys
   are kept). `origamy upgrade` explains this, asks for a typed `yes`
   (`--yes` skips it), then drops and recreates the table itself. On Docker
-  the running ClickHouse decides, not the tag: String payload columns cross
-  the reset, and a table that already has the JSON columns is never dropped,
-  whatever `clickhouse-init.sql` or the tags say. Only when ClickHouse cannot
-  be asked (stopped, no events table, no answer within 20 s) do the project's
-  `clickhouse-init.sql` and the release numbers decide, which covers projects
-  deployed by CLI v0.1.15–v0.1.18 (`DP_IMAGE_TAG=main`); the reset asks
-  ClickHouse again once it is up and drops the table only if it is the String
-  one. It is done only once ClickHouse reports the JSON table (the bundle's
-  init service exits 0 even when a statement fails).
+  the running ClickHouse decides, never the tags or `clickhouse-init.sql`
+  (projects deployed by CLI v0.1.15–v0.1.18 run `DP_IMAGE_TAG=main`, and an
+  earlier upgrade or deploy can have moved the files on): for a release that
+  writes JSON, String payload columns cross the reset (asked first) and a
+  missing events table is created with the new schema (nothing is dropped,
+  so nothing is asked). A table that already has the JSON columns is never
+  dropped, and moving it to a release before 0.1.18 is refused, as is an
+  events table of any other type. A ClickHouse that does not answer
+  (stopped, hung, no container) is started with `up -d clickhouse` on the
+  release and compose files the project runs now and asked again; when it
+  still cannot be asked, the upgrade is refused rather than guessing. The
+  reset asks ClickHouse again once it is up on the new bundle and drops the
+  table only if it is the String one, and only when `clickhouse-init.sql` is
+  the new schema (a served schema of neither generation is refused before
+  anything is dropped). It is done only once ClickHouse reports the JSON
+  table (the bundle's init service exits 0 even when a statement fails).
   The reset needs ClickHouse 25.3, so it only runs when the compose
   configuration the project would run (override files and `COMPOSE_FILE`
   included, as `docker compose config` renders it) has `clickhouse-server`
@@ -199,6 +219,9 @@ Two release boundaries the CLI knows about:
   table, the record is cleared without dropping or asking anything. Either
   way `clickhouse` (and `caddy` with the ingress profile) are restarted, since
   the run that began the reset may have replaced the files they mount.
+  Every upgrade, reset or not, ends with the check after `up -d`: a missing
+  or String table under a release that writes JSON fails the run and is
+  recorded as `ORIGAMY_RESET_PENDING`, so the next run finishes it.
 
 ### Docker bundle refresh
 
@@ -222,6 +245,9 @@ plane, another `--version`, `--channel edge`) it says so and only moves
   written as `<file>.new` (removed again once the file itself is the served
   version); `--replace-bundle` replaces it anyway (backed up, and named in the
   output), `--keep-bundle` skips the refresh.
+- A control plane whose bundle for the target release carries the
+  pre-reset (String) schema is refused, also when that file is already the
+  project's, as the CLI did before the refresh existed.
 - The new compose file must pass `docker compose config -q` against your
   `.env` first, and the images are pulled with it (new services' too) before
   any file is replaced, so a failed pull leaves the project as it was. A

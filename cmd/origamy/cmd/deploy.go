@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -93,7 +94,14 @@ verify. --require-signed-config (` + minSigningVersion + `+) makes the services 
 start without the key.
 
 Re-running deploy inside an existing ./origamy-dp-<id>/ re-deploys that plane
-in place, keeping its generated passwords and data.`,
+in place, keeping its generated passwords and data. The bundle is downloaded
+next to the project and swapped in only once every check passed and the
+token was redeemed (each file it replaces backed up as <file>.bak-<release>),
+so a refused deploy leaves the project as it was. What the plane's ClickHouse
+holds is asked first, as in 'origamy upgrade' (it is started when it does
+not answer; the deploy is refused when it still cannot be asked), and once
+the services are up, deploy checks that ClickHouse holds the events table
+the release writes.`,
 	Example: `  origamy deploy --token dpe_xxx
   origamy deploy --token dpe_xxx --enable-ai
   origamy deploy --token dpe_xxx --datastore-auth
@@ -179,6 +187,11 @@ func runDeploy(raw, target string, enableAI, aiSet, datastoreAuth, requireSigned
 		kp, err = planKubernetes(dpVersion, enableAI, aiSet, datastoreAuth, docker)
 	} else {
 		dp, err = planDocker(dpVersion, enableAI, aiSet, peek.ID, peek.URL)
+		if dp != nil {
+			// The download and the lock go once the deploy is over; until
+			// the token is redeemed, the project's files are as they were.
+			defer dp.close()
+		}
 	}
 	if err != nil {
 		return err
@@ -774,28 +787,39 @@ func hasDocker() bool {
 // and checked against the release.
 type dockerPlan struct {
 	imageTag string
-	// dir is the project directory (created by the plan). existingID is set
-	// when it already held this plane: the deploy then happens in place,
-	// keeping the generated passwords (the datastores hold data under them)
-	// and the operator's own .env additions.
+	// dir is the project directory (absolute; created by the plan).
+	// existingID is set when it already held this plane: the deploy then
+	// happens in place, keeping the generated passwords (the datastores hold
+	// data under them) and the operator's own .env additions.
 	dir           string
 	existingID    string
 	fullProfile   bool
 	aiEnabled     bool
 	ingestDomain  string
 	requireSigned bool
-	// resetPending is the target of a storage reset an earlier upgrade began
-	// here and did not finish (resetPendingVar): this deploy finishes it.
-	// resetDone: ClickHouse already holds the new events table, so finishing
-	// it drops nothing (and nothing was asked).
-	resetPending string
-	resetDone    bool
+	// bundle is the control plane's bundle, downloaded into a directory in
+	// the project and swapped in by applyDocker only once every check passed
+	// and the token was redeemed: a refused or failed plan leaves the
+	// project's files as they were.
+	bundle *bundleRefresh
+	// resetPending is the release a storage reset is recorded under that this
+	// deploy finishes before the services start: one an earlier upgrade began
+	// here and did not finish (resetPendingVar), or, for a plane whose
+	// ClickHouse has no events table, imageTag (the table is created).
+	// resetFound is what ClickHouse held when the plan was made
+	// (resetDockerEvents).
+	resetPending, resetFound string
+	// close removes what the plan put in the project — the download, the
+	// lock, a directory it created and nothing filled — once the deploy is
+	// over, whatever its outcome (or when a prompt ends the CLI).
+	close func()
 }
 
 // planDocker runs the preflight checks, downloads the bundle and asks every
 // question for a Docker install of plane id, whose control plane is at base.
 // The current directory is used when it is already this plane's project;
 // otherwise ./origamy-dp-<id>/, reused when it exists from an earlier deploy.
+// A plane deployed there already is asked what its ClickHouse holds first.
 func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*dockerPlan, error) {
 	ui.Title("Target")
 	ui.Success("Docker detected")
@@ -810,11 +834,7 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 	// — Directory ————————————————————————————————————————————————————————
 	switch cwdID := existingProjectID("."); {
 	case cwdID == id:
-		wd, err := os.Getwd()
-		if err != nil {
-			return nil, fail("Could not read the working directory.", err.Error())
-		}
-		p.dir, p.existingID = wd, id
+		p.dir, p.existingID = ".", id
 	case cwdID != "":
 		return nil, fail(fmt.Sprintf("This directory holds data plane %s, but the token enrolls %s.", cwdID, id),
 			"Run deploy from the parent directory to create ./origamy-dp-"+id+"/ for the new plane, or uninstall the old one first.")
@@ -824,47 +844,98 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 			p.existingID = id
 		}
 	}
+	abs, err := filepath.Abs(p.dir)
+	if err != nil {
+		return nil, fail("Could not read the working directory.", err.Error())
+	}
+	p.dir = abs
 	envPath := filepath.Join(p.dir, ".env")
 	if p.existingID != "" {
 		ui.Step("Data plane %s is already deployed in ./%s — it will be re-deployed in place, keeping its passwords, data and extra .env settings.", ui.Bold(id), filepath.Base(p.dir))
 	}
+
+	// One run at a time on a project (lock.go). Everything the plan puts in
+	// it until the token is redeemed is removed again on the way out.
+	_, statErr := os.Stat(p.dir)
+	created := errors.Is(statErr, os.ErrNotExist)
+	if err := os.MkdirAll(p.dir, 0o755); err != nil {
+		return nil, fail("Could not create the working directory.", err.Error())
+	}
+	unlock, err := lockProject(p.dir, "origamy deploy")
+	if err != nil {
+		if created {
+			_ = os.Remove(p.dir)
+		}
+		return nil, lockFail(err, "Nothing has been enrolled or installed.")
+	}
+	p.close = onExit(func() {
+		if p.bundle != nil {
+			p.bundle.cleanup()
+		}
+		unlock()
+		if created {
+			_ = os.Remove(p.dir) // only while nothing was put in it
+		}
+	})
+	refuse := func(err error) (*dockerPlan, error) {
+		p.close()
+		return nil, err
+	}
+	nothing := "Nothing has been enrolled or installed."
 
 	// — Bundle ——————————————————————————————————————————————————————————
 	// The whole bundle (compose + ClickHouse schema/users config + the
 	// Caddyfile) is served by the control plane at /byod/*. The Caddyfile is
 	// fetched even without a domain: it is inert until the "ingress" profile
 	// is on, and a later `up` with the profile added would otherwise turn the
-	// missing bind-mount source into an empty directory and crash Caddy.
-	if err := os.MkdirAll(p.dir, 0o755); err != nil {
-		return nil, fail("Could not create the working directory.", err.Error())
+	// missing bind-mount source into an empty directory and crash Caddy. It
+	// waits in a directory in the project until applyDocker swaps it in, with
+	// the release the control plane says it is for recorded so `origamy
+	// upgrade` can tell these files from later edits here.
+	if p.existingID != "" {
+		if stale := removeStaleBundleDirs(p.dir); len(stale) > 0 {
+			ui.Step("Removed the bundle download an interrupted run left behind (%s).", strings.Join(stale, ", "))
+		}
 	}
 	sp := ui.Start("Downloading the deploy bundle")
-	for _, f := range bundleFiles {
-		if err := fetchBundleFile(base, f, p.dir); err != nil {
-			sp.Fail("Could not download %s", f)
-			if errors.Is(err, errNotServed) {
-				return nil, fail(fmt.Sprintf("Your control plane does not serve %s.", f),
-					"It predates this CLI's deploy bundle — upgrade the control plane, or deploy with an older CLI.")
-			}
-			return nil, fail(fmt.Sprintf("Could not download %s from your control plane (%s).", f, base),
-				err.Error()+"\nCheck that this host reaches the control plane over HTTPS (DNS, proxy, firewall), then retry with the same token: nothing has been enrolled.")
-		}
-	}
-	sp.Success("Bundle downloaded (%s)", strings.Join(bundleFiles, ", "))
-	// Record what was downloaded, and for which release when the control plane
-	// says, so `origamy upgrade` can tell these files from later edits here.
 	served, _ := servedBundleVersion(base)
-	if err := recordDeployedBundle(p.dir, served); err != nil {
-		ui.Warn("Could not write %s (%v); `origamy upgrade` falls back to the bundle versions it knows.", bundleManifestFile, err)
-	}
-
-	// — Unfinished storage reset ——————————————————————————————————————
-	if p.existingID != "" {
-		pending, done, err := deployPendingReset(p.dir, imageTag)
-		if err != nil {
-			return nil, err
+	r, err := prepareBundleRefresh(p.dir, base, served, readEnvVar(envPath, "DP_IMAGE_TAG"), true, nil)
+	if err != nil {
+		name := "the deploy bundle"
+		if fe := (*bundleFileError)(nil); errors.As(err, &fe) {
+			name = fe.name
 		}
-		p.resetPending, p.resetDone = pending, done
+		sp.Fail("Could not download %s", name)
+		if errors.Is(err, errNotServed) {
+			return refuse(fail(fmt.Sprintf("Your control plane does not serve %s.", name),
+				"It predates this CLI's deploy bundle — upgrade the control plane, or deploy with an older CLI. "+nothing))
+		}
+		return refuse(fail(fmt.Sprintf("Could not download %s from your control plane (%s).", name, base),
+			err.Error()+"\nCheck that this host reaches the control plane over HTTPS (DNS, proxy, firewall), then retry with the same token: nothing has been enrolled."))
+	}
+	p.bundle = r
+	sp.Success("Bundle downloaded (%s)", strings.Join(bundleFiles, ", "))
+
+	// — What ClickHouse holds ———————————————————————————————————————————
+	// For a plane that already runs, what its volume holds decides, as in the
+	// upgrade: ClickHouse is started on the release it runs now when it does
+	// not answer, and the deploy is refused when it still cannot be asked. A
+	// storage reset an earlier upgrade left unfinished is finished, and a
+	// missing table created, before the services start (deployResetPlan).
+	live := liveSchema{}
+	if p.existingID != "" {
+		live = askClickHouse(p.dir, envPath, readEnvVar(envPath, "DP_IMAGE_TAG"))
+		switch {
+		case live.gen == "":
+			return refuse(fail("ClickHouse could not be asked which events table this plane holds, so what deploying over it does to the table cannot be checked.",
+				outputHint(live.out)+"Check: docker compose --project-directory "+p.dir+" --env-file "+envPath+" logs clickhouse\nOnce it answers, rerun deploy with the same token. "+nothing))
+		case live.gen == liveOther:
+			return refuse(fail(fmt.Sprintf("ClickHouse's %s here has payload columns of type %s, neither the pre-reset (String) nor the new (JSON) schema, which no release writes.", eventsTable, live.typ),
+				"Check what created it, and drop it yourself if it should be recreated with the new schema; then rerun deploy. "+nothing))
+		}
+		if p.resetPending, p.resetFound, err = deployResetPlan(p.dir, imageTag, live, r); err != nil {
+			return refuse(err)
+		}
 	}
 
 	// — Schema guard ————————————————————————————————————————————————————
@@ -873,17 +944,13 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 	// drops every event at insert — refuse it here rather than find out later.
 	// For a plane that already runs, what its volume holds beats what a fresh
 	// volume would get, unless the reset above is about to replace it.
-	live := ""
-	if p.existingID != "" && (p.resetPending == "" || p.resetDone) {
-		live = liveSchemaGeneration(p.dir, envPath)
-	}
-	if live != "" {
-		if why := liveSchemaMismatch(live, imageTag); why != "" {
-			return nil, fail(why, "")
+	if live.known() && p.resetPending == "" {
+		if why := liveSchemaMismatch(live.gen, imageTag); why != "" {
+			return refuse(fail(why, nothing))
 		}
-	} else if servedSQL, err := os.ReadFile(filepath.Join(p.dir, "clickhouse-init.sql")); err == nil {
-		if why := bundleSchemaMismatch(string(servedSQL), imageTag); why != "" {
-			return nil, fail(why, "Pass --version <release> to install a matching data-plane release, or ask Origamy which release your control plane expects.")
+	} else if sql, err := os.ReadFile(bundlePath(r, "clickhouse-init.sql")); err == nil {
+		if why := bundleSchemaMismatch(string(sql), imageTag); why != "" {
+			return refuse(fail(why, "Pass --version <release> to install a matching data-plane release, or ask Origamy which release your control plane expects. "+nothing))
 		}
 	}
 
@@ -933,56 +1000,75 @@ func planDocker(imageTag string, enableAI, aiSet bool, id, base string) (*docker
 	return p, nil
 }
 
-// deployPendingReset handles a storage reset an earlier upgrade began in the
-// project dir and did not finish (resetPendingVar): the events table may be
-// the old one or gone, so the re-deploy finishes it before the services
-// start. What ClickHouse holds decides, as in the upgrade: when it is the new
-// table already (done), nothing is dropped or asked and only the record is
-// cleared; otherwise the bundle just downloaded must be able to finish it
-// for imageTag and the operator must agree, like the upgrade asks. It
-// returns the reset's target ("" when none is pending). Nothing has been
+// bundlePath is where bundle file name is once refresh r is swapped in: the
+// served version (from the download directory) unless r keeps the
+// project's own.
+func bundlePath(r *bundleRefresh, name string) string {
+	if r.served(name) {
+		return filepath.Join(r.tmp, name)
+	}
+	return filepath.Join(r.dir, name)
+}
+
+// deployResetPlan decides what an in-place deploy of imageTag does with the
+// events table before the services start, from what the project's ClickHouse
+// holds (live) and the bundle downloaded for the deploy (r). It finishes a
+// storage reset an earlier upgrade began here and did not finish
+// (resetPendingVar), and creates a missing table for a release that writes
+// the new schema. It returns the release the reset is recorded under ("" for
+// nothing to do) and what ClickHouse held (found, for resetDockerEvents).
+// When that is the new table, a recorded reset is finished without dropping
+// or asking anything; the pre-reset table is dropped only for a recorded
+// reset, once the operator agreed like the upgrade asks (without a record,
+// liveSchemaMismatch points at the upgrade). The bundle must be able to
+// create the table: ClickHouse 25.3 and the new schema. Nothing has been
 // enrolled when it refuses.
-func deployPendingReset(dir, imageTag string) (pending string, done bool, err error) {
+func deployResetPlan(dir, imageTag string, live liveSchema, r *bundleRefresh) (target, found string, err error) {
 	envPath := filepath.Join(dir, ".env")
-	pending = readEnvVar(envPath, resetPendingVar)
-	if pending == "" {
-		return "", false, nil
+	pending := readEnvVar(envPath, resetPendingVar)
+	_, create := dockerResetAction(live.gen, imageTag)
+	if pending == "" && !create {
+		return "", "", nil
 	}
-	finish := upgradeCommand(pending) + " (in ./" + filepath.Base(dir) + ")"
-	if releaseSchemaGeneration(imageTag) != "json" {
-		return "", false, fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env), and %s.", pending, resetPendingVar, cannotFinishReset(imageTag)),
-			"Finish it first: "+finish+". Nothing has been enrolled or installed.")
+	nothing := "Nothing has been enrolled or installed."
+	what := fmt.Sprintf("ClickHouse here has no events table, which this deploy would create with the %s schema", imageTag)
+	finish := upgradeCommand(imageTag) + " (in ./" + filepath.Base(dir) + ")"
+	if pending != "" {
+		what = fmt.Sprintf("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env)", pending, resetPendingVar)
+		finish = upgradeCommand(pending) + " (in ./" + filepath.Base(dir) + ")"
+		if releaseSchemaGeneration(imageTag) != "json" {
+			return "", "", fail(what+", and "+cannotFinishReset(imageTag)+".", "Finish it first: "+finish+". "+nothing)
+		}
+		if live.gen == "json" {
+			ui.Step("An earlier upgrade to %s recorded an unfinished storage reset here (%s in .env), but ClickHouse already holds the new events table (%s payload columns): nothing is dropped, and the record is cleared once the services are up.", pending, resetPendingVar, live.typ)
+			return pending, live.gen, nil
+		}
 	}
-	live := probeLiveSchema(dir, envPath, nil)
-	switch live.gen {
-	case "json":
-		ui.Step("An earlier upgrade to %s recorded an unfinished storage reset here (%s in .env), but ClickHouse already holds the new events table (%s payload columns): nothing is dropped, and the record is cleared once the services are up.", pending, resetPendingVar, live.typ)
-		return pending, true, nil
-	case liveOther:
-		return "", false, fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here, and ClickHouse's %s has payload columns of type %s, neither the pre-reset (String) nor the new (JSON) schema; the reset drops only the pre-reset table.", pending, eventsTable, live.typ),
-			"Check what created it, and drop it yourself if it should be recreated with the new schema; then rerun deploy. Nothing has been enrolled or installed.")
-	}
-	why, culprit, cfg, cerr := resetComposeProblem(dir, envPath, imageTag, nil)
-	initSQL, _ := os.ReadFile(filepath.Join(dir, "clickhouse-init.sql"))
+	why, culprit, cerr := resetComposeProblem(dir, envPath, imageTag, r)
+	initSQL, _ := os.ReadFile(bundlePath(r, "clickhouse-init.sql"))
 	switch {
 	case cerr != nil:
-		return "", false, fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env), and docker compose could not render this project's configuration to tell which ClickHouse it runs.", pending, resetPendingVar),
-			cerr.Error()+"\nFix the compose files or .env, then rerun deploy. Nothing has been enrolled or installed.")
+		return "", "", fail(what+", and docker compose could not render this project's configuration to tell which ClickHouse it runs.",
+			cerr.Error()+"\nFix the compose files or .env, then rerun deploy. "+nothing)
 	case len(culprit) > 0:
-		headline, hint := resetComposeRefusal(dir, pending, nil, "", why, culprit, nil)
-		return "", false, fail(headline, strings.Replace(hint, "rerun `"+upgradeCommand(pending)+"`. Nothing has been changed.", "rerun deploy. Nothing has been enrolled or installed.", 1))
-	case why != "" || schemaGeneration(string(initSQL)) == "string":
-		return "", false, fail(fmt.Sprintf("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env), and your control plane's bundle predates the reset, so it cannot finish it.", pending, resetPendingVar),
-			"Update the control plane, then rerun deploy, or run "+finish+". Nothing has been enrolled or installed.")
+		headline, hint := resetComposeRefusal(dir, imageTag, nil, "", why, culprit, nil)
+		return "", "", fail(headline, strings.Replace(hint, "rerun `"+upgradeCommand(imageTag)+"`. Nothing has been changed.", "rerun deploy. "+nothing, 1))
+	case why != "" || schemaGeneration(string(initSQL)) != "json":
+		return "", "", fail(what+", and your control plane's bundle cannot do it: it needs ClickHouse "+minClickHouseForJSON+" and the new schema (native JSON payload columns).",
+			"Update the control plane, then rerun deploy, or run "+finish+". "+nothing)
 	}
-	note := ""
-	if !live.known() {
-		note = liveResetNote(live, existingVolumes(cfg.serviceVolumes("clickhouse")))
+	switch {
+	case live.gen == "string":
+		if !confirmResumedReset(pending, imageTag, false) {
+			return "", "", fail("Cancelled.", nothing)
+		}
+	case pending != "":
+		ui.Step("An earlier upgrade to %s began the storage reset here and did not finish it (%s in .env). ClickHouse has no events table now, so nothing is dropped: this deploy creates it with the new schema before the services start.", pending, resetPendingVar)
+	default:
+		ui.Step("ClickHouse here has no events table: this deploy creates it with the new schema before the services start; nothing is dropped.")
+		pending = imageTag
 	}
-	if !confirmResumedReset(pending, imageTag, false, note) {
-		return "", false, fail("Cancelled.", "Nothing has been enrolled or installed.")
-	}
-	return pending, false, nil
+	return pending, live.gen, nil
 }
 
 // applyDocker installs the plane described by p for the enrolled token.
@@ -996,6 +1082,39 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 		ui.Success("Re-deploying in ./%s", dir)
 	} else {
 		ui.Success("Working directory ./%s", dir)
+	}
+
+	// The bundle downloaded with the plan goes in now that every check passed
+	// and the token was redeemed. A file it replaces is backed up as
+	// <file>.bak-<release> (an edited one too); a symbolic link or a
+	// directory with files in it is the operator's own and is kept, the
+	// served version next to it as <file>.new.
+	b := p.bundle
+	if err := b.apply(); err != nil {
+		if rerr := b.rollback(); rerr != nil {
+			return fail("Could not put the deploy bundle in place, nor the previous files back.",
+				err.Error()+"\n"+rerr.Error()+"\nThe backups are next to them in ./"+dir+" (*.bak-*).")
+		}
+		return fail("Could not put the deploy bundle in place; the previous files were put back.",
+			err.Error()+"\nFix the cause, then rerun deploy here with a fresh token.")
+	}
+	if err := b.commit(); err != nil {
+		ui.Warn("Could not record the bundle in %s (%v); `origamy upgrade` falls back to the bundle versions it knows.", bundleManifestFile, err)
+	}
+	var backups []string
+	for _, f := range b.files {
+		switch {
+		case f.edited:
+			ui.Warn("Replaced your edited %s with your control plane's version; yours is backed up as %s", f.name, filepath.Base(f.backup))
+		case f.backup != "":
+			backups = append(backups, filepath.Base(f.backup))
+		}
+	}
+	if len(backups) > 0 {
+		ui.Step("Replaced %s with your control plane's version; the previous ones are backed up (%s).", strings.Join(b.changed(), ", "), strings.Join(backups, ", "))
+	}
+	for _, name := range b.kept() {
+		ui.Warn("Kept %s (not a regular file, so the operator's own); your control plane's version is next to it as %s.new", name, name)
 	}
 
 	// Secrets are generated HERE, in the customer's environment, and written to
@@ -1080,16 +1199,21 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 		ui.Success("Wrote mTLS identity (certs/tls.crt, tls.key, ca.crt)")
 	}
 
-	// The storage reset an earlier upgrade left unfinished, on the bundle just
-	// downloaded, before anything runs on the new release.
+	// The storage reset an earlier upgrade left unfinished, or the missing
+	// events table, on the bundle just swapped in, before anything runs on
+	// the new release. Recorded in .env first (mergeEnv kept an earlier
+	// record), so a failure is finished by the next run.
+	envPath := filepath.Join(p.dir, ".env")
 	outcome := resetNone
 	if p.resetPending != "" {
 		ui.Title("Storage reset")
-		wd, err := os.Getwd()
-		if err != nil {
-			return fail("Could not read the working directory.", err.Error())
+		if readEnvVar(envPath, resetPendingVar) == "" {
+			if err := setEnvVar(envPath, resetPendingVar, p.resetPending); err != nil {
+				return fail("Could not update .env.", err.Error())
+			}
 		}
-		if outcome, err = resetDockerEvents(wd, filepath.Join(wd, ".env"), p.imageTag, !p.resetDone); err != nil {
+		var err error
+		if outcome, err = resetDockerEvents(p.dir, envPath, p.imageTag, p.resetFound); err != nil {
 			return err
 		}
 	}
@@ -1099,17 +1223,36 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	// Profiles come from COMPOSE_PROFILES in .env, so every later compose
 	// invocation (upgrade/status) sees the same service set. --remove-orphans
 	// stops the containers of a profile a re-deploy just turned off.
-	if out, err := runCaptured("docker", "compose", "--env-file", ".env", "up", "-d", "--remove-orphans"); err != nil {
+	if out, err := dockerRun(nil, "docker", "compose", "--env-file", ".env", "up", "-d", "--remove-orphans"); err != nil {
 		sp.Fail("docker compose failed")
 		return diagnoseDocker(out, "rerun `docker compose --env-file .env up -d` in ./"+dir)
 	}
 	sp.Success("Services started")
-	// The upgrade that began the reset may have swapped bundle files under
-	// the services that bind-mount them (bundleMountServices) and stopped
-	// before restarting them; the reset is finished once they were.
+	// Compose recreates a container when its definition changes, not when a
+	// file it bind-mounts does: the services whose files the deploy replaced
+	// are restarted. The upgrade that began a reset may have swapped bundle
+	// files under them and stopped before restarting them too; the reset is
+	// finished once they were.
+	var restarts []string
+	if p.existingID != "" {
+		restarts = b.restarts(profiles)
+	}
 	if p.resetPending != "" {
-		if restartMounts(bundleMountServices(profiles), "--env-file", ".env") {
-			if err := clearResetRecord(".env", p.imageTag); err != nil {
+		for _, svc := range bundleMountServices(profiles) {
+			if !slices.Contains(restarts, svc) {
+				restarts = append(restarts, svc)
+			}
+		}
+	}
+	restarted := restartMounts(restarts, "--env-file", ".env")
+	// The deploy succeeds only when the events table the services now run on
+	// is the one the release writes.
+	if got, why := eventsTableProblem(p.dir, envPath, p.imageTag); why != "" {
+		return eventsTableFail(p.dir, envPath, p.imageTag, got, why)
+	}
+	if p.resetPending != "" {
+		if restarted {
+			if err := clearResetRecord(envPath, p.imageTag); err != nil {
 				return err
 			}
 		} else {
@@ -1156,11 +1299,14 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 	if line := signingSummary(tok.CSK != "", signingSupported(p.imageTag), p.requireSigned); line != "" {
 		lines = append(lines, ui.Gray("Config      ")+line)
 	}
+	if len(backups) > 0 {
+		lines = append(lines, ui.Gray("Bundle      ")+"replaced "+strings.Join(b.changed(), ", ")+"; previous versions in *.bak-*")
+	}
 	switch outcome {
 	case resetDropped:
 		lines = append(lines, ui.Gray("Storage     ")+ui.Yellow("reset finished: event history was discarded; profiles, traits, segments and journeys were kept"))
 	case resetCreated:
-		lines = append(lines, ui.Gray("Storage     ")+ui.Yellow("reset finished: the events table was created with the new schema; profiles, traits, segments and journeys were kept"))
+		lines = append(lines, ui.Gray("Storage     ")+ui.Yellow("the events table was created with the new schema (nothing was dropped); profiles, traits, segments and journeys were kept"))
 	case resetAlready:
 		lines = append(lines, ui.Gray("Storage     ")+"reset finished: ClickHouse already held the new events table; nothing was dropped")
 	}
@@ -1213,7 +1359,7 @@ func rejectAnswer(answer string) {
 	ui.Fail("Unexpected answer on a non-interactive stdin: %q", answer)
 	ui.Detail("The prompts changed in this release; check the piped answers. Nothing has been enrolled or installed.")
 	fmt.Println()
-	os.Exit(1)
+	exitNow(1)
 }
 
 func promptChoice(label string, min, max, defaultVal int) int {
