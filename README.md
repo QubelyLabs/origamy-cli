@@ -303,6 +303,12 @@ disturb the core.
 - Docker: datastore passwords (Redis, NATS, ClickHouse, Postgres) and, with AI
   on, the orchestrator KEK + API token are generated on the host into `.env`
   (mode 0600) and reused on re-deploy. Nothing generated here is sent to Origamy.
+- Docker delivery events: `ENGAGEMENT_SECRET` (32 random bytes, hex) signs the
+  provider delivery callbacks and webhooks the workflow-engine hands out. `deploy`
+  generates it once, `upgrade` adds it to an older `.env`, and neither changes a
+  value already there: rotating it breaks callbacks and webhooks already issued.
+  `.env` also gets `CONTROL_PLANE_PUBLIC_URL` (the control plane's public origin).
+  On Kubernetes the chart creates and keeps the secret in-cluster.
 
 ## Config signing
 

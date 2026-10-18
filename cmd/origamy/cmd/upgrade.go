@@ -1502,6 +1502,15 @@ func upgradeDocker(version, channel string, enableAI, disableAI, requireSigned, 
 	if err != nil {
 		return fail("Could not update .env.", err.Error())
 	}
+	// Delivery events: an .env from before them has no signing secret. It is
+	// generated once here and kept by every later deploy and upgrade.
+	notes, err = backfillEngagementSecret(envPath)
+	for _, n := range notes {
+		ui.Step("%s", n)
+	}
+	if err != nil {
+		return fail("Could not update .env.", err.Error())
+	}
 	// The key follows the tag: only a release that verifies gets
 	// CONFIG_SIGNING_KEY, so a move below minSigningVersion blanks it.
 	signingVars := map[string]string{}

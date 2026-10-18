@@ -1301,6 +1301,10 @@ func applyDocker(tok *token.Enrollment, keyPEM []byte, p *dockerPlan) error {
 		MTLS:          tok.Cert != "",
 		SigningKey:    tok.CSK,
 		RequireSigned: p.requireSigned,
+
+		// Delivery-event signing key: generated once, then kept (a new one
+		// would stop the callbacks and webhooks already issued from verifying).
+		EngagementSecret: existingOrRandomHex(".env", "ENGAGEMENT_SECRET"),
 	})
 	// Keep whatever else the operator put in the old .env (rate limits, CORS,
 	// an opt-in LLM key): only the keys the CLI owns are rewritten.
