@@ -248,6 +248,26 @@ func backfillDockerEnv(dir, envPath, base string) ([]string, error) {
 	return notes, nil
 }
 
+// backfillEngagementSecret gives an .env from before delivery events an
+// ENGAGEMENT_SECRET, the HMAC key behind the SMS callback tokens and the
+// per-domain Envelope webhook secrets (the bundle's workflow-engine reads it).
+// A value already set, quoted or not, is never touched: rotating it would
+// stop the callbacks and webhooks already issued from verifying. The value is
+// not printed. It returns a line when it added one.
+func backfillEngagementSecret(envPath string) ([]string, error) {
+	if dotenvValue(envPath, "ENGAGEMENT_SECRET") != "" {
+		return nil, nil
+	}
+	secret := randomHex32()
+	if secret == "" {
+		return nil, nil
+	}
+	if err := setEnvVar(envPath, "ENGAGEMENT_SECRET", secret); err != nil {
+		return nil, err
+	}
+	return []string{"Generated ENGAGEMENT_SECRET in .env (signs delivery-event callbacks and webhooks; keep it, never change it)."}, nil
+}
+
 // isBareURL reports whether v is an http(s) URL with no path.
 func isBareURL(v string) bool {
 	u, err := url.Parse(v)
