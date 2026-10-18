@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"cmp"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -388,6 +389,57 @@ func TestApplyDockerPinsTheRelease(t *testing.T) {
 			}
 			if pinned != "" && (err == nil || strings.Contains(out, "Deployed") || !strings.Contains(out, "portal-agent runs ghcr.io/qubelylabs/origamy-data-plane/portal-agent:0.1.17")) {
 				t.Fatalf("%v\n%s", err, out)
+			}
+		})
+	}
+}
+
+// TestApplyDockerEngagementSecret: the delivery-event signing key is generated
+// by the first deploy and never changes after: a re-deploy over an .env that
+// has one writes the same value back, and the public control-plane origin sits
+// next to it.
+func TestApplyDockerEngagementSecret(t *testing.T) {
+	t.Setenv("COMPOSE_FILE", "")
+	for _, tc := range []struct{ name, before string }{
+		{"absent: generated", ""},
+		{"blank: generated", "ENGAGEMENT_SECRET=\n"},
+		{"set: kept", "ENGAGEMENT_SECRET=already-issued\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, parent := deployProject(t, compose253, jsonSchemaSQL, "0.1.19")
+			f := newFakeCompose(t)
+			f.live = liveJSONRow
+			if tc.before != "" {
+				old := readFile(t, p.env)
+				writeFile(t, p.env, old+tc.before)
+			}
+			plan, out, err := planIn(t, parent, "0.1.20", p.base)
+			if err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			defer plan.close()
+			out = captureStdout(t, func() {
+				err = applyDocker(&token.Enrollment{ID: "dp-1", Tok: "tok", Addr: "tunnel.example.com:443", URL: p.base}, nil, plan)
+			})
+			if err != nil || !strings.Contains(out, "Deployed") {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			got := readEnvVar(p.env, "ENGAGEMENT_SECRET")
+			if strings.HasPrefix(tc.before, "ENGAGEMENT_SECRET=a") {
+				if got != "already-issued" {
+					t.Fatalf("an issued secret was changed to %q", got)
+				}
+			} else if _, err := hex.DecodeString(got); err != nil || len(got) != 64 {
+				t.Fatalf("generated secret %q is not 32 bytes of hex", got)
+			}
+			if strings.Contains(out, got) {
+				t.Fatal("the secret was printed")
+			}
+			if readEnvVar(p.env, "CONTROL_PLANE_PUBLIC_URL") != p.base || readEnvVar(p.env, "DATA_PLANE_ID") != "dp-1" {
+				t.Fatalf("public origin / plane id missing from .env:\n%s", readFile(t, p.env))
+			}
+			if n := strings.Count(readFile(t, p.env), "ENGAGEMENT_SECRET="); n != 1 {
+				t.Fatalf("%d ENGAGEMENT_SECRET lines:\n%s", n, readFile(t, p.env))
 			}
 		})
 	}

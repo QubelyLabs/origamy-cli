@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,81 @@ func TestExistingOrRandom(t *testing.T) {
 	// A key absent from an existing file still generates.
 	if got := existingOrRandom(env, "CLICKHOUSE_PASSWORD"); got == "" {
 		t.Fatal("expected generated secret for absent key")
+	}
+}
+
+func TestExistingOrRandomHex(t *testing.T) {
+	env := filepath.Join(t.TempDir(), ".env")
+	a := existingOrRandomHex(env, "ENGAGEMENT_SECRET")
+	if raw, err := hex.DecodeString(a); err != nil || len(raw) != 32 || len(a) != 64 {
+		t.Fatalf("want 32 random bytes as 64 hex chars, got %q (%v)", a, err)
+	}
+	if b := existingOrRandomHex(env, "ENGAGEMENT_SECRET"); b == a {
+		t.Fatal("two generations must differ")
+	}
+	// A blank line is not a value: it is generated.
+	if err := os.WriteFile(env, []byte("ENGAGEMENT_SECRET=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := existingOrRandomHex(env, "ENGAGEMENT_SECRET"); len(got) != 64 {
+		t.Fatalf("blank value not replaced: %q", got)
+	}
+	// Once set it is never regenerated, and survives the re-render a re-deploy does.
+	if err := os.WriteFile(env, []byte("ENGAGEMENT_SECRET="+a+"\nCORS_ALLOWED_ORIGINS=https://x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := existingOrRandomHex(env, "ENGAGEMENT_SECRET"); got != a {
+		t.Fatalf("an existing secret must never be regenerated: %q != %q", got, a)
+	}
+	old, _ := os.ReadFile(env)
+	merged := mergeEnv(string(old), renderDockerEnv(dockerEnvParams{HTTPURL: "https://cp.example", EngagementSecret: existingOrRandomHex(env, "ENGAGEMENT_SECRET")}))
+	if strings.Count(merged, "ENGAGEMENT_SECRET=") != 1 || !strings.Contains(merged, "ENGAGEMENT_SECRET="+a+"\n") {
+		t.Fatalf("re-render lost or duplicated the secret:\n%s", merged)
+	}
+}
+
+func TestBackfillEngagementSecret(t *testing.T) {
+	for _, tc := range []struct {
+		name, env string
+		want      string // "" = generated (64 hex); else kept as is
+	}{
+		{"absent", "DATA_PLANE_ID=dp-1\n", ""},
+		{"blank", "ENGAGEMENT_SECRET=\nDATA_PLANE_ID=dp-1\n", ""},
+		{"set", "ENGAGEMENT_SECRET=issued\nDATA_PLANE_ID=dp-1\n", "issued"},
+		{"quoted", "ENGAGEMENT_SECRET=\"issued\"\n", "issued"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := filepath.Join(t.TempDir(), ".env")
+			writeFile(t, env, tc.env)
+			notes, err := backfillEngagementSecret(env)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := dotenvValue(env, "ENGAGEMENT_SECRET")
+			if tc.want != "" {
+				if got != tc.want || len(notes) != 0 || readFile(t, env) != tc.env {
+					t.Fatalf("an issued secret was touched: %q, notes %q\n%s", got, notes, readFile(t, env))
+				}
+				return
+			}
+			if raw, err := hex.DecodeString(got); err != nil || len(raw) != 32 {
+				t.Fatalf("generated %q", got)
+			}
+			if len(notes) != 1 || strings.Contains(notes[0], got) {
+				t.Fatalf("one note, without the secret: %q", notes)
+			}
+			if !strings.Contains(readFile(t, env), "DATA_PLANE_ID=dp-1\n") || strings.Count(readFile(t, env), "ENGAGEMENT_SECRET=") != 1 {
+				t.Fatalf("other lines moved or key duplicated:\n%s", readFile(t, env))
+			}
+			// The next upgrade finds it and changes nothing.
+			again, err := backfillEngagementSecret(env)
+			if err != nil || len(again) != 0 || dotenvValue(env, "ENGAGEMENT_SECRET") != got {
+				t.Fatalf("second run: %q, %v, %q", again, err, dotenvValue(env, "ENGAGEMENT_SECRET"))
+			}
+		})
+	}
+	if _, err := backfillEngagementSecret(filepath.Join(t.TempDir(), "missing.env")); err == nil {
+		t.Fatal("a missing .env must be an error, not a silent skip")
 	}
 }
 
@@ -243,7 +319,7 @@ func TestRenderDockerEnv(t *testing.T) {
 		DataPlaneID: "dp-1", AuthToken: "dpt_x", ImageTag: "0.1.17", Preset: "starter",
 		Profiles: []string{"full", "ingress"}, IngestDomain: "events.acme.com",
 		RedisPw: "r", NatsPw: "n", ClickHousePw: "c", DBPw: "d",
-		OrchKEK: "kek", OrchToken: "tok", AIEnabled: true, MTLS: true,
+		OrchKEK: "kek", OrchToken: "tok", AIEnabled: true, MTLS: true, EngagementSecret: "eng",
 	})
 	// Every key the served compose bundle reads without a default, plus the
 	// FULL endpoint paths config-sync/telemetry expect (not the bare base URL).
@@ -257,6 +333,7 @@ func TestRenderDockerEnv(t *testing.T) {
 		"DP_REDIS_PASSWORD=r\n", "NATS_PASSWORD=n\n", "CLICKHOUSE_PASSWORD=c\n", "DB_PASSWORD=d\n",
 		"ORCH_KEK=kek\n", "ORCH_ENGINE_API_TOKEN=tok\n", "ORCHESTRATOR_ENGINE_URL=" + orchestratorEngineURL + "\n",
 		"TUNNEL_TLS_CERT=/certs/tls.crt\n", "TUNNEL_TLS_KEY=/certs/tls.key\n",
+		"ENGAGEMENT_SECRET=eng\n", "CONTROL_PLANE_PUBLIC_URL=https://v1.origamy.io\n",
 	} {
 		if !strings.Contains(env, want) {
 			t.Errorf("missing %q in:\n%s", want, env)

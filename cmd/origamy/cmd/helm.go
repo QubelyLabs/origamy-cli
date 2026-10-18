@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +36,29 @@ func existingOrRandom(path, key string) string {
 		return ""
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// existingOrRandomHex is existingOrRandom for the delivery-event signing secret
+// (ENGAGEMENT_SECRET): 32 random bytes as 64 hex characters, generated once
+// and then kept as it is. It is the HMAC key behind the SMS delivery-callback
+// tokens and the per-domain Envelope webhook secrets, so rotating it would
+// stop the callbacks and webhooks already handed to providers from verifying.
+func existingOrRandomHex(path, key string) string {
+	if v := readEnvVar(path, key); v != "" {
+		return v
+	}
+	return randomHex32()
+}
+
+// randomHex32 is 32 bytes from crypto/rand as hex, "" if the system's entropy
+// source fails (effectively impossible; an empty secret leaves delivery events
+// off, never a predictable one).
+func randomHex32() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // ── AI (orchestrator engine) enablement ─────────────────────────────────────
@@ -763,6 +787,10 @@ type dockerEnvParams struct {
 	// caller against ImageTag).
 	SigningKey    string
 	RequireSigned bool
+
+	// EngagementSecret signs delivery-event callbacks and webhooks (see
+	// existingOrRandomHex); the CLI generates it once and carries it forward.
+	EngagementSecret string
 }
 
 // renderDockerEnv writes the .env the served compose bundle expects. The
@@ -804,6 +832,13 @@ func renderDockerEnv(p dockerEnvParams) string {
 	if p.AIEnabled {
 		w("ORCHESTRATOR_ENGINE_URL", orchestratorEngineURL)
 	}
+	// Delivery events (provider receipts for email/SMS), used by the `full`
+	// profile's workflow-engine. DATA_PLANE_ID above names this plane in the
+	// callback URLs; the public origin is the same control plane the plane
+	// already talks to.
+	b.WriteString("# Delivery events: ENGAGEMENT_SECRET signs provider callbacks and webhooks (generated here) — NEVER change it.\n# CONTROL_PLANE_PUBLIC_URL is where providers call back (the control plane's public origin).\n")
+	w("ENGAGEMENT_SECRET", p.EngagementSecret)
+	w("CONTROL_PLANE_PUBLIC_URL", base)
 	if p.MTLS {
 		b.WriteString("# mTLS client identity for the tunnel (written to ./certs; the agent renews it in place).\n")
 		w("TUNNEL_TLS_CERT", "/certs/tls.crt")
