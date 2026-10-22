@@ -33,10 +33,11 @@ const (
 	// bulker adds it to an existing table on start), and 0.1.21's delivery
 	// status for workspace-connected Cloudflare/Envelope accounts (needs
 	// ENGAGEMENT_SECRET, generated once by deploy/upgrade), and 0.1.22's
-	// year-less birthday traits for the form date fields. On Kubernetes `origamy
+	// year-less birthday traits for the form date fields, and 0.1.23's list
+	// segments and workflow property-filter operators. On Kubernetes `origamy
 	// upgrade` resolves the latest published chart at run time, so there this
 	// pin only governs a fresh install; on Docker it is also upgrade's default.
-	helmVersion = "0.1.22"
+	helmVersion = "0.1.23"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
