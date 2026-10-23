@@ -203,14 +203,18 @@ func runUpgrade(version, channel string, sets []string, enableAI, disableAI, ena
 		return fail(err.Error(), "Pass one of --replace-bundle or --keep-bundle, not both.")
 	}
 	ui.Title("Origamy data plane — upgrade")
-	switch {
-	case hasKubernetes() && releaseInstalled():
+	kind, err := locateInstall("origamy upgrade")
+	if err != nil {
+		return err
+	}
+	switch kind {
+	case installKubernetes:
 		if bundle != bundleAuto {
 			return fail("--replace-bundle/--keep-bundle apply to Docker installs only.",
 				"A Kubernetes install's configuration comes with the chart, which the upgrade replaces as a whole.")
 		}
 		return upgradeKubernetes(version, channel, sets, enableAI, disableAI, enablePredictor, disablePredictor, requireSigned, assumeYes)
-	case hasDocker():
+	case installDocker:
 		if len(sets) > 0 {
 			return fail("--set applies to Kubernetes installs only.",
 				"Docker installs configure via .env; edit it directly and rerun without --set.")
@@ -277,7 +281,8 @@ func upgradeKubernetes(version, channel string, sets []string, enableAI, disable
 		return fail("Could not read the current release values.", err.Error())
 	}
 	eff := effectiveValues(vals, sets)
-	external, signing := usesExternalClickHouse(eff), signingConfigured(vals)
+	// Signing is as the release will have it: a key given with --set counts.
+	external, signing := usesExternalClickHouse(eff), signingConfigured(eff)
 	if external && versionLess(target, minChartExternalClickHouse) {
 		return fail(fmt.Sprintf("This data plane uses an external ClickHouse, which needs chart %s or newer (targeting %s).", minChartExternalClickHouse, target),
 			"Pass --version "+minChartExternalClickHouse+" or newer.")
