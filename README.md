@@ -44,6 +44,9 @@ Environment knobs, set before `sh -c`:
 | `origamy upgrade` | Moves the install to a newer release. `--enable-ai` / `--disable-ai` toggle the AI engine; `--enable-predictor` / `--disable-predictor` toggle the predictor (Kubernetes). On Docker it also refreshes the compose bundle (see [Docker bundle refresh](#docker-bundle-refresh)). |
 | `origamy rollback [--to N]` | Rolls a Kubernetes install back to a previous Helm revision (not across the storage reset: see below). |
 | `origamy status` | Installed version, whether a newer one is published (Kubernetes), service health. |
+| `origamy doctor` | Read-only pipeline check: ClickHouse disk use and `system.*_log` sizes, every NATS stream's depth (DLQ and retry included) and consumer lag, a Redis PING, and a one-line likely cause. `--json` for scripts. |
+| `origamy dlq` | What is parked in the dead-letter queue, by error code, project and age, and which entries can never be replayed (no payload). `--list` shows entries; their payloads (personal data) only with `--show-payload`. `--code` / `--project` filter. |
+| `origamy dlq replay` | Re-sends the parked events once the cause is fixed: a dry run first, then a confirmation (`--dry-run` stops there, `--yes` skips the question). Reports what was sent, removed and is still parked. |
 | `origamy uninstall [id]` | Tears the data plane down (Helm release + namespace, or compose project + volumes). |
 | `origamy version` | Prints the CLI version. |
 
@@ -54,6 +57,12 @@ install prints the kubectl context it is about to use), `--enable-ai`,
 Redis/NATS/ClickHouse), `--version` (data-plane release to install instead of
 the pin: the chart version on Kubernetes, the image tag on Docker),
 `--require-signed-config` (see [Config signing](#config-signing)).
+
+`doctor` and `dlq` never connect to your datastores from your machine: they
+run `eventctl` inside the data plane's portal-agent (`kubectl exec` in
+`origamy-dp`, or `docker compose exec`), which reads the connection settings
+from that container. That needs data plane 0.1.24 or later; an older one is
+told to run `origamy upgrade` first.
 
 ## Deploy the core first, add the rest later
 
