@@ -22,10 +22,14 @@ var statusCmd = &cobra.Command{
 
 func runStatus() error {
 	ui.Title("Origamy data plane — status")
-	switch {
-	case hasKubernetes() && releaseInstalled():
+	kind, err := locateInstall("origamy status")
+	if err != nil {
+		return err
+	}
+	switch kind {
+	case installKubernetes:
 		return statusKubernetes()
-	case hasDocker():
+	case installDocker:
 		return statusDocker()
 	default:
 		return fail("No Origamy data plane found on this machine.",

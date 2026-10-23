@@ -49,10 +49,14 @@ func init() {
 
 func runRollback(to int) error {
 	ui.Title("Origamy data plane — rollback")
-	switch {
-	case hasKubernetes() && releaseInstalled():
+	kind, err := locateInstall("origamy rollback")
+	if err != nil {
+		return err
+	}
+	switch kind {
+	case installKubernetes:
 		return rollbackKubernetes(to)
-	case hasDocker():
+	case installDocker:
 		return fail("Docker installs don't keep a revision history.",
 			"Docker tracks image tags, not Helm releases. Move back with: origamy upgrade --version <older>")
 	default:
