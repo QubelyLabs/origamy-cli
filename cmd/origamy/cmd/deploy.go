@@ -39,7 +39,7 @@ const (
 	// retries with capped system logs. On Kubernetes `origamy
 	// upgrade` resolves the latest published chart at run time, so there this
 	// pin only governs a fresh install; on Docker it is also upgrade's default.
-	helmVersion = "0.1.24"
+	helmVersion = "0.1.25"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
