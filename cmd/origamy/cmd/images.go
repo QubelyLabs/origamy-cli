@@ -58,12 +58,16 @@ func imageName(ref string) string { return path.Base(imageRepo(ref)) }
 const dataPlaneRegistry = "ghcr.io/qubelylabs/" + dataPlaneImageRepo
 
 // bundleDataPlaneServices are the data-plane services of every compose bundle
-// so far (0.1.16 to 0.1.20), each named like its image in dataPlaneRegistry:
-// one of them is a data-plane service whatever image a compose file the
-// operator edited gives it.
+// so far (0.1.16 to 0.1.20, plus 0.1.25's source-worker and
+// destination-worker), each named like its image in dataPlaneRegistry: one of
+// them is a data-plane service whatever image a compose file the operator
+// edited gives it. engagement-public is left out: it runs the onboarding-public
+// image, so its name is not its image's, and the bundle's own image for it
+// already identifies it.
 var bundleDataPlaneServices = []string{
 	"ingestion-gateway", "transformer-engine", "identity-resolver", "segment-evaluator",
 	"bulker-worker", "config-sync", "portal-agent", "workflow-engine", "orchestrator-engine",
+	"source-worker", "destination-worker",
 }
 
 // dpService is a data-plane service as a project's compose configuration
