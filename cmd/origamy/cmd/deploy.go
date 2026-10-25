@@ -36,7 +36,9 @@ const (
 	// year-less birthday traits for the form date fields, 0.1.23's list
 	// segments and workflow property-filter operators, and 0.1.24's eventctl
 	// in the portal-agent (origamy dlq / doctor) and ClickHouse disk-full
-	// retries with capped system logs. On Kubernetes `origamy
+	// retries with capped system logs, and 0.1.25's Origamy email on by
+	// default plus open/click tracking and one-click unsubscribe through the
+	// ingestion gateway. On Kubernetes `origamy
 	// upgrade` resolves the latest published chart at run time, so there this
 	// pin only governs a fresh install; on Docker it is also upgrade's default.
 	helmVersion = "0.1.25"
