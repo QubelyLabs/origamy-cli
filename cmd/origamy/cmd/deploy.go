@@ -38,10 +38,11 @@ const (
 	// in the portal-agent (origamy dlq / doctor) and ClickHouse disk-full
 	// retries with capped system logs, and 0.1.25's Origamy email on by
 	// default plus open/click tracking and one-click unsubscribe through the
-	// ingestion gateway. On Kubernetes `origamy
+	// ingestion gateway, and 0.1.26's segment event property filters and a
+	// source-worker that no longer schedules push sources. On Kubernetes `origamy
 	// upgrade` resolves the latest published chart at run time, so there this
 	// pin only governs a fresh install; on Docker it is also upgrade's default.
-	helmVersion = "0.1.25"
+	helmVersion = "0.1.26"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
