@@ -39,10 +39,12 @@ const (
 	// retries with capped system logs, and 0.1.25's Origamy email on by
 	// default plus open/click tracking and one-click unsubscribe through the
 	// ingestion gateway, and 0.1.26's segment event property filters and a
-	// source-worker that no longer schedules push sources. On Kubernetes `origamy
+	// source-worker that no longer schedules push sources, and 0.1.27's in-app
+	// messages through the ingestion gateway, template standard variables,
+	// view-in-browser links and the email sender-name rule. On Kubernetes `origamy
 	// upgrade` resolves the latest published chart at run time, so there this
 	// pin only governs a fresh install; on Docker it is also upgrade's default.
-	helmVersion = "0.1.26"
+	helmVersion = "0.1.27"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
