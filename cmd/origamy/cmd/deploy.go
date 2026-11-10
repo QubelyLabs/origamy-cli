@@ -41,10 +41,13 @@ const (
 	// ingestion gateway, and 0.1.26's segment event property filters and a
 	// source-worker that no longer schedules push sources, and 0.1.27's in-app
 	// messages through the ingestion gateway, template standard variables,
-	// view-in-browser links and the email sender-name rule. On Kubernetes `origamy
+	// view-in-browser links and the email sender-name rule, and 0.1.28's
+	// page-builder pages, catalog checkout, event tickets, staff-entered
+	// submissions for scanned paper forms and ClickHouse metric_log turned
+	// off. On Kubernetes `origamy
 	// upgrade` resolves the latest published chart at run time, so there this
 	// pin only governs a fresh install; on Docker it is also upgrade's default.
-	helmVersion = "0.1.27"
+	helmVersion = "0.1.28"
 	namespace   = "origamy-dp"
 	release     = "odp"
 )
