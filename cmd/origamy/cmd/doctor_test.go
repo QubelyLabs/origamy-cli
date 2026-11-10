@@ -53,6 +53,51 @@ func TestDoctor_Unreachable(t *testing.T) {
 	}
 }
 
+// The 2026-11-10 report from a 0.1.28 plane: its retry stream held 22
+// messages, every one already retried, and doctor said "retry 22" and
+// "22 events are waiting in the retry stream". The stream keeps a week of
+// retries, so only what its consumers have yet to settle is waiting.
+func TestDoctor_RetryCountsWhatStillWaits(t *testing.T) {
+	report := func(consumers string) string {
+		return `{"schema":1,"eventctl_version":"0.1.28","clickhouse":{"reachable":true,"version":"25.3.14.14"},` +
+			`"nats":{"reachable":true,"streams":[{"name":"DLQ","role":"dlq","messages":0},` +
+			`{"name":"Retry","role":"retry","messages":22` + consumers + `}]},` +
+			`"redis":{"configured":true,"reachable":true,"ping_ms":8.9},` +
+			`"findings":[{"severity":"warning","check":"clickhouse","message":"ClickHouse returned MEMORY_LIMIT_EXCEEDED (241) 23 times since it started"},` +
+			`{"severity":"info","check":"nats","message":"22 events are waiting in the retry stream"}],` +
+			`"likely_cause":"ClickHouse returned MEMORY_LIMIT_EXCEEDED (241) 23 times since it started"}` + "\n"
+	}
+	render := func(consumers string) string {
+		t.Helper()
+		useFakeEventctl(t, &fakeEventctl{reply: func([]string) (string, string, error) { return report(consumers), "", nil }})
+		var err error
+		out := captureStdout(t, func() { err = runDoctor(false) })
+		if err != nil {
+			t.Fatalf("runDoctor: %v\n%s", err, out)
+		}
+		return out
+	}
+
+	settled := render(`,"consumers":[{"name":"bulker-retry","pending":0,"ack_pending":0},{"name":"identity-retry","pending":0,"ack_pending":0}]`)
+	if !strings.Contains(settled, "retry 0") || strings.Contains(settled, "waiting") {
+		t.Errorf("every retry was settled, want retry 0 and no waiting line:\n%s", settled)
+	}
+	if !strings.Contains(settled, "Likely cause: ClickHouse returned MEMORY_LIMIT_EXCEEDED") {
+		t.Errorf("the likely cause is gone:\n%s", settled)
+	}
+
+	// 3 not handed out yet, 2 held until they are due.
+	due := render(`,"consumers":[{"name":"bulker-retry","pending":3,"ack_pending":0},{"name":"identity-retry","pending":0,"ack_pending":2}]`)
+	if !strings.Contains(due, "retry 5") || !strings.Contains(due, "5 events are waiting to be retried") || strings.Contains(due, "22 events") {
+		t.Errorf("want the 5 unsettled retries, not the stream's 22 messages:\n%s", due)
+	}
+
+	// Nobody consumes the stream: all of it waits.
+	if orphaned := render(""); !strings.Contains(orphaned, "retry 22") || !strings.Contains(orphaned, "22 events are waiting to be retried") {
+		t.Errorf("want all 22 waiting when the stream has no consumer:\n%s", orphaned)
+	}
+}
+
 func TestDoctor_JSONIsTheReportAlone(t *testing.T) {
 	f := &fakeEventctl{reply: func([]string) (string, string, error) {
 		return "compose warning\n" + strings.ReplaceAll(diskFullDoctor, "\n", "") + "\n", "", nil
