@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -80,6 +81,9 @@ type doctorFinding struct {
 	Check    string `json:"check"`
 	Message  string `json:"message"`
 }
+
+// staleRetryFinding is the retry-stream finding of eventctl up to 0.1.28.
+var staleRetryFinding = regexp.MustCompile(`^\d+ events are waiting in the retry stream$`)
 
 // doctorTimeout bounds each of eventctl's checks; the exec gets all three.
 const doctorTimeout = 30 * time.Second
@@ -181,16 +185,30 @@ func printDoctor(rep doctorReport) {
 	}
 
 	n := rep.NATS
+	var retry uint64
 	if !n.Reachable {
 		ui.KV("NATS", ui.Red("unreachable")+ui.Gray("  "+firstLine(n.Error)))
 	} else {
-		var dlq, retry uint64
+		var dlq uint64
 		for _, s := range n.Streams {
 			switch s.Role {
 			case "dlq":
 				dlq += s.Messages
 			case "retry":
-				retry += s.Messages
+				// Not s.Messages: the retry stream keeps every retry until it
+				// ages out (a week), settled or not, so that count is history.
+				// What still waits is what its consumers have not been handed
+				// or have not settled (a retry that is not due yet is held
+				// unsettled). A stream nobody consumes is all waiting.
+				if len(s.Consumers) == 0 {
+					retry += s.Messages
+				}
+				for _, c := range s.Consumers {
+					retry += c.Pending
+					if c.AckPending > 0 {
+						retry += uint64(c.AckPending)
+					}
+				}
 			}
 		}
 		dlqText := commas(int(dlq))
@@ -240,6 +258,15 @@ func printDoctor(rep doctorReport) {
 		if causeSeverity == "" && f.Message == cause {
 			causeSeverity = f.Severity
 			continue
+		}
+		// Planes up to 0.1.28 report the retry stream's message count as
+		// "waiting", which stays long after every retry was settled. Say what
+		// the consumers above show instead, and nothing when nothing waits.
+		if f.Severity == "info" && staleRetryFinding.MatchString(f.Message) {
+			if retry == 0 {
+				continue
+			}
+			f.Message = fmt.Sprintf("%d events are waiting to be retried", retry)
 		}
 		others = append(others, f)
 	}
